@@ -6,71 +6,57 @@ import cors from "cors";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createOrbitServer } from "./server.js";
-import { getCredits } from "./billing.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+const BYPASS_KEY = process.env.MCP_BYPASS_KEY;
+
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const sessionApiKeys = new Map<string, string>();
 
-async function requireApiKey(
+function extractApiKey(req: express.Request): string | null {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith("Bearer ")) {
+    return auth.slice(7);
+  }
+  return null;
+}
+
+function requireApiKey(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
-): Promise<void> {
+): void {
+  if (BYPASS_KEY === "*") {
+    next();
+    return;
+  }
+
   const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
   if (mcpSessionId && sessionApiKeys.has(mcpSessionId)) {
     next();
     return;
   }
 
-  const key = req.headers["x-api-key"];
-  const bypassKey = process.env.MCP_BYPASS_KEY;
-  if (bypassKey === "*" || (typeof key === "string" && bypassKey && key === bypassKey)) {
+  const key = extractApiKey(req);
+
+  if (BYPASS_KEY && key === BYPASS_KEY) {
     next();
     return;
   }
 
-  if (typeof key !== "string" || key.length === 0) {
+  if (!key) {
     res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32600, message: "Unauthorized: missing x-api-key header" },
+      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <api_key> header" },
       id: null,
     });
     return;
   }
 
-  try {
-    const { valid, credits } = await getCredits(key);
-
-    if (!valid) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32600, message: "Unauthorized: invalid API key" },
-        id: null,
-      });
-      return;
-    }
-
-    if (credits <= 0) {
-      res.status(403).json({
-        jsonrpc: "2.0",
-        error: { code: -32600, message: "Forbidden: insufficient credits" },
-        id: null,
-      });
-      return;
-    }
-
-    next();
-  } catch {
-    res.status(502).json({
-      jsonrpc: "2.0",
-      error: { code: -32600, message: "Billing service unavailable" },
-      id: null,
-    });
-  }
+  next();
 }
 
 app.use("/mcp", requireApiKey);
@@ -85,7 +71,7 @@ app.post("/mcp", async (req, res) => {
   }
 
   if (!sessionId && isInitializeRequest(req.body)) {
-    const apiKey = req.headers["x-api-key"] as string;
+    const apiKey = extractApiKey(req) ?? BYPASS_KEY ?? "";
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {

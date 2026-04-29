@@ -1,13 +1,13 @@
 # @openea/orbit-mcp
 
-MCP server that exposes the Orbit people-search API as tools for any MCP-compatible AI client (Claude Desktop, Cursor, etc.).
+MCP server that exposes the Orbit Developer API as tools for any MCP-compatible AI client (Claude Desktop, Cursor, etc.).
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `search_people` | Search for people by name, phone, email, or description. Returns matching profiles with basic info. |
-| `get_profile` | Get a full profile by user ID or username. Returns bio, jobs, education, family, social links, and more. |
+| Tool | Description | Credits |
+|------|-------------|---------|
+| `search_people` | Search for people by name, phone, email, or description. Returns matching profiles. | `numUsers` per call |
+| `get_profile` | Get a full profile by user ID (from search results). | per Developer API pricing |
 
 ## Build
 
@@ -16,6 +16,18 @@ cd packages/mcp-server
 npm install
 npm run build
 ```
+
+## Authentication
+
+The MCP server uses Orbit Developer API keys (`sk_orb_...`). Keys are passed through to the Orbit API, which handles validation, credit metering, and rate limiting.
+
+Clients authenticate with:
+
+```http
+Authorization: Bearer sk_orb_YOUR_KEY
+```
+
+Get a key via `POST /v2/api-keys` with scopes `["search:read", "profile:read"]`.
 
 ## Claude Desktop
 
@@ -47,60 +59,6 @@ Add to `.cursor/mcp.json` in your project root:
 }
 ```
 
-## Authentication & Billing
-
-The HTTP server requires an `x-api-key` header on all `/mcp` requests. Keys are validated against your billing API, which also tracks credit usage.
-
-### Credit costs
-
-| Tool | Cost |
-|------|------|
-| `search_people` | 1 credit per person returned |
-| `get_profile` | 2 credits per call |
-
-### Billing API contract
-
-The MCP server calls your billing service at `BILLING_API_URL` (defaults to `https://api.orbitsearch.com/v1/mcp/billing`). Your service must implement:
-
-**Check credits** — `GET {BILLING_API_URL}/credits`
-
-Request header: `x-api-key: <client key>`
-
-Response:
-```json
-{ "valid": true, "credits": 100 }
-```
-
-**Deduct credits** — `POST {BILLING_API_URL}/deduct`
-
-Request header: `x-api-key: <client key>`
-
-Request body:
-```json
-{ "credits": 5, "tool": "search_people" }
-```
-
-Response:
-```json
-{ "success": true, "remaining": 95 }
-```
-
-### Error responses
-
-| Status | Meaning |
-|--------|---------|
-| `401` | Missing or invalid API key |
-| `403` | Insufficient credits |
-| `502` | Billing service unavailable |
-
-### Environment variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `BILLING_API_URL` | Base URL of your billing service | `https://api.orbitsearch.com/v1/mcp/billing` |
-
-The stdio transport (`npm start`) bypasses authentication entirely — no API key or billing required.
-
 ## Remote HTTP server
 
 The HTTP entry point exposes the MCP server over Streamable HTTP at `/mcp`.
@@ -111,15 +69,17 @@ npm run start:http
 
 This starts on port 3000 by default. Set `PORT` env var to change it.
 
-### Deploy to Railway / Render / Fly.io
+### Deploy
 
-1. Set the build command to `npm install && npm run build`
-2. Set the start command to `node build/http.js`
-3. Expose port `3000` (or set `PORT` env var to match the platform)
+```bash
+gcloud run deploy orbit-mcp \
+  --image gcr.io/YOUR_PROJECT/orbit-mcp \
+  --port 8080 \
+  --allow-unauthenticated \
+  --region us-central1
+```
 
 ### Connect remote clients
-
-Point your MCP client to the deployed URL. Include `x-api-key` if auth is enabled:
 
 ```json
 {
@@ -128,7 +88,7 @@ Point your MCP client to the deployed URL. Include `x-api-key` if auth is enable
       "type": "streamable-http",
       "url": "https://your-deployed-url.example.com/mcp",
       "headers": {
-        "x-api-key": "YOUR_API_KEY"
+        "Authorization": "Bearer sk_orb_YOUR_KEY"
       }
     }
   }
@@ -137,18 +97,27 @@ Point your MCP client to the deployed URL. Include `x-api-key` if auth is enable
 
 The `/health` endpoint returns `{"status":"ok"}` for monitoring.
 
+### Environment variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ORBIT_API_URL` | Base URL of the Orbit API | `https://api.orbitsearch.com` |
+| `MCP_BYPASS_KEY` | Bypass auth for testing (set to `*` to allow all) | — |
+| `PORT` | HTTP server port | `3000` |
+
 ## Example tool calls
 
 ### search_people
 
 Input:
 ```json
-{ "query": "Elon Musk" }
+{ "query": "Elon Musk", "numUsers": 10 }
 ```
 
 Output:
 ```json
 {
+  "searchId": "uuid",
   "results": [
     {
       "displayName": "Elon Musk",
@@ -159,7 +128,8 @@ Output:
       "matchReason": "Exact name match",
       "sourceCount": 42
     }
-  ]
+  ],
+  "creditsRemaining": 90
 }
 ```
 
@@ -167,32 +137,26 @@ Output:
 
 Input:
 ```json
-{ "userId": "abc-123-def" }
-```
-
-Or by username:
-```json
-{ "username": "elonmusk" }
+{ "profileId": "abc-123-def" }
 ```
 
 Output:
 ```json
 {
+  "id": "abc-123-def",
+  "orbitId": "orbit-id",
   "displayName": "Elon Musk",
   "avatarUrl": "https://...",
-  "username": "elonmusk",
-  "location": { "city": "Austin", "region": "TX", "country": "US" },
-  "bio": "CEO of Tesla and SpaceX...",
-  "birthday": "June 28, 1971",
-  "school": "University of Pennsylvania",
-  "jobs": [{ "title": "CEO", "company": "Tesla" }],
-  "education": [{ "school": "University of Pennsylvania", "degree": "BS Physics" }],
-  "interests": ["AI", "space exploration", "electric vehicles"],
-  "family": [{ "name": "...", "relationship": "..." }],
-  "accomplishments": [{ "description": "..." }],
-  "controversies": [{ "description": "..." }],
-  "socialLinks": [{ "network": "twitter", "url": "https://x.com/elonmusk", "username": "elonmusk" }],
-  "worldview": "...",
-  "sources": [{ "source": "LinkedIn", "url": "https://..." }]
+  "profileUrl": "https://orbitsearch.com/elonmusk",
+  "verified": true,
+  "location": { "city": "Austin, TX, US" },
+  "headline": { "jobTitle": "CEO", "companyName": "Tesla", "schoolName": "UPenn" },
+  "sections": {
+    "basic": { "school": "University of Pennsylvania", "location": "Austin" },
+    "jobs": { "...": "..." },
+    "education": { "...": "..." },
+    "passions": { "...": "..." },
+    "accomplishments": { "...": "..." }
+  }
 }
 ```
