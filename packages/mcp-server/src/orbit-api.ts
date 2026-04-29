@@ -1,6 +1,8 @@
 import type { DeveloperSearchResponse, DeveloperProfileResponse } from "./types.js";
 
 const BASE_URL = process.env.ORBIT_API_URL ?? "https://api.orbitsearch.com";
+const APP_ID = process.env.ORBIT_APP_ID ?? "0eae6b0f-c7aa-43c3-af09-7bd5a0a7df7d";
+const APP_VERSION = "1.0.0";
 
 export interface SearchResult {
   displayName: string;
@@ -28,6 +30,8 @@ export async function searchPeople(
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      "App-Id": APP_ID,
+      "App-Version": APP_VERSION,
     },
     body: JSON.stringify({ query, numUsers }),
   });
@@ -66,7 +70,11 @@ export async function getProfile(
     `${BASE_URL}/v2/developer/profiles/${encodeURIComponent(profileId)}`,
     {
       method: "GET",
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "App-Id": APP_ID,
+        "App-Version": APP_VERSION,
+      },
     },
   );
 
