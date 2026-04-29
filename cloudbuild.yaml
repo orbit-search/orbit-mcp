@@ -2,6 +2,8 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args:
       - build
+      - -f
+      - packages/mcp-server/Dockerfile
       - -t
       - gcr.io/$PROJECT_ID/orbit-mcp
       - packages/mcp-server
