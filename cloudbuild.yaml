@@ -9,5 +9,21 @@ steps:
       - -t
       - gcr.io/$PROJECT_ID/orbit-mcp
       - packages/mcp-server
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/$PROJECT_ID/orbit-mcp
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    args:
+      - gcloud
+      - run
+      - deploy
+      - orbit-mcp
+      - --image
+      - gcr.io/$PROJECT_ID/orbit-mcp
+      - --region
+      - us-central1
+      - --platform
+      - managed
 images:
   - gcr.io/$PROJECT_ID/orbit-mcp
