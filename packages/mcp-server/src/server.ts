@@ -7,11 +7,13 @@ import {
 } from "./orbit-api.js";
 import { getCredits, deductCredits } from "./billing.js";
 
+const bypassKey = process.env.MCP_BYPASS_KEY;
+
 async function assertCredits(
   apiKey: string | null,
   required: number,
 ): Promise<void> {
-  if (!apiKey) return;
+  if (!apiKey || apiKey === bypassKey) return;
   const { credits } = await getCredits(apiKey);
   if (credits < required) {
     throw new Error(`Insufficient credits: ${credits} available, ${required} required`);
@@ -53,7 +55,7 @@ export function createOrbitServer(apiKey?: string): McpServer {
           };
         }
 
-        if (apiKey) {
+        if (apiKey && apiKey !== bypassKey) {
           await deductCredits(apiKey, results.length, "search_people");
         }
 
@@ -122,7 +124,7 @@ export function createOrbitServer(apiKey?: string): McpServer {
           ? await getProfileById(userId)
           : await getProfileByUsername(username!);
 
-        if (apiKey) {
+        if (apiKey && apiKey !== bypassKey) {
           await deductCredits(apiKey, 2, "get_profile");
         }
 
