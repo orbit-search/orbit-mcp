@@ -26,6 +26,6 @@ steps:
       - --platform
       - managed
       - --set-env-vars
-      - MCP_BYPASS_KEY=123
+      - MCP_BYPASS_KEY=*
 images:
   - gcr.io/$PROJECT_ID/orbit-mcp

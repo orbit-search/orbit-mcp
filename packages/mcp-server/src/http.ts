@@ -28,7 +28,7 @@ async function requireApiKey(
 
   const key = req.headers["x-api-key"];
   const bypassKey = process.env.MCP_BYPASS_KEY;
-  if (typeof key === "string" && bypassKey && key === bypassKey) {
+  if (bypassKey === "*" || (typeof key === "string" && bypassKey && key === bypassKey)) {
     next();
     return;
   }
