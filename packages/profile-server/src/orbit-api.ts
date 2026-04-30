@@ -77,30 +77,4 @@ export async function getProfile(
   return data.payload;
 }
 
-export async function storeMemories(
-  profileId: string,
-  facts: Array<{ category: string; fact: string }>,
-  apiKey: string,
-): Promise<{ stored: number }> {
-  const response = await fetch(
-    `${BASE_URL}/v2/developer/profiles/${encodeURIComponent(profileId)}/memories`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "App-Id": APP_ID,
-        "App-Version": APP_VERSION,
-      },
-      body: JSON.stringify({ facts }),
-    },
-  );
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Orbit API error ${response.status}: ${body}`);
-  }
-
-  const data = (await response.json()) as { stored: number };
-  return data;
-}

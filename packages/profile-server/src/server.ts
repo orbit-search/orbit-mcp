@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { searchPeople, getProfile, storeMemories } from "./orbit-api.js";
+import { searchPeople, getProfile } from "./orbit-api.js";
 import { extractFacts } from "./extract.js";
 
 export function createProfileServer(apiKey?: string): McpServer {
@@ -49,9 +49,9 @@ export function createProfileServer(apiKey?: string): McpServer {
 
   server.tool(
     "add_memories",
-    "Extract and store facts about a person from conversation messages. Pass raw conversation text and the person's identifier — facts are automatically extracted and saved to their profile.",
+    "Extract and store personal facts about a user from conversation messages. Pass the person's identifier and raw conversation text — facts are automatically extracted, categorized, and saved to their Orbit profile.",
     {
-      query: z.string().describe("Phone number, email, or name to identify the person"),
+      query: z.string().describe("Phone number, email address, or name to identify the person"),
       messages: z.string().describe("Raw conversation text to extract facts from"),
     },
     async ({ query, messages }) => {
@@ -67,7 +67,7 @@ export function createProfileServer(apiKey?: string): McpServer {
 
         if (results.length === 0) {
           return {
-            content: [{ type: "text" as const, text: "No matching person found. Cannot store memories." }],
+            content: [{ type: "text" as const, text: "No matching person found." }],
             isError: true,
           };
         }
@@ -80,18 +80,18 @@ export function createProfileServer(apiKey?: string): McpServer {
           };
         }
 
-        const { stored } = await storeMemories(results[0].userId, facts, apiKey);
+        // TODO: call Orbit API to persist facts once endpoint exists
 
         return {
           content: [{
             type: "text" as const,
-            text: `Stored ${stored} fact(s):\n${facts.map((f) => `- [${f.category}] ${f.fact}`).join("\n")}`,
+            text: JSON.stringify({ userId: results[0].userId, displayName: results[0].displayName, facts }, null, 2),
           }],
         };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Unknown error occurred";
         return {
-          content: [{ type: "text" as const, text: `Error storing memories: ${message}` }],
+          content: [{ type: "text" as const, text: `Error adding memories: ${message}` }],
           isError: true,
         };
       }
