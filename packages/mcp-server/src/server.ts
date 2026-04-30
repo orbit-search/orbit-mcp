@@ -10,7 +10,7 @@ export function createOrbitServer(apiKey?: string): McpServer {
 
   server.tool(
     "search_people",
-    "Search for people by name, phone number, email, or description. Returns a list of matching profiles with basic info. Costs numUsers credits.",
+    "Search for people by name, phone number, email, or description. Returns a list of matching profiles with basic info.",
     {
       query: z
         .string()
@@ -23,7 +23,7 @@ export function createOrbitServer(apiKey?: string): McpServer {
         .min(1)
         .max(100)
         .default(10)
-        .describe("Number of results to return (1-100). Each result costs 1 credit."),
+        .describe("Number of results to return (1-50)"),
     },
     async ({ query, numUsers }) => {
       if (!apiKey) {

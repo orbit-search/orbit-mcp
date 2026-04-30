@@ -27,5 +27,30 @@ steps:
       - managed
       - --set-env-vars
       - MCP_BYPASS_KEY=*
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - packages/profile-server/Dockerfile
+      - -t
+      - gcr.io/$PROJECT_ID/orbit-profile-mcp
+      - packages/profile-server
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - gcr.io/$PROJECT_ID/orbit-profile-mcp
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    args:
+      - gcloud
+      - run
+      - deploy
+      - orbit-profile-mcp
+      - --image
+      - gcr.io/$PROJECT_ID/orbit-profile-mcp
+      - --region
+      - us-central1
+      - --platform
+      - managed
 images:
   - gcr.io/$PROJECT_ID/orbit-mcp
+  - gcr.io/$PROJECT_ID/orbit-profile-mcp
