@@ -1,162 +1,134 @@
-# @openea/orbit-mcp
+# Orbit MCP
 
-MCP server that exposes the Orbit Developer API as tools for any MCP-compatible AI client (Claude Desktop, Cursor, etc.).
+Public MCP server for Orbit Developer API v3 Search and Enrich. It is a thin authenticated adapter: every Orbit request uses the connecting customer's Developer API key and remains subject to that key's scopes and rate limits.
 
 ## Tools
 
-| Tool | Description | Credits |
-|------|-------------|---------|
-| `search_people` | Search for people by name, phone, email, or description. Returns matching profiles. | `numUsers` per call |
-| `get_profile` | Get a full profile by user ID (from search results). | per Developer API pricing |
+| Tool | Purpose | Orbit API |
+|---|---|---|
+| `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
+| `get_profile` | Read an existing profile without scheduling regeneration | `GET /v3/enrich/{profile_id}` |
+| `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
 
-## Build
-
-```bash
-cd packages/mcp-server
-npm install
-npm run build
-```
+Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
 ## Authentication
 
-The MCP server uses Orbit Developer API keys (`sk_orb_...`). Keys are passed through to the Orbit API, which handles validation, credit metering, and rate limiting.
+Use an Orbit Developer API key with:
 
-Clients authenticate with:
+- `search:read` for Search, polling, and Enrich operations;
+- `profile:read` for profile reads and embedded profiles.
+
+Remote HTTP clients must send the key on every MCP request:
 
 ```http
-Authorization: Bearer sk_orb_YOUR_KEY
+Authorization: Bearer sk_orb_REDACTED
 ```
 
-Get a key via `POST /v2/api-keys` with scopes `["search:read", "profile:read"]`.
+There is no bypass key. The MCP forwards the key only to the configured Orbit API base URL.
 
-## Claude Desktop
+## Local stdio
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+```bash
+npm install
+npm run build
+ORBIT_DEVELOPER_API_KEY=sk_orb_REDACTED npm start
+```
+
+Claude Desktop or another stdio MCP client:
 
 ```json
 {
   "mcpServers": {
     "orbit": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/packages/mcp-server/build/index.js"]
-    }
-  }
-}
-```
-
-## Cursor
-
-Add to `.cursor/mcp.json` in your project root:
-
-```json
-{
-  "mcpServers": {
-    "orbit": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/packages/mcp-server/build/index.js"]
-    }
-  }
-}
-```
-
-## Remote HTTP server
-
-The HTTP entry point exposes the MCP server over Streamable HTTP at `/mcp`.
-
-```bash
-npm run start:http
-```
-
-This starts on port 3000 by default. Set `PORT` env var to change it.
-
-### Deploy
-
-```bash
-gcloud run deploy orbit-mcp \
-  --image gcr.io/YOUR_PROJECT/orbit-mcp \
-  --port 8080 \
-  --allow-unauthenticated \
-  --region us-central1
-```
-
-### Connect remote clients
-
-```json
-{
-  "mcpServers": {
-    "orbit": {
-      "type": "streamable-http",
-      "url": "https://your-deployed-url.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer sk_orb_YOUR_KEY"
+      "args": ["/absolute/path/to/orbit-mcp/packages/mcp-server/build/index.js"],
+      "env": {
+        "ORBIT_DEVELOPER_API_KEY": "sk_orb_REDACTED"
       }
     }
   }
 }
 ```
 
-The `/health` endpoint returns `{"status":"ok"}` for monitoring.
+## Remote Streamable HTTP
 
-### Environment variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ORBIT_API_URL` | Base URL of the Orbit API | `https://api.orbitsearch.com` |
-| `MCP_BYPASS_KEY` | Bypass auth for testing (set to `*` to allow all) | — |
-| `PORT` | HTTP server port | `3000` |
-
-## Example tool calls
-
-### search_people
-
-Input:
-```json
-{ "query": "Elon Musk", "numUsers": 10 }
+```bash
+npm run start:http
 ```
 
-Output:
+The MCP endpoint is `/mcp`; `/health` is an unauthenticated process-health endpoint.
+
 ```json
 {
-  "searchId": "uuid",
-  "results": [
-    {
-      "displayName": "Elon Musk",
-      "username": "elonmusk",
-      "userId": "abc-123-def",
-      "city": "Austin, TX",
-      "age": 53,
-      "matchReason": "Exact name match",
-      "sourceCount": 42
+  "mcpServers": {
+    "orbit": {
+      "type": "streamable-http",
+      "url": "https://your-orbit-mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer sk_orb_REDACTED"
+      }
     }
-  ],
-  "creditsRemaining": 90
-}
-```
-
-### get_profile
-
-Input:
-```json
-{ "profileId": "abc-123-def" }
-```
-
-Output:
-```json
-{
-  "id": "abc-123-def",
-  "orbitId": "orbit-id",
-  "displayName": "Elon Musk",
-  "avatarUrl": "https://...",
-  "profileUrl": "https://orbitsearch.com/elonmusk",
-  "verified": true,
-  "location": { "city": "Austin, TX, US" },
-  "headline": { "jobTitle": "CEO", "companyName": "Tesla", "schoolName": "UPenn" },
-  "sections": {
-    "basic": { "school": "University of Pennsylvania", "location": "Austin" },
-    "jobs": { "...": "..." },
-    "education": { "...": "..." },
-    "passions": { "...": "..." },
-    "accomplishments": { "...": "..." }
   }
 }
 ```
+
+## Tool examples
+
+Known people search:
+
+```json
+{
+  "query": "machine learning engineers in San Francisco",
+  "candidate_discovery": false,
+  "profile_depth": "partial",
+  "limit": 10,
+  "request_id": "crm-search-job-123"
+}
+```
+
+Identity resolution:
+
+```json
+{
+  "signals": {
+    "email": "person@example.com",
+    "linkedin_url": "https://www.linkedin.com/in/example"
+  },
+  "candidate_discovery": true,
+  "profile_depth": "full",
+  "limit": 1
+}
+```
+
+Phone and address signals always disable candidate discovery, even if the caller requests it.
+
+Profile enrichment:
+
+```json
+{
+  "profile_id": "profile_123",
+  "operation": "full",
+  "request_id": "crm-enrich-job-456"
+}
+```
+
+## Configuration
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ORBIT_DEVELOPER_API_KEY` | Required for stdio transport | none |
+| `ORBIT_API_URL` | Orbit API base URL | `https://api.orbitsearch.com` |
+| `ORBIT_POLL_TIMEOUT_MS` | Maximum time spent polling one operation | `300000` |
+| `PORT` | HTTP server port | `3000` |
+
+## v2 migration notes
+
+- v2 synchronous smart search was replaced by asynchronous v3 Search polling.
+- `numUsers` became `limit` and is capped at 20.
+- Match reasons and credit headers are not part of the v3 Search contract.
+- `get_profile` now returns the v3 Enrich read envelope.
+- `enrich_profile` is the explicit path for upgrading or regenerating known profile IDs.
+- Identity signals belong in `search_people`, not `enrich_profile`.
+
+No v2 endpoint remains in either package in this repository.

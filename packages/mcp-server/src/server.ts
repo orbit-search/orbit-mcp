@@ -1,93 +1,83 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { searchPeople, getProfile } from "./orbit-api.js";
+import { OrbitV3Client } from "./orbit-api.js";
 
-export function createOrbitServer(apiKey?: string): McpServer {
-  const server = new McpServer({
-    name: "orbit-mcp",
-    version: "1.0.0",
-  });
+function toolResult(value: unknown, isError = false) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function toolError(error: unknown) {
+  return toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
+}
+
+const signalsSchema = z
+  .object({
+    email: z.string().email().optional(),
+    linkedin_url: z.string().url().optional(),
+    usernames: z.array(z.string().min(1)).max(20).optional(),
+    urls: z.array(z.string().url()).max(20).optional(),
+    address: z.string().min(1).optional(),
+    phone: z.string().min(1).optional(),
+  })
+  .strict();
+
+export function createOrbitServer(apiKey: string): McpServer {
+  const client = new OrbitV3Client({ apiKey });
+  const server = new McpServer({ name: "orbit-mcp", version: "2.0.0" });
 
   server.tool(
     "search_people",
-    "Search for people by name, phone number, email, or description. Returns a list of matching profiles with basic info.",
+    "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes ready profiles.",
     {
-      query: z
-        .string()
-        .describe(
-          "The search query — a person's name, phone number, email address, or a description like 'CEO of Acme Corp'.",
-        ),
-      numUsers: z
-        .number()
-        .int()
-        .min(1)
-        .max(100)
-        .default(10)
-        .describe("Number of results to return (1-50)"),
+      query: z.string().min(1).max(2_000).optional().describe("Plain-English people search query."),
+      signals: signalsSchema.optional().describe("Exact identity signals such as email, LinkedIn URL, username, URL, address, or phone."),
+      candidate_discovery: z.boolean().default(false).describe("Allow Orbit to discover people beyond known matches. Address and phone always disable discovery."),
+      profile_depth: z.enum(["partial", "full"]).default("partial").describe("Minimum profile depth to build for selected results."),
+      limit: z.number().int().min(1).max(20).default(10).describe("Maximum results; v3 supports up to 20."),
+      request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical search."),
     },
-    async ({ query, numUsers }) => {
-      if (!apiKey) {
-        return {
-          content: [{ type: "text" as const, text: "No API key provided. Connect with an Authorization header." }],
-          isError: true,
-        };
-      }
-
+    async ({ query, signals, candidate_discovery, profile_depth, limit, request_id }) => {
       try {
-        const { results, searchId, creditsRemaining } = await searchPeople(query, numUsers, apiKey);
-
-        if (results.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No matching people found for the given query." }],
-          };
-        }
-
-        const payload: Record<string, unknown> = { searchId, results };
-        if (creditsRemaining !== null) {
-          payload.creditsRemaining = creditsRemaining;
-        }
-
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
-        };
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "Unknown error occurred";
-        return {
-          content: [{ type: "text" as const, text: `Error searching for people: ${message}` }],
-          isError: true,
-        };
+        const result = await client.searchAndWait({ query, signals, candidate_discovery, profile_depth, limit, request_id });
+        return toolResult(result, result.status !== "completed");
+      } catch (error) {
+        return toolError(error);
       }
     },
   );
 
   server.tool(
     "get_profile",
-    "Get a person's full profile by their user ID (from search results). Returns detailed info including bio, jobs, education, interests, and more.",
+    "Read an existing Orbit profile by its canonical profile ID through v3 Enrich. This read does not regenerate the profile.",
     {
-      profileId: z
-        .string()
-        .describe("The user ID returned from search_people results."),
+      profile_id: z.string().min(1).max(500).describe("Canonical Orbit profile ID returned by search_people."),
     },
-    async ({ profileId }) => {
-      if (!apiKey) {
-        return {
-          content: [{ type: "text" as const, text: "No API key provided. Connect with an Authorization header." }],
-          isError: true,
-        };
-      }
-
+    async ({ profile_id }) => {
       try {
-        const profile = await getProfile(profileId, apiKey);
+        return toolResult(await client.getProfile(profile_id));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
 
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(profile, null, 2) }],
-        };
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "Unknown error occurred";
-        return {
-          content: [{ type: "text" as const, text: `Error fetching profile: ${message}` }],
-          isError: true,
-        };
+  server.tool(
+    "enrich_profile",
+    "Ensure an existing Orbit profile is partial or full, or regenerate a full profile. The tool waits for terminal v3 Enrich status.",
+    {
+      profile_id: z.string().min(1).max(500).describe("Canonical Orbit profile ID. Identity signals belong in search_people instead."),
+      operation: z.enum(["partial", "full", "regenerate"]).describe("Desired level-aware enrichment operation."),
+      request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical enrichment."),
+    },
+    async ({ profile_id, operation, request_id }) => {
+      try {
+        const result = await client.enrichAndWait(profile_id, operation, request_id);
+        return toolResult(result, result.status === "failed");
+      } catch (error) {
+        return toolError(error);
       }
     },
   );

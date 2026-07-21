@@ -1,88 +1,179 @@
-import type { DeveloperSearchResponse, DeveloperProfileResponse } from "./types.js";
+import { randomUUID } from "node:crypto";
+import type {
+  EnrichOperation,
+  EnrichResponse,
+  JsonObject,
+  ProfileReadResponse,
+  SearchInput,
+  SearchResponse,
+  SearchSignals,
+} from "./types.js";
 
-const BASE_URL = process.env.ORBIT_API_URL ?? "https://api.orbitsearch.com";
-const APP_ID = process.env.ORBIT_APP_ID ?? "0eae6b0f-c7aa-43c3-af09-7bd5a0a7df7d";
-const APP_VERSION = "1.0.0";
+const DEFAULT_BASE_URL = "https://api.orbitsearch.com";
+const DEFAULT_POLL_TIMEOUT_MS = 5 * 60_000;
+const TERMINAL_SEARCH_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
+const TERMINAL_ENRICH_STATUSES = new Set(["completed", "failed"]);
 
-export interface SearchResult {
-  displayName: string;
-  username: string | null;
-  userId: string;
-  city: string | null;
-  age: number | null;
-  matchReason: string;
-  sourceCount: number;
+type Sleep = (milliseconds: number) => Promise<void>;
+
+export interface OrbitV3ClientOptions {
+  apiKey: string;
+  baseUrl?: string;
+  pollTimeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  sleepImpl?: Sleep;
 }
 
-export interface SearchResponse {
-  searchId: string;
-  results: SearchResult[];
-  creditsRemaining: number | null;
+export class OrbitApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: unknown,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+    this.name = "OrbitApiError";
+  }
 }
 
-export async function searchPeople(
-  query: string,
-  numUsers: number,
-  apiKey: string,
-): Promise<SearchResponse> {
-  const response = await fetch(`${BASE_URL}/v2/social/profiles/searches/smart`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "App-Id": APP_ID,
-      "App-Version": APP_VERSION,
-    },
-    body: JSON.stringify({ query, numUsers }),
-  });
+function retryAfterMs(response: Response): number | undefined {
+  const value = response.headers.get("retry-after");
+  if (!value) return undefined;
+  if (/^\d+(\.\d+)?$/.test(value)) return Number(value) * 1_000;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? undefined : Math.max(0, parsed - Date.now());
+}
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Orbit API error ${response.status}: ${body}`);
+function cleanSignals(signals?: SearchSignals): SearchSignals | undefined {
+  if (!signals) return undefined;
+  const clean: SearchSignals = {};
+  if (signals.email?.trim()) clean.email = signals.email.trim();
+  if (signals.linkedin_url?.trim()) clean.linkedin_url = signals.linkedin_url.trim();
+  const usernames = signals.usernames?.map((value) => value.trim()).filter(Boolean);
+  if (usernames?.length) clean.usernames = usernames;
+  const urls = signals.urls?.map((value) => value.trim()).filter(Boolean);
+  if (urls?.length) clean.urls = urls;
+  if (signals.address?.trim()) clean.address = signals.address.trim();
+  if (signals.phone?.trim()) clean.phone = signals.phone.trim();
+  return Object.keys(clean).length ? clean : undefined;
+}
+
+export class OrbitV3Client {
+  private readonly apiKey: string;
+  private readonly baseUrl: string;
+  private readonly pollTimeoutMs: number;
+  private readonly fetchImpl: typeof fetch;
+  private readonly sleepImpl: Sleep;
+
+  constructor(options: OrbitV3ClientOptions) {
+    this.apiKey = options.apiKey.trim();
+    if (!this.apiKey) throw new Error("An Orbit Developer API key is required");
+    this.baseUrl = (options.baseUrl ?? process.env.ORBIT_API_URL ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+    this.pollTimeoutMs = options.pollTimeoutMs ?? Number(process.env.ORBIT_POLL_TIMEOUT_MS || DEFAULT_POLL_TIMEOUT_MS);
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.sleepImpl = options.sleepImpl ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   }
 
-  const creditsHeader = response.headers.get("X-Developer-API-Credits-Remaining");
-  const creditsRemaining = creditsHeader !== null ? parseInt(creditsHeader, 10) : null;
-
-  const data = (await response.json()) as DeveloperSearchResponse;
-  const users = data.payload?.users ?? [];
-
-  return {
-    searchId: data.searchId,
-    creditsRemaining,
-    results: users.map((u) => ({
-      displayName: u.displayName ?? "",
-      username: u.username ?? null,
-      userId: u.userId,
-      city: u.city ?? null,
-      age: u.age ?? null,
-      matchReason: typeof u.matchReason === "string" ? u.matchReason : "",
-      sourceCount: u.sourceCount ?? 0,
-    })),
-  };
-}
-
-export async function getProfile(
-  profileId: string,
-  apiKey: string,
-): Promise<DeveloperProfileResponse["payload"]> {
-  const response = await fetch(
-    `${BASE_URL}/v2/developer/profiles/${encodeURIComponent(profileId)}`,
-    {
-      method: "GET",
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      ...init,
       headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "App-Id": APP_ID,
-        "App-Version": APP_VERSION,
+        Authorization: `Bearer ${this.apiKey}`,
+        Accept: "application/json",
+        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...init.headers,
       },
-    },
-  );
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Orbit API error ${response.status}: ${body}`);
+    });
+    const text = await response.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : undefined;
+    } catch {
+      body = text;
+    }
+    if (!response.ok) {
+      throw new OrbitApiError(`Orbit API request failed with HTTP ${response.status}`, response.status, body, retryAfterMs(response));
+    }
+    return body as T;
   }
 
-  const data = (await response.json()) as DeveloperProfileResponse;
-  return data.payload;
+  private async requestWithRetry<T>(path: string, init: RequestInit = {}, maxAttempts = 5): Promise<T> {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        return await this.request<T>(path, init);
+      } catch (error) {
+        if (!(error instanceof OrbitApiError)) throw error;
+        const retryable = error.status === 429 || error.status >= 500;
+        if (!retryable || attempt === maxAttempts - 1) throw error;
+        const backoffMs = Math.min(10_000, 500 * 2 ** attempt);
+        const jitteredMs = Math.round(backoffMs * (0.8 + Math.random() * 0.4));
+        await this.sleepImpl(error.retryAfterMs ?? jitteredMs);
+      }
+    }
+    throw new Error("Unreachable retry state");
+  }
+
+  private async poll<T extends { status: string }>(initial: T, load: () => Promise<T>, terminalStatuses: ReadonlySet<string>): Promise<T> {
+    const startedAt = Date.now();
+    let attempt = 0;
+    let current = initial;
+    while (!terminalStatuses.has(current.status)) {
+      if (Date.now() - startedAt >= this.pollTimeoutMs) {
+        throw new Error(`Orbit operation timed out in state ${current.status}`);
+      }
+      const backoffMs = Math.min(10_000, 500 * 2 ** attempt);
+      await this.sleepImpl(Math.round(backoffMs * (0.8 + Math.random() * 0.4)));
+      current = await load();
+      attempt += 1;
+    }
+    return current;
+  }
+
+  async searchAndWait(input: SearchInput): Promise<SearchResponse> {
+    const query = input.query?.trim() || undefined;
+    const signals = cleanSignals(input.signals);
+    if (!query && !signals) throw new Error("search_people requires a query or at least one identity signal");
+
+    const request: JsonObject = {
+      request_id: input.request_id?.trim() || randomUUID(),
+      ...(query ? { query } : {}),
+      ...(signals ? { signals } : {}),
+      candidate_discovery: signals?.address || signals?.phone ? false : (input.candidate_discovery ?? false),
+      profile_depth: input.profile_depth ?? "partial",
+      include_profile: true,
+      limit: input.limit ?? 10,
+    };
+    const serializedBody = JSON.stringify(request);
+    const initial = await this.requestWithRetry<SearchResponse>("/v3/search", { method: "POST", body: serializedBody });
+    if (TERMINAL_SEARCH_STATUSES.has(initial.status)) return initial;
+    return this.poll(
+      initial,
+      () => this.requestWithRetry<SearchResponse>(`/v3/search/${encodeURIComponent(initial.search_id)}`),
+      TERMINAL_SEARCH_STATUSES,
+    );
+  }
+
+  getProfile(profileId: string): Promise<ProfileReadResponse> {
+    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`);
+  }
+
+  async enrichAndWait(profileId: string, operation: EnrichOperation, requestId?: string): Promise<EnrichResponse> {
+    const request = {
+      request_id: requestId?.trim() || randomUUID(),
+      operation,
+      include_profile: true,
+    };
+    const serializedBody = JSON.stringify(request);
+    const initial = await this.requestWithRetry<EnrichResponse>(`/v3/enrich/${encodeURIComponent(profileId)}`, {
+      method: "POST",
+      body: serializedBody,
+    });
+    if (TERMINAL_ENRICH_STATUSES.has(initial.status)) return initial;
+    if (!initial.links?.status) throw new Error(`Orbit enrich response missing status link while in state ${initial.status}`);
+    return this.poll(
+      initial,
+      () => this.requestWithRetry<EnrichResponse>(`/v3/enrich/requests/${encodeURIComponent(initial.request_id)}`),
+      TERMINAL_ENRICH_STATUSES,
+    );
+  }
 }
