@@ -25,8 +25,9 @@ steps:
       - us-central1
       - --platform
       - managed
-      - --set-env-vars
-      - MCP_BYPASS_KEY=*
+      - --allow-unauthenticated
+      - --remove-env-vars
+      - MCP_BYPASS_KEY
   - name: gcr.io/cloud-builders/docker
     args:
       - build
@@ -51,6 +52,7 @@ steps:
       - us-central1
       - --platform
       - managed
+      - --allow-unauthenticated
 images:
   - gcr.io/$PROJECT_ID/orbit-mcp
   - gcr.io/$PROJECT_ID/orbit-profile-mcp

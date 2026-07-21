@@ -1,7 +1,7 @@
 {
   "name": "@orbit/profile-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for Orbit user profiles — lookup people by phone/email, store memories, semantic search over learned facts",
+  "version": "2.0.0",
+  "description": "MCP server for Orbit v3 profile resolution",
   "type": "module",
   "bin": {
     "orbit-profile-mcp": "./build/index.js",
@@ -12,14 +12,15 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test test/*.test.mjs",
     "start": "node build/index.js",
     "start:http": "node build/http.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "zod": "^3.23.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

@@ -11,15 +11,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const BYPASS_KEY = process.env.MCP_BYPASS_KEY;
-
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const sessionApiKeys = new Map<string, string>();
 
 function extractApiKey(req: express.Request): string | null {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
-    return auth.slice(7);
+    return auth.slice(7).trim() || null;
   }
   return null;
 }
@@ -29,28 +27,21 @@ function requireApiKey(
   res: express.Response,
   next: express.NextFunction,
 ): void {
-  if (BYPASS_KEY === "*") {
-    next();
-    return;
-  }
-
-  const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (mcpSessionId && sessionApiKeys.has(mcpSessionId)) {
-    next();
-    return;
-  }
-
   const key = extractApiKey(req);
-
-  if (BYPASS_KEY && key === BYPASS_KEY) {
-    next();
-    return;
-  }
-
   if (!key) {
     res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <api_key> header" },
+      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <orbit_developer_api_key> header" },
+      id: null,
+    });
+    return;
+  }
+  const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
+  const sessionApiKey = mcpSessionId ? sessionApiKeys.get(mcpSessionId) : undefined;
+  if (sessionApiKey && sessionApiKey !== key) {
+    res.status(403).json({
+      jsonrpc: "2.0",
+      error: { code: -32600, message: "Forbidden: Developer API key does not match this MCP session" },
       id: null,
     });
     return;
@@ -71,7 +62,7 @@ app.post("/mcp", async (req, res) => {
   }
 
   if (!sessionId && isInitializeRequest(req.body)) {
-    const apiKey = extractApiKey(req) ?? BYPASS_KEY ?? "";
+    const apiKey = extractApiKey(req)!;
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {

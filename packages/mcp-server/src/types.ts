@@ -1,52 +1,67 @@
-export interface DeveloperSearchUser {
-  userId: string;
-  displayName?: string;
-  username?: string;
-  city?: string;
-  age?: number;
-  matchReason?: string;
-  sourceCount?: number;
-  [key: string]: unknown;
+export type JsonObject = Record<string, unknown>;
+
+export type ProfileDepth = "partial" | "full";
+export type EnrichOperation = ProfileDepth | "regenerate";
+
+export interface SearchSignals {
+  email?: string;
+  linkedin_url?: string;
+  usernames?: string[];
+  urls?: string[];
+  address?: string;
+  phone?: string;
 }
 
-export interface DeveloperSearchResponse {
-  status: string;
-  searchId: string;
-  payload: {
-    users: DeveloperSearchUser[];
-  };
+export interface SearchInput {
+  request_id?: string;
+  query?: string;
+  signals?: SearchSignals;
+  candidate_discovery?: boolean;
+  profile_depth?: ProfileDepth;
+  limit?: number;
 }
 
-export interface DeveloperProfileResponse {
-  status: string;
-  payload: {
-    id: string;
-    orbitId: string;
-    displayName: string;
-    avatarUrl: string | null;
-    profileUrl: string | null;
-    verified: boolean;
-    location: {
-      city: string | null;
-    } | null;
-    headline: {
-      jobTitle: string | null;
-      companyName: string | null;
-      schoolName: string | null;
-    } | null;
-    sections: {
-      basic: Record<string, unknown> | null;
-      personalLife: Record<string, unknown> | null;
-      jobs: Record<string, unknown> | null;
-      education: Record<string, unknown> | null;
-      passions: Record<string, unknown> | null;
-      worldview: Record<string, unknown> | null;
-      accomplishments: Record<string, unknown> | null;
-      controversies: Record<string, unknown> | null;
-      bestQualities: Record<string, unknown> | null;
-      netWorth: Record<string, unknown> | null;
-      portfolio: Record<string, unknown> | null;
-      families: Record<string, unknown> | null;
-    };
-  };
+export interface Failure {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface SearchResult {
+  profile_id: string;
+  status: "enriching" | "ready" | "failed";
+  generation_level: number | null;
+  profile?: JsonObject;
+  failure?: Failure;
+}
+
+export interface SearchResponse {
+  search_id: string;
+  request_id: string;
+  status: "running" | "completed" | "completed_with_errors" | "failed";
+  candidate_discovery: boolean;
+  profile_depth: ProfileDepth;
+  include_profile: boolean;
+  results: SearchResult[];
+  created_at: string;
+  updated_at: string;
+  links: { status: string };
+}
+
+export interface ProfileReadResponse {
+  profile_id: string;
+  generation_level: number;
+  profile: JsonObject;
+}
+
+export interface EnrichResponse {
+  request_id: string;
+  profile_id: string;
+  status: "running" | "completed" | "failed";
+  operation: EnrichOperation;
+  include_profile: boolean;
+  generation_level?: number | null;
+  profile?: JsonObject;
+  failure?: Failure;
+  links?: { status?: string; profile: string };
 }

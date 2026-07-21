@@ -17,7 +17,7 @@ const sessionApiKeys = new Map<string, string>();
 function extractApiKey(req: express.Request): string | null {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
-    return auth.slice(7);
+    return auth.slice(7).trim() || null;
   }
   return null;
 }
@@ -27,17 +27,21 @@ function requireApiKey(
   res: express.Response,
   next: express.NextFunction,
 ): void {
-  const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (mcpSessionId && sessionApiKeys.has(mcpSessionId)) {
-    next();
-    return;
-  }
-
   const key = extractApiKey(req);
   if (!key) {
     res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <api_key> header" },
+      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <orbit_developer_api_key> header" },
+      id: null,
+    });
+    return;
+  }
+  const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
+  const sessionApiKey = mcpSessionId ? sessionApiKeys.get(mcpSessionId) : undefined;
+  if (sessionApiKey && sessionApiKey !== key) {
+    res.status(403).json({
+      jsonrpc: "2.0",
+      error: { code: -32600, message: "Forbidden: Developer API key does not match this MCP session" },
       id: null,
     });
     return;
