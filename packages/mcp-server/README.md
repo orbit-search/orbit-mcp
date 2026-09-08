@@ -54,7 +54,7 @@ Claude Desktop or another stdio MCP client:
 ## Remote Streamable HTTP
 
 Use the public endpoint `https://api.orbitsearch.com/mcp`. See the
-[connection guide](https://docs.orbitsearch.com/mcp) for setup and troubleshooting.
+[connection guide](https://docs.orbitsearch.com/mcp-server) for setup and troubleshooting.
 An Orbit API key is required; this server does not offer OAuth sign-in.
 
 To run your own instance:
