@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.orbit-search/orbit",
+  "title": "Orbit",
+  "description": "The most in-depth, source-backed context about a person for deep personalization and research.",
+  "version": "2.0.0",
+  "websiteUrl": "https://developer.orbitsearch.com/",
+  "repository": {
+    "url": "https://github.com/orbit-search/orbit-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.orbitsearch.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer followed by a space and your Orbit API key from https://developer.orbitsearch.com/dashboard/keys. Required scopes: search:read and profile:read.",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

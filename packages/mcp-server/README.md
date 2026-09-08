@@ -53,6 +53,12 @@ Claude Desktop or another stdio MCP client:
 
 ## Remote Streamable HTTP
 
+Use the public endpoint `https://api.orbitsearch.com/mcp`. See the
+[connection guide](https://docs.orbitsearch.com/mcp) for setup and troubleshooting.
+An Orbit API key is required; this server does not offer OAuth sign-in.
+
+To run your own instance:
+
 ```bash
 npm run start:http
 ```
@@ -64,7 +70,7 @@ The MCP endpoint is `/mcp`; `/health` is an unauthenticated process-health endpo
   "mcpServers": {
     "orbit": {
       "type": "streamable-http",
-      "url": "https://your-orbit-mcp.example.com/mcp",
+      "url": "https://api.orbitsearch.com/mcp",
       "headers": {
         "Authorization": "Bearer sk_orb_REDACTED"
       }
