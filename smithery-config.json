@@ -4,9 +4,8 @@
   "properties": {
     "orbitAuthorization": {
       "type": "string",
-      "title": "Orbit API authorization",
-      "description": "Enter Bearer followed by a space and your Orbit API key from https://developer.orbitsearch.com/dashboard/keys. Required scopes: search:read and profile:read.",
-      "pattern": "^Bearer sk_orb_.+$",
+      "title": "Orbit API key",
+      "description": "Paste your sk_orb_ key. Get one at https://developer.orbitsearch.com/dashboard/keys.",
       "x-to": { "header": "Authorization" },
       "x-from": { "header": "x-orbit-authorization" },
       "x-order": 0

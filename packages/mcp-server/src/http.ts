@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/** Stateful public MCP transport; customer keys remain bound to each session. */
 
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -6,6 +7,7 @@ import cors from "cors";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createOrbitServer } from "./server.js";
+import { API_KEY_HELP, extractApiKey } from "./api-key-auth.js";
 
 const app = express();
 app.use(cors());
@@ -14,24 +16,16 @@ app.use(express.json());
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const sessionApiKeys = new Map<string, string>();
 
-function extractApiKey(req: express.Request): string | null {
-  const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) {
-    return auth.slice(7).trim() || null;
-  }
-  return null;
-}
-
 function requireApiKey(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ): void {
-  const key = extractApiKey(req);
+  const key = extractApiKey(req.headers.authorization);
   if (!key) {
     res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32600, message: "Unauthorized: missing Authorization: Bearer <orbit_developer_api_key> header" },
+      error: { code: -32600, message: API_KEY_HELP },
       id: null,
     });
     return;
@@ -41,7 +35,7 @@ function requireApiKey(
   if (sessionApiKey && sessionApiKey !== key) {
     res.status(403).json({
       jsonrpc: "2.0",
-      error: { code: -32600, message: "Forbidden: Developer API key does not match this MCP session" },
+      error: { code: -32600, message: "This MCP session belongs to a different API key. Reconnect to Orbit after changing your key." },
       id: null,
     });
     return;
@@ -62,7 +56,7 @@ app.post("/mcp", async (req, res) => {
   }
 
   if (!sessionId && isInitializeRequest(req.body)) {
-    const apiKey = extractApiKey(req)!;
+    const apiKey = extractApiKey(req.headers.authorization)!;
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
@@ -112,6 +106,8 @@ app.get("/health", (_req, res) => {
 });
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-app.listen(PORT, () => {
-  console.error(`Orbit MCP HTTP server running on http://localhost:${PORT}/mcp`);
+const listener = app.listen(PORT, () => {
+  const address = listener.address();
+  const port = address && typeof address === "object" ? address.port : PORT;
+  console.error(`Orbit MCP HTTP server running on http://localhost:${port}/mcp`);
 });

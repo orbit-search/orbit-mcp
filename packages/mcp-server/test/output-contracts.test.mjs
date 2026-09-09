@@ -93,7 +93,10 @@ test("HTTP auth errors stay tool errors, not successful profile envelopes", asyn
   await withClient(async client => {
     const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "person-1" } });
     assert.equal(result.isError, true);
-    assert.deepEqual(result.structuredContent, { error: "Orbit API request failed with HTTP 403" });
+    assert.deepEqual(Object.keys(result.structuredContent), ["error"]);
+    assert.match(result.structuredContent.error, /HTTP 403/);
+    assert.match(result.structuredContent.error, /profile:read/);
+    assert.match(result.structuredContent.error, /developer.orbitsearch.com\/dashboard\/keys/);
     assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   }, { error: "denied" }, 403);
 });

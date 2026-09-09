@@ -43,6 +43,22 @@ Authorization: Bearer sk_orb_REDACTED
 
 There is no bypass key. The MCP forwards the key only to the configured Orbit API base URL.
 
+### Smithery setup
+
+Create a key at [Orbit API keys](https://developer.orbitsearch.com/dashboard/keys)
+with `search:read` and `profile:read`. In Smithery's **Orbit API key** field, paste
+only the `sk_orb_...` key. Existing `Bearer sk_orb_...` values still work.
+The same `orbitAuthorization` config field and `x-orbit-authorization` header are
+retained so saved connections do not need to be recreated. Smithery forwards this
+secret in the Authorization header, never in the URL. The MCP normalizes the key
+and sends standard Bearer authentication to the v3 API.
+
+Missing credentials return setup instructions. If a tool returns HTTP 401, check
+whether the key is invalid, expired, or revoked, then reconnect with a valid key.
+For HTTP 403, check scopes and account access. Discovery alone does not validate
+the key: run `get_profile` with a known profile ID to verify upstream access.
+Changing to a different key requires a new MCP session.
+
 ## Local stdio
 
 ```bash
