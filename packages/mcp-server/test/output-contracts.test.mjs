@@ -46,7 +46,7 @@ test("all three tools advertise substantive output schemas and accurate annotati
       assert.equal(tool.outputSchema.additionalProperties, true);
     }
     assert.deepEqual(tools[0].annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });
-    assert.deepEqual(tools[1].annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    assert.deepEqual(tools[1].annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     assert.deepEqual(tools[2].annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
   });
 });

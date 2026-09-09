@@ -62,7 +62,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     {
       description: "Read an existing Orbit profile by its canonical profile ID through v3 Enrich. This read does not regenerate the profile.",
       outputSchema: profileOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
       inputSchema: {
         profile_id: z.string().min(1).max(500).describe("Canonical Orbit profile ID returned by search_people."),
       },
