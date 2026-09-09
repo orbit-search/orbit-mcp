@@ -12,6 +12,22 @@ Public MCP server for Orbit Developer API v3 Search and Enrich. It is a thin aut
 
 Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
+All three tools declare output schemas and return `structuredContent` alongside
+the same serialized JSON in `content` for compatibility. Schemas describe the v3
+response envelopes; profile bodies and new API fields remain open-ended so no
+person context or source evidence is dropped. Tool errors retain `isError: true`;
+exception payloads are `{ error: string }`, outside the successful output schema.
+
+Annotations mark only `get_profile` as read-only and idempotent. Search may build
+profiles; enrichment may regenerate and replace existing context. Neither write
+tool promises unconditional idempotency because `request_id` is optional.
+
+After building, `node scripts/server-card.mjs` prints a credential-free discovery
+card from the actual registered tools. Mirror it into the infrastructure Worker's
+`server-card.mjs` only with a coordinated release: deploy the MCP server first,
+compare live discovery, then deploy the card and republish Smithery. Do not
+advertise the new contract before its runtime is deployed.
+
 ## Authentication
 
 Use an Orbit Developer API key with:
