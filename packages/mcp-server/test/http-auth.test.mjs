@@ -6,6 +6,23 @@ import { once } from "node:events";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
+async function stopChild(child) {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.kill();
+  await exited;
+}
+
+test("HTTP cleanup returns after a startup failure or signal exit", { timeout: 5000 }, async () => {
+  for (const signal of [false, true]) {
+    const child = spawn(process.execPath, ["-e", signal ? "setInterval(() => {}, 1000)" : "process.exit(1)"], { stdio: "ignore" });
+    const exited = once(child, "exit");
+    if (signal) child.kill();
+    await exited;
+    await stopChild(child);
+  }
+});
+
 test("HTTP setup accepts raw keys, retains Bearer sessions, and rejects key changes", async () => {
   const child = spawn(process.execPath, ["build/http.js"], {
     cwd: new URL("..", import.meta.url),
@@ -16,7 +33,7 @@ test("HTTP setup accepts raw keys, retains Bearer sessions, and rejects key chan
   try {
     const url = await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("HTTP startup timed out")), 10_000);
-      child.once("error", reject);
+      child.once("error", error => { clearTimeout(timeout); reject(error); });
       child.once("exit", () => { clearTimeout(timeout); reject(new Error("HTTP process exited")); });
       child.stderr.on("data", chunk => {
         const match = /http:\/\/localhost:(\d+)\/mcp/.exec(String(chunk));
@@ -41,10 +58,11 @@ test("HTTP setup accepts raw keys, retains Bearer sessions, and rejects key chan
       if (expected === 403) assert.match(body, /Reconnect/);
     }
   } finally {
-    if (transport?.sessionId) await transport.terminateSession();
-    await client?.close();
-    const exited = once(child, "exit");
-    child.kill();
-    await exited;
+    try {
+      if (transport?.sessionId) await transport.terminateSession();
+      await client?.close();
+    } finally {
+      await stopChild(child);
+    }
   }
 });
