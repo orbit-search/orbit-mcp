@@ -93,8 +93,10 @@ export class OrbitV3Client {
       body = text;
     }
     if (!response.ok) {
-      const message = response.status === 401
-        ? `Orbit rejected this API key (HTTP 401). It may be invalid, expired, or revoked. Check your key at ${API_KEY_URL}, then reconnect.`
+      const apiError = body && typeof body === "object" && "error" in body ? body.error : undefined;
+      const invalidKey = response.status === 403 && apiError && typeof apiError === "object" && "code" in apiError && apiError.code === "invalid_api_key";
+      const message = response.status === 401 || invalidKey
+        ? `Orbit rejected this API key (HTTP ${response.status}). It may be invalid, expired, or revoked. Check your key at ${API_KEY_URL}, then reconnect.`
         : response.status === 403
           ? `Orbit denied this operation (HTTP 403). Check the key's permissions at ${API_KEY_URL}: profile reads need profile:read; search and enrichment need search:read, plus profile:read for returned profiles. If scopes are correct, check your account access.`
           : `Orbit API request failed with HTTP ${response.status}`;

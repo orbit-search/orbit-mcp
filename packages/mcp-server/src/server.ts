@@ -13,7 +13,12 @@ function toolResult(value: object, isError = false) {
 }
 
 function toolError(error: unknown) {
-  return toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
+  // Exception envelopes do not match successful output schemas. Some clients
+  // validate any structuredContent even when isError is true, hiding the error.
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) }],
+    isError: true,
+  };
 }
 
 const signalsSchema = z
