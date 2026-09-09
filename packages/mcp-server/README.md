@@ -16,7 +16,9 @@ All three tools declare output schemas and return `structuredContent` alongside
 the same serialized JSON in `content` for compatibility. Schemas describe the v3
 response envelopes; profile bodies and new API fields remain open-ended so no
 person context or source evidence is dropped. Tool errors retain `isError: true`;
-exception payloads are `{ error: string }`, outside the successful output schema.
+exception payloads are `{ error: string }` in text content only, outside the
+successful output schema. This keeps schema-validating clients from hiding the
+actionable error behind a structured-output validation failure.
 
 Annotations mark only `get_profile` as read-only and idempotent. Search may build
 profiles; enrichment may regenerate and replace existing context. Neither write
@@ -55,7 +57,8 @@ and sends standard Bearer authentication to the v3 API.
 
 Missing credentials return setup instructions. If a tool returns HTTP 401, check
 whether the key is invalid, expired, or revoked, then reconnect with a valid key.
-For HTTP 403, check scopes and account access. Discovery alone does not validate
+Invalid-key HTTP 403 responses also explain how to reconnect; other HTTP 403
+responses point to scopes and account access. Discovery alone does not validate
 the key: run `get_profile` with a known profile ID to verify upstream access.
 Changing to a different key requires a new MCP session.
 

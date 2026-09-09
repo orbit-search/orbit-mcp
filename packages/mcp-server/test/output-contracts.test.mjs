@@ -28,6 +28,8 @@ async function withClient(run, responseBody, responseStatus = 200) {
   const [ct, st] = InMemoryTransport.createLinkedPair();
   try {
     await Promise.all([server.connect(st), client.connect(ct)]);
+    // Real clients discover first; this enables client-side output validation.
+    await client.listTools();
     return await run(client);
   } finally {
     globalThis.fetch = originalFetch;
@@ -93,12 +95,22 @@ test("HTTP auth errors stay tool errors, not successful profile envelopes", asyn
   await withClient(async client => {
     const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "person-1" } });
     assert.equal(result.isError, true);
-    assert.deepEqual(Object.keys(result.structuredContent), ["error"]);
-    assert.match(result.structuredContent.error, /HTTP 403/);
-    assert.match(result.structuredContent.error, /profile:read/);
-    assert.match(result.structuredContent.error, /developer.orbitsearch.com\/dashboard\/keys/);
-    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+    assert.equal(result.structuredContent, undefined);
+    const error = JSON.parse(result.content[0].text).error;
+    assert.match(error, /HTTP 403/);
+    assert.match(error, /profile:read/);
+    assert.match(error, /developer.orbitsearch.com\/dashboard\/keys/);
   }, { error: "denied" }, 403);
+});
+
+test("invalid keys surface reconnect instructions after tool discovery", async () => {
+  await withClient(async client => {
+    const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "person-1" } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    assert.match(JSON.parse(result.content[0].text).error, /rejected this API key \(HTTP 403\)/);
+    assert.match(JSON.parse(result.content[0].text).error, /reconnect/);
+  }, { status: "failure", error: { code: "invalid_api_key", message: "sensitive detail" } }, 403);
 });
 
 test("malformed successful output is rejected by SDK output validation", async () => {
