@@ -26,6 +26,22 @@ function clientWithResponses(responses, calls, sleeps = []) {
   });
 }
 
+test("auth failures provide actionable guidance without retrying or echoing upstream secrets", async () => {
+  for (const status of [401, 403]) {
+    const calls = [];
+    const client = clientWithResponses([jsonResponse({ message: "sensitive-upstream-value" }, status)], calls);
+    await assert.rejects(() => client.getProfile("profile-1"), (error) => {
+      assert(error instanceof OrbitApiError);
+      assert.equal(error.status, status);
+      assert.match(error.message, /developer.orbitsearch.com\/dashboard\/keys/);
+      assert.doesNotMatch(error.message, /sensitive-upstream-value/);
+      assert.match(error.message, status === 401 ? /reconnect/ : /profile:read/);
+      return true;
+    });
+    assert.equal(calls.length, 1);
+  }
+});
+
 test("search_people starts v3 work with a stable request ID and polls to terminal", async () => {
   const calls = [];
   const client = clientWithResponses(
