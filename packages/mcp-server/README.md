@@ -37,7 +37,7 @@ For API-key connections, use an Orbit Developer API key with:
 - `search:read` for Search, polling, and Enrich operations;
 - `profile:read` for profile reads and embedded profiles.
 
-API-key clients must send the key on every MCP request:
+HTTP clients using API-key authentication must send the key on every MCP request:
 
 ```http
 Authorization: Bearer sk_orb_REDACTED
