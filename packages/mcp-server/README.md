@@ -1,6 +1,6 @@
 # Orbit MCP
 
-Public MCP server for Orbit Developer API v3 Search and Enrich. It is a thin authenticated adapter: every Orbit request uses the connecting customer's Developer API key and remains subject to that key's scopes and rate limits.
+Public MCP server for Orbit Developer API v3 Search and Enrich. The hosted endpoint supports OAuth sign-in or an Orbit Developer API key. This package forwards authenticated requests to the v3 API, which enforces scopes and rate limits.
 
 ## Tools
 
@@ -32,12 +32,12 @@ advertise the new contract before its runtime is deployed.
 
 ## Authentication
 
-Use an Orbit Developer API key with:
+For API-key connections, use an Orbit Developer API key with:
 
 - `search:read` for Search, polling, and Enrich operations;
 - `profile:read` for profile reads and embedded profiles.
 
-Remote HTTP clients must send the key on every MCP request:
+HTTP clients using API-key authentication must send the key on every MCP request:
 
 ```http
 Authorization: Bearer sk_orb_REDACTED
@@ -90,7 +90,13 @@ Claude Desktop or another stdio MCP client:
 
 Use the public endpoint `https://api.orbitsearch.com/mcp`. See the
 [connection guide](https://docs.orbitsearch.com/mcp-server) for setup and troubleshooting.
-An Orbit API key is required; this server does not offer OAuth sign-in.
+For OAuth, add the URL to an OAuth-capable MCP client without a custom
+authorization header. Start its sign-in flow, review Orbit's consent screen, and
+continue with Google. The client handles Orbit access tokens and refresh.
+
+API-key connections remain supported using the configuration below. Smithery's
+API-key setup is unchanged. OAuth is provided by the hosted endpoint's gateway;
+self-hosted instances of this package use API keys.
 
 To run your own instance:
 
