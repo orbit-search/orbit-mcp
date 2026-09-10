@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitV3Client } from "./orbit-api.js";
+import { registerDirectoryTools } from "./directory-tools.js";
 import { searchOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
@@ -34,7 +35,7 @@ const signalsSchema = z
 
 export function createOrbitServer(apiKey: string): McpServer {
   const client = new OrbitV3Client({ apiKey });
-  const server = new McpServer({ name: "orbit-mcp", version: "2.1.0" });
+  const server = new McpServer({ name: "orbit-mcp", version: "2.2.0" });
 
   server.registerTool(
     "get_credit_usage",
@@ -118,5 +119,6 @@ export function createOrbitServer(apiKey: string): McpServer {
     },
   );
 
+  registerDirectoryTools(server);
   return server;
 }

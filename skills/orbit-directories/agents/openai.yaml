@@ -1,0 +1,11 @@
+interface:
+  display_name: "Orbit directories"
+  short_description: "Manage directories through Orbit MCP"
+  default_prompt: "Use $orbit-directories to organize and research people in my Orbit directories."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "orbit"
+      description: "Orbit general MCP server"
+      transport: "streamable_http"
+      url: "https://api.orbitsearch.com/mcp"

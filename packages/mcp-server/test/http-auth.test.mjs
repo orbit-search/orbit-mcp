@@ -46,7 +46,7 @@ test("HTTP setup accepts raw keys, retains Bearer sessions, and rejects key chan
     client = new Client({ name: "http-auth-test", version: "1.0.0" });
     transport = new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: "sk_orb_test" } } });
     await client.connect(transport);
-    assert.equal((await client.listTools()).tools.length, 4);
+    assert.equal((await client.listTools()).tools.length, 42);
     for (const [authorization, expected] of [["Bearer sk_orb_test", 200], ["sk_orb_other", 403]]) {
       const response = await fetch(url, {
         method: "POST",

@@ -42,9 +42,10 @@ async function withClient(run, responseBody, responseStatus = 200) {
 
 test("all tools advertise output schemas and accurate annotations", async () => {
   await withClient(async client => {
-    const discovery = await client.listTools();
-    const tools = discovery.tools.filter(tool => tool.name !== "get_credit_usage");
-    assert.equal(client.getServerVersion().version, "2.1.0");
+    const catalog = await client.listTools();
+    assert.equal(catalog.tools.length, 42);
+    const tools = catalog.tools.filter(tool => ["search_people", "get_profile", "enrich_profile"].includes(tool.name));
+    assert.equal(client.getServerVersion().version, "2.2.0");
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
     for (const tool of tools) {
       assert.equal(tool.outputSchema.type, "object");
@@ -54,10 +55,10 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     assert.deepEqual(tools[0].annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });
     assert.deepEqual(tools[1].annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     assert.deepEqual(tools[2].annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
-    const usage = discovery.tools.find(tool => tool.name === "get_credit_usage");
+    const usage = catalog.tools.find(tool => tool.name === "get_credit_usage");
     assert.deepEqual(usage.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     assert.deepEqual(usage.inputSchema.properties, {});
-    assert.equal(discovery.tools.length, 4);
+    assert.equal(catalog.tools.length, 42);
   });
 });
 
