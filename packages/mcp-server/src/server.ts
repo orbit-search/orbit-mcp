@@ -41,7 +41,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     {
       description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. This read does not purchase credits or start billable work.",
       outputSchema: creditUsageOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       inputSchema: {},
     },
     async () => {

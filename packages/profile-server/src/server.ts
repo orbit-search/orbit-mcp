@@ -24,7 +24,7 @@ export function createProfileServer(apiKey: string): McpServer {
   server.registerTool("get_credit_usage", {
     description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. No purchase or billable work is started.",
     inputSchema: {}, outputSchema: creditUsageOutputSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async () => {
     try {
       const result = await client.getCreditUsage();

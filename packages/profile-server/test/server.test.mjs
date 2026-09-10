@@ -14,7 +14,7 @@ test("profile server exposes profile resolution and read-only credit usage", asy
   try {
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map(({ name }) => name), ["get_credit_usage", "get_profile"]);
-    assert.equal(tools[0].annotations.readOnlyHint, true);
+    assert.deepEqual(tools[0].annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     assert.deepEqual(tools[0].inputSchema.properties, {});
   } finally {
     await Promise.all([client.close(), server.close()]);

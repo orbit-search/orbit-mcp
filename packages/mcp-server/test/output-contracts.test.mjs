@@ -55,7 +55,7 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     assert.deepEqual(tools[1].annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
     assert.deepEqual(tools[2].annotations, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true });
     const usage = discovery.tools.find(tool => tool.name === "get_credit_usage");
-    assert.deepEqual(usage.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true });
+    assert.deepEqual(usage.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     assert.deepEqual(usage.inputSchema.properties, {});
     assert.equal(discovery.tools.length, 4);
   });
