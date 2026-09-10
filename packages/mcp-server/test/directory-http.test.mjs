@@ -68,7 +68,12 @@ test("directory tools enforce request-local scopes and route all 38 operations t
     assert.equal(directoryTools.length, 38);
     const payloadSchema = name => catalog.find(tool => tool.name === name).outputSchema.properties.data.properties.payload;
     assert.equal(payloadSchema("count_directory_people").properties.count.type, "number");
-    assert.equal(payloadSchema("list_directories").properties.directories.items.properties.name.type, "string");
+    const directorySchema = catalog.find(tool => tool.name === "list_directories").outputSchema;
+    const nameField = payloadSchema("list_directories").properties.directories.items.properties.name;
+    const resolvedName = nameField.$ref
+      ? nameField.$ref.slice(2).split("/").reduce((value, key) => value[key.replaceAll("~1", "/").replaceAll("~0", "~")], directorySchema)
+      : nameField;
+    assert.equal(resolvedName.type, "string");
     assert.equal(payloadSchema("get_directory_source_status").properties.backfills.type, "array");
     for (const permission of [undefined, "directories.read", "directories.write"]) {
       scopes = permission ? [permission] : undefined;
