@@ -21,11 +21,13 @@ const argsFor = def => Object.fromEntries(Object.keys(def.input).filter(key => f
 test("directory tools enforce request-local scopes and route all 38 operations through user auth", async () => {
   const requests = [];
   let status = 200;
+  let responseOverride;
+  let emptyBody = false;
   const upstream = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     requests.push({ url: req.url, method: req.method, headers: req.headers, body });
-    res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(status === 200 ? { status: "success", payload: { queued: true } } : { message: "synthetic-private-user-token" }));
+    res.writeHead(status, { "content-type": "application/json" }).end(emptyBody ? undefined : JSON.stringify(responseOverride ?? (status === 200 ? { status: "success", payload: { queued: true } } : { message: "synthetic-private-user-token" })));
   }).listen(0, "127.0.0.1");
   await once(upstream, "listening");
   const savedHost = process.env.ORBIT_API_URL;
@@ -64,6 +66,10 @@ test("directory tools enforce request-local scopes and route all 38 operations t
     const catalog = (await client.listTools()).tools;
     assert.equal(catalog.length, 41);
     assert.equal(directoryTools.length, 38);
+    const payloadSchema = name => catalog.find(tool => tool.name === name).outputSchema.properties.data.properties.payload;
+    assert.equal(payloadSchema("count_directory_people").properties.count.type, "number");
+    assert.equal(payloadSchema("list_directories").properties.directories.items.properties.name.type, "string");
+    assert.equal(payloadSchema("get_directory_source_status").properties.backfills.type, "array");
     for (const permission of [undefined, "directories.read", "directories.write"]) {
       scopes = permission ? [permission] : undefined;
       for (const def of directoryTools) {
@@ -109,6 +115,30 @@ test("directory tools enforce request-local scopes and route all 38 operations t
     assert.equal(denied.isError, true);
     assert.ok(!JSON.stringify(denied).includes("synthetic-private-user-token"));
     assert.equal(requests.length, before + 1, "no automatic retries");
+    status = 200;
+    for (const envelope of [
+      { status: "failed", error: { code: "import_failed", message: "Some rows failed" }, payload: { source_status: "failed", source: { id, error: "Invalid rows", validation_errors: [{ row: 2, reasons: ["Missing identity"] }] } } },
+      { status: "success", payload: { source_status: "failed", source: { id, error: "Import stopped" }, backfills: [] } }
+    ]) {
+      responseOverride = envelope;
+      const result = await client.callTool({ name: "get_directory_source_status", arguments: { organizationId: id, directoryId: id, sourceId: id } });
+      assert.equal(result.isError, true);
+      assert.deepEqual(result.structuredContent, { data: envelope });
+      assert.deepEqual(JSON.parse(result.content[0].text), envelope);
+    }
+    responseOverride = { status: "success", payload: { refreshes: [{ request_id: id, status: "failed", error: "A profile failed", runs: { completed: 2, failed: 1 }, extra_diagnostic: "preserved" }] } };
+    const history = await client.callTool({ name: "list_directory_refreshes", arguments: { organizationId: id, directoryId: id } });
+    assert.notEqual(history.isError, true, "a history list containing failures is still a successful read");
+    assert.deepEqual(history.structuredContent.data, responseOverride);
+    responseOverride = undefined;
+    emptyBody = true;
+    for (const code of [204, 200]) {
+      status = code;
+      const result = await client.callTool({ name: "delete_directory_watcher", arguments: { organizationId: id, directoryId: id, watcherId: id } });
+      assert.notEqual(result.isError, true);
+      assert.deepEqual(result.structuredContent, { data: {} });
+    }
+    emptyBody = false;
     status = 200;
     before = requests.length;
     expired = true;

@@ -4,6 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { requestDirectory, DirectoryApiError } from "./directory-api.js";
 import { directoryContext } from "./directory-auth.js";
+import { directoryOutputSchema, directoryResultHasFailure } from "./directory-output-schemas.js";
 
 const uuid = z.string().uuid();
 const text = z.string().trim().min(1).max(200);
@@ -116,7 +117,7 @@ export function registerDirectoryTools(server: McpServer) {
       title: def.name.replaceAll("_", " "),
       description: `Use this when the user wants to ${def.description} Requires an Orbit OAuth connection; Orbit enforces organization and directory permissions.`,
       inputSchema: def.input,
-      outputSchema: { data: z.record(z.string(), z.unknown()) },
+      outputSchema: directoryOutputSchema(def.name),
       annotations: { readOnlyHint: def.read, destructiveHint: !def.read, openWorldHint: def.external ?? false },
       _meta: { securitySchemes: [{ type: "oauth2", scopes: ["search.read", permission] }] }
     }, async (args: Record<string, unknown>): Promise<CallToolResult> => {
@@ -135,8 +136,8 @@ export function registerDirectoryTools(server: McpServer) {
         const result = await requestDirectory(path, options, auth);
         if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("invalid_response");
         const envelope = result as Record<string, unknown>;
-        if (envelope.status === "failed" || envelope.status === "error") throw new Error("upstream_failure");
-        return { structuredContent: { data: envelope }, content: [{ type: "text", text: JSON.stringify(envelope) }] };
+        return { structuredContent: { data: envelope }, content: [{ type: "text", text: JSON.stringify(envelope) }],
+          ...(directoryResultHasFailure(envelope) ? { isError: true } : {}) };
       } catch (error) {
         const status = error instanceof DirectoryApiError ? error.status : undefined;
         return { isError: true, content: [{ type: "text", text: status === 401 || status === 403

@@ -187,6 +187,10 @@ The catalog also includes 38 directory tools: organization discovery, directory
 lifecycle, member management, scoped search, CSV imports and source tracking,
 entity population, access grants, one-time refreshes, directory watchers, and
 activity. Their schemas and exact routes live in `src/directory-tools.ts`.
+Response-family schemas in `src/directory-output-schemas.ts` describe directories,
+members, pagination, counts, sources, grants, refreshes and watchers while retaining
+unknown profile evidence and partial responses. Failed operations preserve their
+structured diagnostics with `isError`; empty successful mutations return `{ data: {} }`.
 Use the [general MCP directory skill](../../skills/orbit-directories/SKILL.md)
 for workflows and safeguards. These capabilities are not ChatGPT-specific.
 

@@ -15,5 +15,6 @@ export async function requestDirectory(path: string, options: { method: string; 
   });
   // Never echo upstream error bodies or retry an ambiguous write automatically.
   if (!response.ok) { await response.body?.cancel(); throw new DirectoryApiError(response.status); }
-  return response.json();
+  const body = await response.text();
+  return body.trim() ? JSON.parse(body) : {};
 }
