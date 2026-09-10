@@ -18,6 +18,8 @@ Orbit uses usage-based credits. Customers connect their own Orbit API key, and O
 
 HTTP `402` is returned as a tool error with billing guidance, without automatic retries. Automatic retries of Search and Enrich submissions reuse the same serialized body and `request_id`; status polling continues the existing operation rather than starting new work. When retrying a logical operation manually, retain its `request_id` too.
 
+Each explicit profile read sends a fresh `Idempotency-Key` that is reused for that read's automatic transport retries. A separate tool call performs a new logical read with a new key.
+
 The profile-resolution package returns an embedded Search profile when available. If Search omits it, the package performs an explicit profile read, subject to the API's profile-read billing policy.
 
 All three tools declare output schemas and return `structuredContent` alongside

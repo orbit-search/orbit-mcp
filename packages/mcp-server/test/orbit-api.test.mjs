@@ -65,6 +65,24 @@ test("automatic search and enrich retries retain the generated billing idempoten
   }
 });
 
+test("profile-read retries retain one idempotency header and independent reads use new keys", async () => {
+  const calls = [];
+  const profile = { profile_id: "profile-1", generation_level: 3, profile: {} };
+  const client = clientWithResponses([
+    jsonResponse({ error: "temporary failure" }, 503),
+    jsonResponse(profile),
+    jsonResponse(profile),
+  ], calls);
+  await client.getProfile("profile-1");
+  await client.getProfile("profile-1");
+  assert.equal(calls.length, 3);
+  const keys = calls.map(call => call.init.headers["Idempotency-Key"]);
+  assert(keys.every(key => /^[0-9a-f-]{36}$/.test(key)));
+  assert.equal(keys[0], keys[1]);
+  assert.notEqual(keys[1], keys[2]);
+  assert(calls.every(call => call.init.headers.Authorization === "Bearer sk_orb_test"));
+});
+
 test("auth failures provide actionable guidance without retrying or echoing upstream secrets", async () => {
   for (const status of [401, 403]) {
     const calls = [];

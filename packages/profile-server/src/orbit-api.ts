@@ -101,6 +101,7 @@ export class ProfileOrbitClient {
         Authorization: `Bearer ${this.apiKey}`,
         Accept: "application/json",
         ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...init.headers,
       },
     });
     const text = await response.text();
@@ -167,7 +168,10 @@ export class ProfileOrbitClient {
   }
 
   getProfile(profileId: string): Promise<ProfileReadResponse> {
-    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`);
+    // One key per logical paid read, retained by all transport retries.
+    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`, {
+      headers: { "Idempotency-Key": randomUUID() },
+    });
   }
 
   async resolveProfile(query: string, profileDepth: ProfileDepth, requestId?: string): Promise<ProfileReadResponse | null> {

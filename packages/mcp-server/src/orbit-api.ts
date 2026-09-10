@@ -164,7 +164,10 @@ export class OrbitV3Client {
   }
 
   getProfile(profileId: string): Promise<ProfileReadResponse> {
-    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`);
+    // One key per logical paid read, retained by all transport retries.
+    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`, {
+      headers: { "Idempotency-Key": randomUUID() },
+    });
   }
 
   async enrichAndWait(profileId: string, operation: EnrichOperation, requestId?: string): Promise<EnrichResponse> {
