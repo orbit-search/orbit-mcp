@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { billingSchema, creditUsageOutputSchema, type OperationBilling } from "./billing.js";
 
 const DEFAULT_BASE_URL = "https://api.orbitsearch.com";
 const TERMINAL_SEARCH_STATUSES = new Set(["completed", "completed_with_errors", "failed"]);
@@ -17,6 +18,7 @@ export interface ProfileSearchResult {
 }
 
 export interface ProfileSearchResponse {
+  billing?: OperationBilling;
   search_id: string;
   request_id: string;
   status: "running" | "completed" | "completed_with_errors" | "failed";
@@ -24,6 +26,8 @@ export interface ProfileSearchResponse {
 }
 
 export interface ProfileReadResponse {
+  billing?: OperationBilling;
+  search_billing?: OperationBilling;
   profile_id: string;
   generation_level: number;
   profile: JsonObject;
@@ -45,6 +49,12 @@ class OrbitApiError extends Error {
     readonly retryAfterMs?: number,
   ) {
     super(message);
+  }
+}
+
+export class ProfileResolutionError extends Error {
+  constructor(error: unknown, readonly search_billing?: OperationBilling) {
+    super(error instanceof Error ? error.message : "Orbit profile resolution failed");
   }
 }
 
@@ -175,16 +185,25 @@ export class ProfileOrbitClient {
     });
   }
 
-  async resolveProfile(query: string, profileDepth: ProfileDepth, requestId?: string): Promise<ProfileReadResponse | null> {
+  async getCreditUsage() {
+    return creditUsageOutputSchema.parse(await this.requestWithRetry<unknown>("/v3/credits/usage"));
+  }
+
+  async resolveProfile(query: string, profileDepth: ProfileDepth, requestId?: string): Promise<ProfileReadResponse | { message: string; search_billing?: OperationBilling }> {
     const search = await this.searchAndWait(query, profileDepth, requestId);
+    const searchBilling = search.billing ? { search_billing: billingSchema.parse(search.billing) } : {};
     const result = search.results.find((item) => item.status === "ready");
     if (!result) {
       const failure = search.results.find((item) => item.failure)?.failure;
-      if (search.status === "failed" || failure) throw new Error(failure?.message || "Orbit profile resolution failed");
-      return null;
+      if (search.status === "failed" || failure) throw new ProfileResolutionError(new Error(failure?.message || "Orbit profile resolution failed"), searchBilling.search_billing);
+      return { message: "No matching person found.", ...searchBilling };
     }
     // Search embeds a summary even when the stored generation level is full.
     // Only the explicit read endpoint delivers the complete requested profile.
-    return this.getProfile(result.profile_id);
+    try {
+      return { ...await this.getProfile(result.profile_id), ...searchBilling };
+    } catch (error) {
+      throw new ProfileResolutionError(error, searchBilling.search_billing);
+    }
   }
 }

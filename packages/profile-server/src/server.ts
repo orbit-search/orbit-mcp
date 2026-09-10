@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ProfileOrbitClient } from "./orbit-api.js";
+import { ProfileOrbitClient, ProfileResolutionError } from "./orbit-api.js";
+import { creditUsageOutputSchema } from "./billing.js";
 
 function toolResult(value: unknown, isError = false) {
   return {
@@ -10,12 +11,26 @@ function toolResult(value: unknown, isError = false) {
 }
 
 function toolError(error: unknown) {
-  return toolResult({ error: error instanceof Error ? error.message : String(error) }, true);
+  return toolResult({
+    error: error instanceof Error ? error.message : String(error),
+    ...(error instanceof ProfileResolutionError && error.search_billing ? { search_billing: error.search_billing } : {}),
+  }, true);
 }
 
 export function createProfileServer(apiKey: string): McpServer {
   const client = new ProfileOrbitClient({ apiKey });
   const server = new McpServer({ name: "orbit-profile-mcp", version: "2.0.0" });
+
+  server.registerTool("get_credit_usage", {
+    description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. No purchase or billable work is started.",
+    inputSchema: {}, outputSchema: creditUsageOutputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  }, async () => {
+    try {
+      const result = await client.getCreditUsage();
+      return { ...toolResult(result), structuredContent: result };
+    } catch (error) { return toolError(error); }
+  });
 
   server.tool(
     "get_profile",
@@ -27,7 +42,7 @@ export function createProfileServer(apiKey: string): McpServer {
     async ({ query, request_id }) => {
       try {
         const profile = await client.resolveProfile(query, "full", request_id);
-        return profile ? toolResult(profile) : toolResult({ message: "No matching person found." });
+        return { ...toolResult(profile), structuredContent: { ...profile } };
       } catch (error) {
         return toolError(error);
       }

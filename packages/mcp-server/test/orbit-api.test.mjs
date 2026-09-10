@@ -101,10 +101,11 @@ test("auth failures provide actionable guidance without retrying or echoing upst
 
 test("search_people starts v3 work with a stable request ID and polls to terminal", async () => {
   const calls = [];
+  const billing = { id: "logical-operation", pricingVersion: "server-owned", reservedCredits: 20, consumedCredits: 7, releasedCredits: 13, heldCredits: 0, status: "settled" };
   const client = clientWithResponses(
     [
-      jsonResponse({ search_id: "search-1", request_id: "crm-job-1", status: "running", results: [] }, 202),
-      jsonResponse({ search_id: "search-1", request_id: "crm-job-1", status: "completed", results: [{ profile_id: "profile-1", status: "ready", generation_level: 2 }] }),
+      jsonResponse({ search_id: "search-1", request_id: "crm-job-1", status: "running", results: [], billing: { ...billing, status: "open", consumedCredits: 3, releasedCredits: 0, heldCredits: 17 } }, 202),
+      jsonResponse({ search_id: "search-1", request_id: "crm-job-1", status: "completed", results: [{ profile_id: "profile-1", status: "ready", generation_level: 2 }], billing }),
     ],
     calls,
   );
@@ -118,6 +119,8 @@ test("search_people starts v3 work with a stable request ID and polls to termina
   });
 
   assert.equal(result.status, "completed");
+  assert.deepEqual(result.billing, billing);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].url, "https://api.orbit.test/v3/search");
   assert.equal(calls[1].url, "https://api.orbit.test/v3/search/search-1");
   assert.equal(calls[0].init.headers.Authorization, "Bearer sk_orb_test");

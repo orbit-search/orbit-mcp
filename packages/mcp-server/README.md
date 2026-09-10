@@ -9,6 +9,7 @@ Public MCP server for Orbit Developer API v3 Search and Enrich. The hosted endpo
 | `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
 | `get_profile` | Read an existing profile without scheduling regeneration | `GET /v3/enrich/{profile_id}` |
 | `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
+| `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
 
 Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
@@ -20,9 +21,13 @@ HTTP `402` is returned as a tool error with billing guidance, without automatic 
 
 Each explicit profile read sends a fresh `Idempotency-Key` that is reused for that read's automatic transport retries. A separate tool call performs a new logical read with a new key.
 
+Tool results preserve the API's optional `billing` receipt: `pricingVersion`, `reservedCredits`, `consumedCredits`, `releasedCredits`, `heldCredits`, operation `id`, and settlement `status`. These are cumulative values for that operation, **not charges to add together across polls**. Missing billing is unknown, not zero. The profile-resolution package exposes the Search receipt separately as `search_billing`, alongside the final profile-read `billing` receipt; it does not calculate a combined price. If that final read fails, the error retains any completed Search receipt.
+
+Both packages expose `get_credit_usage` as a read-only tool with no arguments. It uses the connected API key only; the backend selects the user or organization billing account. Usage totals cover that key, while available/reserved credits cover its billing account. The response includes the account type and reporting period, but not user, organization, or key identifiers. No balance lookup is made automatically after other tools or polls, and there is no purchase tool. This tool requires the API release exposing `/v3/credits/usage`; a missing or forbidden endpoint remains a tool error, never a fabricated zero balance.
+
 Search embeds profile summaries, not full profile details or contacts, even when `generation_level` indicates a full stored profile. Use `get_profile` with a selected result's canonical ID for those details. The profile-resolution package always performs this explicit, billed profile read after selecting a ready Search result; it never treats an embedded summary as the full profile.
 
-All three tools declare output schemas and return `structuredContent` alongside
+All four tools declare output schemas and return `structuredContent` alongside
 the same serialized JSON in `content` for compatibility. Schemas describe the v3
 response envelopes; profile bodies and new API fields remain open-ended so no
 person context or source evidence is dropped. Tool errors retain `isError: true`;
@@ -30,7 +35,7 @@ exception payloads are `{ error: string }` in text content only, outside the
 successful output schema. This keeps schema-validating clients from hiding the
 actionable error behind a structured-output validation failure.
 
-Annotations mark only `get_profile` as read-only and idempotent. Search may build
+Annotations mark `get_profile` and `get_credit_usage` as read-only and idempotent. Search may build
 profiles; enrichment may regenerate and replace existing context. Neither write
 tool promises unconditional idempotency because `request_id` is optional.
 

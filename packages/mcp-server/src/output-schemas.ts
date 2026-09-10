@@ -1,6 +1,31 @@
 /** Public v3 response envelopes; preserve evolving profile fields and API additions. */
 import { z } from "zod";
 
+export const billingSchema = z.object({
+  id: z.string(),
+  pricingVersion: z.string(),
+  reservedCredits: z.number().finite(),
+  consumedCredits: z.number().finite(),
+  releasedCredits: z.number().finite(),
+  heldCredits: z.number().finite(),
+  status: z.enum(["open", "settled"]),
+}).describe("Authoritative operation billing from Orbit; reserved credits are not necessarily consumed credits.");
+
+export const creditUsageOutputSchema = z.object({
+  status: z.literal("success"),
+  payload: z.object({
+    account_type: z.enum(["user", "organization"]),
+    usage_scope: z.literal("current_api_key"),
+    balance_scope: z.literal("billing_account"),
+    period_start: z.string(),
+    period_end: z.string(),
+    credits_used: z.number().finite().describe("Net credits consumed by this API key, including refunds."),
+    request_count: z.number().int().nonnegative(),
+    available_credits: z.number().finite(),
+    reserved_credits: z.number().finite(),
+  }),
+});
+
 const profile = z.object({}).passthrough().describe(
   "Public Orbit person context, including available profile sections and source evidence. Fields vary by generation level; returned fields are preserved.",
 );
@@ -21,6 +46,7 @@ const source = z.object({
 }).passthrough();
 
 export const searchOutputSchema = z.object({
+  billing: billingSchema.optional(),
   search_id: z.string().describe("Server-generated search identifier."),
   request_id: z.string().describe("Idempotency key for this logical search; reuse for retries."),
   status: z.enum(["completed", "completed_with_errors", "failed"]).describe("Terminal search state after polling."),
@@ -48,12 +74,14 @@ export const searchOutputSchema = z.object({
 }).passthrough();
 
 export const profileOutputSchema = z.object({
+  billing: billingSchema.optional(),
   profile_id: z.string().describe("Canonical Orbit profile identifier."),
   generation_level: generationLevel,
   profile,
 }).passthrough();
 
 export const enrichOutputSchema = z.object({
+  billing: billingSchema.optional(),
   request_id: z.string().describe("Idempotency key for this enrichment; reuse for retries."),
   profile_id: z.string().describe("Canonical Orbit profile identifier."),
   status: z.enum(["completed", "failed"]).describe("Terminal enrichment state after polling."),

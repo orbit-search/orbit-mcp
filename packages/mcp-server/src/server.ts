@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitV3Client } from "./orbit-api.js";
-import { searchOutputSchema, profileOutputSchema, enrichOutputSchema } from "./output-schemas.js";
+import { searchOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
   return {
@@ -35,6 +35,20 @@ const signalsSchema = z
 export function createOrbitServer(apiKey: string): McpServer {
   const client = new OrbitV3Client({ apiKey });
   const server = new McpServer({ name: "orbit-mcp", version: "2.1.0" });
+
+  server.registerTool(
+    "get_credit_usage",
+    {
+      description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. This read does not purchase credits or start billable work.",
+      outputSchema: creditUsageOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      inputSchema: {},
+    },
+    async () => {
+      try { return toolResult(await client.getCreditUsage()); }
+      catch (error) { return toolError(error); }
+    },
+  );
 
   server.registerTool(
     "search_people",

@@ -1,4 +1,13 @@
 export type JsonObject = Record<string, unknown>;
+export interface OperationBilling {
+  id: string;
+  pricingVersion: string;
+  reservedCredits: number;
+  consumedCredits: number;
+  releasedCredits: number;
+  heldCredits: number;
+  status: "open" | "settled";
+}
 
 export type ProfileDepth = "partial" | "full";
 export type EnrichOperation = ProfileDepth | "regenerate";
@@ -37,6 +46,7 @@ export interface SearchResult {
 }
 
 export interface SearchResponse {
+  billing?: OperationBilling;
   search_id: string;
   request_id: string;
   status: "running" | "completed" | "completed_with_errors" | "failed";
@@ -50,12 +60,14 @@ export interface SearchResponse {
 }
 
 export interface ProfileReadResponse {
+  billing?: OperationBilling;
   profile_id: string;
   generation_level: number;
   profile: JsonObject;
 }
 
 export interface EnrichResponse {
+  billing?: OperationBilling;
   request_id: string;
   profile_id: string;
   status: "running" | "completed" | "failed";
