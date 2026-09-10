@@ -26,6 +26,45 @@ function clientWithResponses(responses, calls, sleeps = []) {
   });
 }
 
+test("billing failures preserve HTTP 402 and do not retry paid operations", async () => {
+  for (const run of [
+    (client) => client.getProfile("profile-1"),
+    (client) => client.searchAndWait({ query: "Ada Lovelace" }),
+    (client) => client.enrichAndWait("profile-1", "full"),
+  ]) {
+    const calls = [];
+    const sleeps = [];
+    const body = { error: { code: "insufficient_credits", message: "sensitive-upstream-value" } };
+    const client = clientWithResponses([jsonResponse(body, 402)], calls, sleeps);
+    await assert.rejects(() => run(client), (error) => {
+      assert(error instanceof OrbitApiError);
+      assert.equal(error.status, 402);
+      assert.deepEqual(error.body, body);
+      assert.match(error.message, /dashboard\/billing/);
+      assert.doesNotMatch(error.message, /sensitive-upstream-value/);
+      return true;
+    });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("automatic search and enrich retries retain the generated billing idempotency key", async () => {
+  for (const operation of ["search", "enrich"]) {
+    const calls = [];
+    const client = clientWithResponses([
+      jsonResponse({ error: "temporary failure" }, 503),
+      jsonResponse({ error: "rate limited" }, 429, { "retry-after": "0" }),
+      jsonResponse({ status: "completed", search_id: "search-1", request_id: "request-1", results: [] }),
+    ], calls);
+    if (operation === "search") await client.searchAndWait({ query: "Ada Lovelace" });
+    else await client.enrichAndWait("profile-1", "full");
+    assert.equal(calls.length, 3);
+    assert.match(JSON.parse(calls[0].init.body).request_id, /^[0-9a-f-]{36}$/);
+    assert(calls.every((call) => call.init.method === "POST" && call.init.body === calls[0].init.body));
+  }
+});
+
 test("auth failures provide actionable guidance without retrying or echoing upstream secrets", async () => {
   for (const status of [401, 403]) {
     const calls = [];

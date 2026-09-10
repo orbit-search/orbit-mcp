@@ -9,6 +9,61 @@ function jsonResponse(body, status = 200) {
   });
 }
 
+test("profile billing failures stop immediately with safe HTTP 402 guidance", async () => {
+  for (const operation of ["search", "read"]) {
+    const calls = [];
+    const sleeps = [];
+    const body = { error: { code: "insufficient_credits", message: "sensitive-upstream-value" } };
+    const client = new ProfileOrbitClient({
+      apiKey: "sk_orb_test",
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), init });
+        return jsonResponse(body, 402);
+      },
+      sleepImpl: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(
+      () => operation === "search" ? client.resolveProfile("Ada Lovelace", "full") : client.getProfile("profile-1"),
+      (error) => {
+        assert.equal(error.status, 402);
+        assert.deepEqual(error.body, body);
+        assert.match(error.message, /HTTP 402.*dashboard\/billing/);
+        assert.doesNotMatch(error.message, /sensitive-upstream-value/);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("profile resolution retries reuse one generated request ID and then poll existing work", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ error: "temporary failure" }, 503),
+    jsonResponse({ search_id: "search-1", status: "running", results: [] }, 202),
+    jsonResponse({ search_id: "search-1", status: "completed", results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile: { name: "Ada" } }] }),
+  ];
+  const client = new ProfileOrbitClient({
+    apiKey: "sk_orb_test",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      const response = responses.shift();
+      assert(response, "unexpected request");
+      return response;
+    },
+    sleepImpl: async () => {},
+  });
+  await client.resolveProfile("Ada Lovelace", "full");
+  assert.equal(calls.length, 3);
+  assert.match(JSON.parse(calls[0].init.body).request_id, /^[0-9a-f-]{36}$/);
+  assert.equal(calls[0].init.body, calls[1].init.body);
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[1].init.method, "POST");
+  assert.equal(calls[2].init.body, undefined);
+  assert.match(calls[2].url, /\/v3\/search\/search-1$/);
+});
+
 test("profile resolution uses v3 Search and returns the embedded profile", async () => {
   const calls = [];
   const responses = [

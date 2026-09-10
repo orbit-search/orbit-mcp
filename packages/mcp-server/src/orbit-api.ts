@@ -99,7 +99,9 @@ export class OrbitV3Client {
         ? `Orbit rejected this API key (HTTP ${response.status}). It may be invalid, expired, or revoked. Check your key at ${API_KEY_URL}, then reconnect.`
         : response.status === 403
           ? `Orbit denied this operation (HTTP 403). Check the key's permissions at ${API_KEY_URL}: profile reads need profile:read; search and enrichment need search:read, plus profile:read for returned profiles. If scopes are correct, check your account access.`
-          : `Orbit API request failed with HTTP ${response.status}`;
+          : response.status === 402
+            ? "Orbit requires additional credits for this operation (HTTP 402). Review your balance at https://developer.orbitsearch.com/dashboard/billing before retrying."
+            : `Orbit API request failed with HTTP ${response.status}`;
       throw new OrbitApiError(message, response.status, body, retryAfterMs(response));
     }
     return body as T;

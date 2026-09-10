@@ -103,6 +103,18 @@ test("HTTP auth errors stay tool errors, not successful profile envelopes", asyn
   }, { error: "denied" }, 403);
 });
 
+test("HTTP 402 remains an actionable MCP tool error after schema discovery", async () => {
+  await withClient(async client => {
+    const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "person-1" } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    const error = JSON.parse(result.content[0].text).error;
+    assert.match(error, /HTTP 402/);
+    assert.match(error, /dashboard\/billing/);
+    assert.doesNotMatch(error, /sensitive detail/);
+  }, { error: { code: "insufficient_credits", message: "sensitive detail" } }, 402);
+});
+
 test("invalid keys surface reconnect instructions after tool discovery", async () => {
   await withClient(async client => {
     const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "person-1" } });

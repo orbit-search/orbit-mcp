@@ -110,7 +110,12 @@ export class ProfileOrbitClient {
     } catch {
       body = text;
     }
-    if (!response.ok) throw new OrbitApiError(`Orbit API request failed with HTTP ${response.status}`, response.status, body, retryAfterMs(response));
+    if (!response.ok) {
+      const message = response.status === 402
+        ? "Orbit requires additional credits for this operation (HTTP 402). Review your balance at https://developer.orbitsearch.com/dashboard/billing before retrying."
+        : `Orbit API request failed with HTTP ${response.status}`;
+      throw new OrbitApiError(message, response.status, body, retryAfterMs(response));
+    }
     return body as T;
   }
 

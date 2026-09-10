@@ -12,6 +12,14 @@ Public MCP server for Orbit Developer API v3 Search and Enrich. The hosted endpo
 
 Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
+## Billing
+
+Orbit uses usage-based credits. Customers connect their own Orbit API key, and Orbit applies charges under their account plan. The Developer API owns pricing and the billing ledger; neither MCP package calculates or debits credits locally. Consult the central [pricing catalog](https://api.orbitsearch.com/v2/developer/pricing) for operation rates and purchase packages, and manage your balance in the [billing dashboard](https://developer.orbitsearch.com/dashboard/billing).
+
+HTTP `402` is returned as a tool error with billing guidance, without automatic retries. Automatic retries of Search and Enrich submissions reuse the same serialized body and `request_id`; status polling continues the existing operation rather than starting new work. When retrying a logical operation manually, retain its `request_id` too.
+
+The profile-resolution package returns an embedded Search profile when available. If Search omits it, the package performs an explicit profile read, subject to the API's profile-read billing policy.
+
 All three tools declare output schemas and return `structuredContent` alongside
 the same serialized JSON in `content` for compatibility. Schemas describe the v3
 response envelopes; profile bodies and new API fields remain open-ended so no
@@ -178,4 +186,4 @@ Profile enrichment:
 - `enrich_profile` is the explicit path for upgrading or regenerating known profile IDs.
 - Identity signals belong in `search_people`, not `enrich_profile`.
 
-No v2 endpoint remains in either package in this repository.
+Both packages use v3 endpoints for search and enrichment. The shared pricing catalog is served separately at `/v2/developer/pricing`.
