@@ -64,7 +64,7 @@ test("directory tools enforce request-local scopes and route all 38 operations t
   try {
     await client.connect(transport); // Start key-only; subsequent grants need no new MCP session.
     const catalog = (await client.listTools()).tools;
-    assert.equal(catalog.length, 41);
+    assert.equal(catalog.length, 42);
     assert.equal(directoryTools.length, 38);
     const payloadSchema = name => catalog.find(tool => tool.name === name).outputSchema.properties.data.properties.payload;
     assert.equal(payloadSchema("count_directory_people").properties.count.type, "number");

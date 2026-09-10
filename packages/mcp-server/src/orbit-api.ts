@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { API_KEY_URL } from "./api-key-auth.js";
+import { creditUsageOutputSchema } from "./output-schemas.js";
 import type {
   EnrichOperation,
   EnrichResponse,
@@ -98,8 +99,12 @@ export class OrbitV3Client {
       const message = response.status === 401 || invalidKey
         ? `Orbit rejected this API key (HTTP ${response.status}). It may be invalid, expired, or revoked. Check your key at ${API_KEY_URL}, then reconnect.`
         : response.status === 403
-          ? `Orbit denied this operation (HTTP 403). Check the key's permissions at ${API_KEY_URL}: profile reads need profile:read; search and enrichment need search:read, plus profile:read for returned profiles. If scopes are correct, check your account access.`
-          : `Orbit API request failed with HTTP ${response.status}`;
+          ? path === "/v3/credits/usage"
+            ? `Orbit denied this credit-usage lookup (HTTP 403). Check the connected key and its account access at ${API_KEY_URL}.`
+            : `Orbit denied this operation (HTTP 403). Check the key's permissions at ${API_KEY_URL}: profile reads need profile:read; search and enrichment need search:read, plus profile:read for returned profiles. If scopes are correct, check your account access.`
+          : response.status === 402
+            ? "Orbit requires additional credits for this operation (HTTP 402). Review your balance at https://developer.orbitsearch.com/dashboard/billing before retrying."
+            : `Orbit API request failed with HTTP ${response.status}`;
       throw new OrbitApiError(message, response.status, body, retryAfterMs(response));
     }
     return body as T;
@@ -162,7 +167,15 @@ export class OrbitV3Client {
   }
 
   getProfile(profileId: string): Promise<ProfileReadResponse> {
-    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`);
+    // One key per logical paid read, retained by all transport retries.
+    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`, {
+      headers: { "Idempotency-Key": randomUUID() },
+    });
+  }
+
+  async getCreditUsage() {
+    // Subject selection stays entirely upstream; strip any unexpected identity fields.
+    return creditUsageOutputSchema.parse(await this.requestWithRetry<unknown>("/v3/credits/usage"));
   }
 
   async enrichAndWait(profileId: string, operation: EnrichOperation, requestId?: string): Promise<EnrichResponse> {

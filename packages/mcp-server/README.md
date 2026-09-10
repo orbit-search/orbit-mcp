@@ -9,6 +9,7 @@ General MCP server for Orbit people search, profiles, enrichment, and directory 
 | `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
 | `get_profile` | Read an existing profile without scheduling regeneration | `GET /v3/enrich/{profile_id}` |
 | `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
+| `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
 
 Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
@@ -20,7 +21,7 @@ exception payloads are `{ error: string }` in text content only, outside the
 successful output schema. This keeps schema-validating clients from hiding the
 actionable error behind a structured-output validation failure.
 
-Of these three tools, only `get_profile` is read-only and idempotent. Search may build
+Annotations mark `get_profile` and `get_credit_usage` as read-only; only the usage lookup is idempotent, while independent profile reads consume credits. Search may build
 profiles; enrichment may regenerate and replace existing context. Neither write
 tool promises unconditional idempotency because `request_id` is optional.
 
@@ -178,7 +179,7 @@ Profile enrichment:
 - `enrich_profile` is the explicit path for upgrading or regenerating known profile IDs.
 - Identity signals belong in `search_people`, not `enrich_profile`.
 
-Search and enrichment use v3. Directory tools use the existing user-authenticated
+Search and enrichment use v3; the central pricing catalog is at `/v2/developer/pricing`. Directory tools use the existing user-authenticated
 directory management routes; developer API keys do not authorize those routes.
 
 ## Directory management
@@ -228,6 +229,6 @@ API-key compatibility, CSV limits, scoped search, and backend denial. Orbit API
 responses are local fakes, not production behavior proof.
 
 Deploy this server and the companion shared OAuth gateway change before
-publishing directory docs. Verify the 41-tool catalog and a disposable directory
+publishing directory docs. Verify the 42-tool catalog and a disposable directory
 through the canonical public endpoint. Update the infrastructure-owned static
 server card only after the deployed contract is verified.

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
-import { searchOutputSchema, profileOutputSchema, enrichOutputSchema } from "./output-schemas.js";
+import { searchOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
   return {
@@ -38,9 +38,23 @@ export function createOrbitServer(apiKey: string): McpServer {
   const server = new McpServer({ name: "orbit-mcp", version: "2.2.0" });
 
   server.registerTool(
+    "get_credit_usage",
+    {
+      description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. This read does not purchase credits or start billable work.",
+      outputSchema: creditUsageOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      try { return toolResult(await client.getCreditUsage()); }
+      catch (error) { return toolError(error); }
+    },
+  );
+
+  server.registerTool(
     "search_people",
     {
-      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes ready profiles.",
+      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes profile summaries. Use get_profile with a selected profile ID for full available details and contacts; this is a separate billed read.",
       outputSchema: searchOutputSchema,
       // Search may generate/upgrade profiles; an omitted request_id creates new work.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },

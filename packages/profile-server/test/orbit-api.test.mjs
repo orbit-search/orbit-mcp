@@ -9,7 +9,90 @@ function jsonResponse(body, status = 200) {
   });
 }
 
-test("profile resolution uses v3 Search and returns the embedded profile", async () => {
+test("profile billing failures stop immediately with safe HTTP 402 guidance", async () => {
+  for (const operation of ["search", "read"]) {
+    const calls = [];
+    const sleeps = [];
+    const body = { error: { code: "insufficient_credits", message: "sensitive-upstream-value" } };
+    const client = new ProfileOrbitClient({
+      apiKey: "sk_orb_test",
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), init });
+        return jsonResponse(body, 402);
+      },
+      sleepImpl: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(
+      () => operation === "search" ? client.resolveProfile("Ada Lovelace", "full") : client.getProfile("profile-1"),
+      (error) => {
+        assert.equal(error.status, 402);
+        assert.deepEqual(error.body, body);
+        assert.match(error.message, /HTTP 402.*dashboard\/billing/);
+        assert.doesNotMatch(error.message, /sensitive-upstream-value/);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 1);
+    assert.deepEqual(sleeps, []);
+  }
+});
+
+test("profile resolution retries reuse one generated request ID and then poll existing work", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ error: "temporary failure" }, 503),
+    jsonResponse({ search_id: "search-1", status: "running", results: [] }, 202),
+    jsonResponse({ search_id: "search-1", status: "completed", results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile: { name: "Ada" } }] }),
+    jsonResponse({ profile_id: "profile-1", generation_level: 3, profile: { name: "Ada", contacts: {} } }),
+  ];
+  const client = new ProfileOrbitClient({
+    apiKey: "sk_orb_test",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      const response = responses.shift();
+      assert(response, "unexpected request");
+      return response;
+    },
+    sleepImpl: async () => {},
+  });
+  await client.resolveProfile("Ada Lovelace", "full");
+  assert.equal(calls.length, 4);
+  assert.match(JSON.parse(calls[0].init.body).request_id, /^[0-9a-f-]{36}$/);
+  assert.equal(calls[0].init.body, calls[1].init.body);
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[1].init.method, "POST");
+  assert.equal(calls[2].init.body, undefined);
+  assert.match(calls[2].url, /\/v3\/search\/search-1$/);
+  assert.equal(calls[2].init.headers["Idempotency-Key"], undefined);
+  assert.match(calls[3].url, /\/v3\/enrich\/profile-1$/);
+  assert.match(calls[3].init.headers["Idempotency-Key"], /^[0-9a-f-]{36}$/);
+});
+
+test("profile-read retries retain one idempotency header and independent reads use new keys", async () => {
+  const calls = [];
+  const profile = { profile_id: "profile-1", generation_level: 3, profile: {} };
+  const responses = [jsonResponse({ error: "temporary failure" }, 503), jsonResponse(profile), jsonResponse(profile)];
+  const client = new ProfileOrbitClient({
+    apiKey: "sk_orb_test",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      const response = responses.shift();
+      assert(response, "unexpected request");
+      return response;
+    },
+    sleepImpl: async () => {},
+  });
+  await client.getProfile("profile-1");
+  await client.getProfile("profile-1");
+  assert.equal(calls.length, 3);
+  const keys = calls.map(call => call.init.headers["Idempotency-Key"]);
+  assert(keys.every(key => /^[0-9a-f-]{36}$/.test(key)));
+  assert.equal(keys[0], keys[1]);
+  assert.notEqual(keys[1], keys[2]);
+  assert(calls.every(call => call.init.headers.Authorization === "Bearer sk_orb_test"));
+});
+
+test("profile resolution reads full details instead of returning an L3 Search summary", async () => {
   const calls = [];
   const responses = [
     jsonResponse({ search_id: "search-1", request_id: "request-1", status: "running", results: [] }, 202),
@@ -17,8 +100,9 @@ test("profile resolution uses v3 Search and returns the embedded profile", async
       search_id: "search-1",
       request_id: "request-1",
       status: "completed",
-      results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile: { name: "Ada" } }],
+      results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile_projection: "summary", profile: { displayName: "Ada", sections: { socials: { items: [] } } } }],
     }),
+    jsonResponse({ profile_id: "profile-1", generation_level: 3, profile: { name: "Ada", sections: { bio: { bio: "Full person context" } }, emails: ["ada@example.test"] } }),
   ];
   const client = new ProfileOrbitClient({
     apiKey: "sk_orb_test",
@@ -34,8 +118,12 @@ test("profile resolution uses v3 Search and returns the embedded profile", async
 
   assert.equal(result.profile_id, "profile-1");
   assert.equal(result.profile.name, "Ada");
+  assert.deepEqual(result.profile.emails, ["ada@example.test"]);
+  assert.equal(result.profile.sections.bio.bio, "Full person context");
   assert.equal(calls[0].url, "https://api.orbit.test/v3/search");
   assert.equal(calls[1].url, "https://api.orbit.test/v3/search/search-1");
+  assert.equal(calls[2].url, "https://api.orbit.test/v3/enrich/profile-1");
+  assert.equal(calls.length, 3);
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     request_id: JSON.parse(calls[0].init.body).request_id,
     query: "Ada Lovelace",
@@ -46,7 +134,7 @@ test("profile resolution uses v3 Search and returns the embedded profile", async
   });
 });
 
-test("profile resolution falls back to v3 Enrich when Search omits the embedded profile", async () => {
+test("profile resolution reads v3 Enrich when Search omits the summary", async () => {
   const calls = [];
   const responses = [
     jsonResponse({ search_id: "search-2", request_id: "request-2", status: "completed", results: [{ profile_id: "profile/2", status: "ready", generation_level: 2 }] }),
@@ -65,6 +153,26 @@ test("profile resolution falls back to v3 Enrich when Search omits the embedded 
 
   assert.equal(result.profile.name, "Grace");
   assert.equal(calls[1].url, "https://api.orbit.test/v3/enrich/profile%2F2");
+});
+
+test("a billed-read failure never falls back to a Search summary as full detail", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ search_id: "search-1", status: "completed", results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile_projection: "summary", profile: { displayName: "Ada" } }] }),
+    jsonResponse({ error: { code: "insufficient_credits" } }, 402),
+  ];
+  const client = new ProfileOrbitClient({
+    apiKey: "sk_orb_test",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      const response = responses.shift();
+      assert(response, "unexpected request");
+      return response;
+    },
+  });
+  await assert.rejects(() => client.resolveProfile("Ada Lovelace", "full"), /HTTP 402/);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].url, /\/v3\/enrich\/profile-1$/);
 });
 
 test("email and phone queries use v3 identity signals", async () => {
