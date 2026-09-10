@@ -31,6 +31,7 @@ export interface SearchResult {
   profile_id: string;
   status: "enriching" | "ready" | "failed";
   generation_level: number | null;
+  profile_projection?: "summary";
   profile?: JsonObject;
   failure?: Failure;
 }

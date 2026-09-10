@@ -20,7 +20,7 @@ HTTP `402` is returned as a tool error with billing guidance, without automatic 
 
 Each explicit profile read sends a fresh `Idempotency-Key` that is reused for that read's automatic transport retries. A separate tool call performs a new logical read with a new key.
 
-The profile-resolution package returns an embedded Search profile when available. If Search omits it, the package performs an explicit profile read, subject to the API's profile-read billing policy.
+Search embeds profile summaries, not full profile details or contacts, even when `generation_level` indicates a full stored profile. Use `get_profile` with a selected result's canonical ID for those details. The profile-resolution package always performs this explicit, billed profile read after selecting a ready Search result; it never treats an embedded summary as the full profile.
 
 All three tools declare output schemas and return `structuredContent` alongside
 the same serialized JSON in `content` for compatibility. Schemas describe the v3
