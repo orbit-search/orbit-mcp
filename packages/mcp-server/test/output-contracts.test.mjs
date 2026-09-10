@@ -39,8 +39,10 @@ async function withClient(run, responseBody, responseStatus = 200) {
 
 test("all three tools advertise substantive output schemas and accurate annotations", async () => {
   await withClient(async client => {
-    const { tools } = await client.listTools();
-    assert.equal(client.getServerVersion().version, "2.1.0");
+    const catalog = await client.listTools();
+    assert.equal(catalog.tools.length, 41);
+    const tools = catalog.tools.filter(tool => ["search_people", "get_profile", "enrich_profile"].includes(tool.name));
+    assert.equal(client.getServerVersion().version, "2.2.0");
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
     for (const tool of tools) {
       assert.equal(tool.outputSchema.type, "object");
