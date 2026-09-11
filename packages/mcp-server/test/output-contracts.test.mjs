@@ -13,7 +13,7 @@ const search = {
   search_id: "search-1", request_id: "request-1", status: "completed",
   candidate_discovery: false, profile_depth: "partial", include_profile: true,
   profile_upgrades_completed: true,
-  results: [{ profile_id: "person-1", status: "ready", generation_level: 3, sources: ["search"], profile_projection: "summary", profile: { id: "person-1", displayName: "Ada", sections: { socials: { items: [] } } }, confidence: 0.9 }],
+  results: [{ profile_id: "person-1", status: "ready", generation_level: 2, sources: ["search"], profile, confidence: 0.9 }],
   created_at: "2026-09-09T00:00:00Z", updated_at: "2026-09-09T00:00:00Z",
   links: { status: "/v3/search/search-1" }, future_field: "preserved",
 };

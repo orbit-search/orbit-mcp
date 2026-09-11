@@ -12,7 +12,6 @@ export interface ProfileSearchResult {
   profile_id: string;
   status: "enriching" | "ready" | "failed";
   generation_level: number | null;
-  profile_projection?: "summary";
   profile?: JsonObject;
   failure?: { code: string; message: string; retryable: boolean };
 }
@@ -198,8 +197,14 @@ export class ProfileOrbitClient {
       if (search.status === "failed" || failure) throw new ProfileResolutionError(new Error(failure?.message || "Orbit profile resolution failed"), searchBilling.search_billing);
       return { message: "No matching person found.", ...searchBilling };
     }
-    // Search embeds a summary even when the stored generation level is full.
-    // Only the explicit read endpoint delivers the complete requested profile.
+    if (result.profile) {
+      return {
+        profile_id: result.profile_id,
+        generation_level: result.generation_level ?? 0,
+        profile: result.profile,
+        ...searchBilling,
+      };
+    }
     try {
       return { ...await this.getProfile(result.profile_id), ...searchBilling };
     } catch (error) {

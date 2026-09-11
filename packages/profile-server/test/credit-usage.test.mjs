@@ -34,7 +34,7 @@ async function withTool(responses, run, key = "test-key") {
 test("profile tool preserves separate Search and read receipts without fetching usage", async () => {
   const read = { profile_id: "profile-1", generation_level: 3, profile: { name: "Ada" }, billing: readBilling };
   await withTool([
-    { body: { search_id: "search-1", status: "completed", billing: searchBilling, results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile_projection: "summary", profile: { displayName: "Ada" } }] } },
+    { body: { search_id: "search-1", status: "completed", billing: searchBilling, results: [{ profile_id: "profile-1", status: "ready", generation_level: 3 }] } },
     { body: read },
   ], async (client, calls) => {
     const result = await client.callTool({ name: "get_profile", arguments: { query: "Ada Lovelace", request_id: "stable-search" } });
@@ -44,6 +44,19 @@ test("profile tool preserves separate Search and read receipts without fetching 
     assert.equal(calls.length, 2);
     assert(calls.every(call => !call.url.includes("/credits/usage")));
     assert.match(calls[1].init.headers["Idempotency-Key"], /^[0-9a-f-]{36}$/);
+  });
+});
+
+test("an embedded Search profile returns with its Search receipt and no profile read", async () => {
+  const profile = { displayName: "Ada", sections: { bio: { bio: "Public context" } }, emails: ["ada@example.test"] };
+  await withTool([
+    { body: { search_id: "search-1", status: "completed", billing: searchBilling, results: [{ profile_id: "profile-1", status: "ready", generation_level: 3, profile }] } },
+  ], async (client, calls) => {
+    const result = await client.callTool({ name: "get_profile", arguments: { query: "Ada Lovelace" } });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(result.structuredContent, { profile_id: "profile-1", generation_level: 3, profile, search_billing: searchBilling });
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+    assert.equal(calls.length, 1);
   });
 });
 

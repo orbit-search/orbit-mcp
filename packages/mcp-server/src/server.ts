@@ -54,7 +54,7 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool(
     "search_people",
     {
-      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes profile summaries. Use get_profile with a selected profile ID for full available details and contacts; this is a separate billed read.",
+      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes ready profiles.",
       outputSchema: searchOutputSchema,
       // Search may generate/upgrade profiles; an omitted request_id creates new work.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
