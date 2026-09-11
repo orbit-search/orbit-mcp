@@ -53,7 +53,7 @@ export const searchOutputSchema = z.object({
   candidate_discovery: z.boolean().describe("Whether candidate discovery was enabled."),
   candidate_discovery_completed: z.boolean().optional().describe("Whether discovery can add any more results."),
   profile_depth: z.enum(["partial", "full"]).describe("Requested minimum profile depth."),
-  include_profile: z.boolean().describe("Whether results include available profile summaries, not full details or contacts."),
+  include_profile: z.boolean().describe("Whether results include available profile objects."),
   profile_upgrades_completed: z.boolean().optional().describe("Whether all results reached the requested depth or failed."),
   results: z.array(z.object({
     profile_id: z.string().describe("Canonical ID for get_profile or enrich_profile."),
@@ -62,8 +62,7 @@ export const searchOutputSchema = z.object({
     sources: z.array(z.enum(["search", "candidate_discovery"])).optional().describe("Result origins, not evidence receipts."),
     candidate_sources: z.array(source).optional().describe("Discovery evidence assigned to this person."),
     preview: z.object({}).passthrough().optional().describe("Available preview while the profile is being prepared."),
-    profile_projection: z.literal("summary").optional().describe("Search embeds only a summary regardless of stored generation level."),
-    profile: z.object({}).passthrough().optional().describe("Search summary. Read the canonical profile ID with get_profile for full available sections and contacts."),
+    profile: profile.optional(),
     failure: failure.optional(),
   }).passthrough()).describe("Matched people; an empty completed result means no matches."),
   discovered_sources: z.array(source).optional().describe("Discovery evidence not yet assigned to a person."),
