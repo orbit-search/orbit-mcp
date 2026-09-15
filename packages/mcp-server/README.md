@@ -7,11 +7,14 @@ General MCP server for Orbit people search, profiles, enrichment, and directory 
 | Tool | Purpose | Orbit API |
 |---|---|---|
 | `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
+| `quote_population_search` | Price a search for everyone at a company or everyone who attended a school, as one number in credits | `POST /v3/search/populations/quote` |
+| `search_population` | Start a search for everyone in one population at partial or full depth; returns the first snapshot at once | `POST /v3/search/populations` |
+| `get_search_status` | Read the latest snapshot of any v3 search, to follow a population search to its end | `GET /v3/search/{search_id}` |
 | `get_profile` | Read an existing profile without scheduling regeneration | `GET /v3/enrich/{profile_id}` |
 | `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
 | `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
 
-Search and enrichment tools poll to a terminal state. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
+`search_people` and `enrich_profile` poll to a terminal state. `search_population` returns at once because a population can take a long time to fill; follow it with `get_search_status`, spacing polls out. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
 The three search/profile tools declare output schemas and return `structuredContent` alongside
 the same serialized JSON in `content` for compatibility. Schemas describe the v3

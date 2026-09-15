@@ -4,7 +4,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createOrbitServer } from "../build/server.js";
-import { searchOutputSchema, profileOutputSchema, enrichOutputSchema } from "../build/output-schemas.js";
+import { searchOutputSchema, searchSnapshotOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema } from "../build/output-schemas.js";
 
 const profile = { id: "person-1", sections: { bio: { bio: "Public context" } }, sources: [{ url: "https://example.org/evidence" }], future_field: { kept: true } };
 const billing = { id: "operation-receipt", pricingVersion: "server-owned-version", reservedCredits: 20, consumedCredits: 7, releasedCredits: 13, heldCredits: 0, status: "settled" };
@@ -17,6 +17,12 @@ const search = {
   created_at: "2026-09-09T00:00:00Z", updated_at: "2026-09-09T00:00:00Z",
   links: { status: "/v3/search/search-1" }, future_field: "preserved",
 };
+const population = { kind: "company", id: "1441", name: "OpenAI", size: 2400, profile_depth: "partial", credits_quoted: 8834, status: "running" };
+const populationSearch = {
+  ...search, status: "running", include_profile: false, population,
+  results: [{ profile_id: "person-1", status: "ready", generation_level: 2, sources: ["search"], preview: { id: "person-1", displayName: "Ada" } }],
+};
+const populationQuote = { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400, profile_depth: "partial", credits: 8834, max_people: 5000, pricing_version: "2026-09-10" };
 const enrichment = {
   billing,
   profile_id: "person-1", request_id: "enrich-1", status: "completed", operation: "full",
@@ -43,9 +49,9 @@ async function withClient(run, responseBody, responseStatus = 200) {
 test("all tools advertise output schemas and accurate annotations", async () => {
   await withClient(async client => {
     const catalog = await client.listTools();
-    assert.equal(catalog.tools.length, 42);
+    assert.equal(catalog.tools.length, 45);
     const tools = catalog.tools.filter(tool => ["search_people", "get_profile", "enrich_profile"].includes(tool.name));
-    assert.equal(client.getServerVersion().version, "2.2.0");
+    assert.equal(client.getServerVersion().version, "2.3.0");
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
     for (const tool of tools) {
       assert.equal(tool.outputSchema.type, "object");
@@ -58,7 +64,13 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     const usage = catalog.tools.find(tool => tool.name === "get_credit_usage");
     assert.deepEqual(usage.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     assert.deepEqual(usage.inputSchema.properties, {});
-    assert.equal(catalog.tools.length, 42);
+    const quote = catalog.tools.find(tool => tool.name === "quote_population_search");
+    assert.deepEqual(quote.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    assert.deepEqual(catalog.tools.find(tool => tool.name === "search_population").annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });
+    assert.deepEqual(catalog.tools.find(tool => tool.name === "get_search_status").annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+    // Population tool text names no data provider and says nothing about what Orbit already holds.
+    for (const tool of catalog.tools.filter(tool => /population|search_status/.test(tool.name))) assert.doesNotMatch(JSON.stringify(tool), /linkedin|already hold/i, `${tool.name} text`);
+    assert.equal(catalog.tools.length, 45);
   });
 });
 
@@ -67,6 +79,9 @@ for (const [name, args, body, schema] of [
   ["search_people", { query: "No matches" }, { ...search, results: [] }, searchOutputSchema],
   ["get_profile", { profile_id: "person-1" }, { profile_id: "person-1", generation_level: null, profile, billing }, profileOutputSchema],
   ["enrich_profile", { profile_id: "person-1", operation: "full" }, enrichment, enrichOutputSchema],
+  ["quote_population_search", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400 }, populationQuote, populationQuoteOutputSchema],
+  ["search_population", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400, profile_depth: "partial" }, populationSearch, searchSnapshotOutputSchema],
+  ["get_search_status", { search_id: "search-1" }, populationSearch, searchSnapshotOutputSchema],
 ]) {
   test(`${name} returns schema-valid structured content and unchanged text JSON (${body.results?.length ?? "profile"})`, async () => {
     await withClient(async client => {

@@ -134,6 +134,39 @@ test("search_people starts v3 work with a stable request ID and polls to termina
   });
 });
 
+test("population searches are quoted, started once, and read back without polling", async () => {
+  const calls = [];
+  const quote = { population: { kind: "school", id: "18", name: "Stanford" }, size: 18000, profile_depth: "full", credits: 21752, max_people: 5000, pricing_version: "2026-09-10" };
+  const snapshot = { search_id: "search-9", request_id: "pop-1", status: "running", results: [], population: { kind: "school", id: "18", name: "Stanford", size: 18000, profile_depth: "full", credits_quoted: 21752, status: "running" } };
+  const client = clientWithResponses(
+    [jsonResponse(quote), jsonResponse(snapshot, 202), jsonResponse({ ...snapshot, status: "completed" })],
+    calls,
+  );
+
+  assert.deepEqual(await client.quotePopulation({ population: { kind: "school", id: "18", name: " Stanford " }, size: 18000, profile_depth: "full" }), quote);
+  const started = await client.startPopulation({ request_id: "pop-1", population: { kind: "school", id: "18", name: "Stanford" }, size: 18000, profile_depth: "full" });
+  assert.equal(started.status, "running");
+  assert.equal((await client.getSearch("search-9")).status, "completed");
+
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, "https://api.orbit.test/v3/search/populations/quote");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { population: { kind: "school", id: "18", name: "Stanford" }, size: 18000, profile_depth: "full" });
+  assert.equal(calls[1].url, "https://api.orbit.test/v3/search/populations");
+  assert.deepEqual(JSON.parse(calls[1].init.body), { request_id: "pop-1", population: { kind: "school", id: "18", name: "Stanford" }, size: 18000, profile_depth: "full" });
+  assert.equal(calls[2].url, "https://api.orbit.test/v3/search/search-9");
+  assert.equal(calls[2].init.method ?? "GET", "GET");
+});
+
+test("a population start without a request id makes one, and a size left out is sent as null", async () => {
+  const calls = [];
+  const client = clientWithResponses([jsonResponse({ search_id: "search-10", request_id: "generated", status: "running", results: [] }, 202)], calls);
+  await client.startPopulation({ population: { kind: "company", id: "1441", name: "OpenAI" } });
+  const body = JSON.parse(calls[0].init.body);
+  assert.match(body.request_id, /^[0-9a-f-]{36}$/);
+  assert.equal(body.size, null);
+  assert.equal(body.profile_depth, "partial");
+});
+
 test("phone and address signals always disable candidate discovery", async () => {
   const calls = [];
   const client = clientWithResponses(
