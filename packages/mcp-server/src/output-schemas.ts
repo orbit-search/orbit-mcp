@@ -97,11 +97,14 @@ export const populationSchema = z.object({
   status: z.enum(["running", "completed", "completed_with_errors", "failed", "cancelled"]).describe("Where the population search is."),
 }).passthrough().describe("Present on a population search: the subject, the depth, the reserved credits and the status.");
 
-/** A search snapshot as read while it may still run: the same envelope, with running allowed and the population block. */
+/** A search snapshot as read while it may still run: the same envelope, with running allowed and the population block when the search is one. */
 export const searchSnapshotOutputSchema = searchOutputSchema.extend({
   status: z.enum(["running", "completed", "completed_with_errors", "failed"]).describe("Search state at the time of the read; running means more results can arrive."),
   population: populationSchema.optional(),
 });
+
+/** The snapshot a population search returns: the population block is always present. */
+export const populationSearchOutputSchema = searchSnapshotOutputSchema.extend({ population: populationSchema });
 
 export const profileOutputSchema = z.object({
   billing: billingSchema.optional(),

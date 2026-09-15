@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
-import { searchOutputSchema, searchSnapshotOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
+import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
   return {
@@ -32,6 +32,9 @@ const signalsSchema = z
     phone: z.string().min(1).optional(),
   })
   .strict();
+
+/** Terminal states that are MCP errors, as search_people reports them: some or all of the work failed. */
+const PARTIAL_OR_FAILED: ReadonlySet<string> = new Set(["completed_with_errors", "failed"]);
 
 export function createOrbitServer(apiKey: string): McpServer {
   const client = new OrbitV3Client({ apiKey });
@@ -105,7 +108,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     "search_population",
     {
       description: "Search everyone in one population: every current employee of a company, or everyone who attended a school. Reserves the quoted credits and returns the search snapshot at once; the search keeps running in Orbit and adds people to its results as it finds them. Poll get_search_status with the returned search_id until status is terminal. Results are append-only.",
-      outputSchema: searchSnapshotOutputSchema,
+      outputSchema: populationSearchOutputSchema,
       // A population search builds profiles; an omitted request_id creates new work.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       inputSchema: {
@@ -116,7 +119,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     async ({ population, size, profile_depth, request_id }) => {
       try {
         const result = await client.startPopulation({ population, size, profile_depth, request_id });
-        return toolResult(result, result.status === "failed");
+        return toolResult(result, PARTIAL_OR_FAILED.has(result.status));
       } catch (error) {
         return toolError(error);
       }
@@ -136,7 +139,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     async ({ search_id }) => {
       try {
         const result = await client.getSearch(search_id);
-        return toolResult(result, result.status === "failed");
+        return toolResult(result, PARTIAL_OR_FAILED.has(result.status));
       } catch (error) {
         return toolError(error);
       }

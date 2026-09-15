@@ -4,7 +4,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createOrbitServer } from "../build/server.js";
-import { searchOutputSchema, searchSnapshotOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema } from "../build/output-schemas.js";
+import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema } from "../build/output-schemas.js";
 
 const profile = { id: "person-1", sections: { bio: { bio: "Public context" } }, sources: [{ url: "https://example.org/evidence" }], future_field: { kept: true } };
 const billing = { id: "operation-receipt", pricingVersion: "server-owned-version", reservedCredits: 20, consumedCredits: 7, releasedCredits: 13, heldCredits: 0, status: "settled" };
@@ -80,7 +80,7 @@ for (const [name, args, body, schema] of [
   ["get_profile", { profile_id: "person-1" }, { profile_id: "person-1", generation_level: null, profile, billing }, profileOutputSchema],
   ["enrich_profile", { profile_id: "person-1", operation: "full" }, enrichment, enrichOutputSchema],
   ["quote_population_search", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400 }, populationQuote, populationQuoteOutputSchema],
-  ["search_population", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400, profile_depth: "partial" }, populationSearch, searchSnapshotOutputSchema],
+  ["search_population", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400, profile_depth: "partial" }, populationSearch, populationSearchOutputSchema],
   ["get_search_status", { search_id: "search-1" }, populationSearch, searchSnapshotOutputSchema],
 ]) {
   test(`${name} returns schema-valid structured content and unchanged text JSON (${body.results?.length ?? "profile"})`, async () => {
@@ -105,6 +105,28 @@ for (const status of ["completed_with_errors", "failed"]) {
     }, body);
   });
 }
+
+for (const [name, args] of [
+  ["search_population", { population: { kind: "company", id: "1441", name: "OpenAI" }, size: 2400 }],
+  ["get_search_status", { search_id: "search-1" }],
+]) {
+  test(`${name} reports completed_with_errors as an MCP error, like search_people`, async () => {
+    const body = { ...populationSearch, status: "completed_with_errors", population: { ...population, status: "completed_with_errors" } };
+    await withClient(async client => {
+      const result = await client.callTool({ name, arguments: args });
+      assert.equal(result.isError, true);
+      assert.deepEqual(searchSnapshotOutputSchema.parse(result.structuredContent), body);
+    }, body);
+  });
+}
+
+test("search_population advertises the population block as required", async () => {
+  await withClient(async client => {
+    const { tools } = await client.listTools();
+    assert.ok(tools.find(tool => tool.name === "search_population").outputSchema.required.includes("population"));
+    assert.ok(!tools.find(tool => tool.name === "get_search_status").outputSchema.required.includes("population"));
+  }, populationSearch);
+});
 
 test("failed enrichment preserves the terminal failure envelope", async () => {
   const body = { ...enrichment, status: "failed", failure: { code: "failed", message: "Failed", retryable: true } };
