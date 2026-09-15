@@ -30,6 +30,43 @@ export interface SearchInput {
   limit?: number;
 }
 
+export type PopulationKind = "company" | "school";
+export type PopulationStatus = "running" | "completed" | "completed_with_errors" | "failed" | "cancelled";
+
+/** The subject of a population search: every current employee of a company, or everyone who attended a school. */
+export interface PopulationSubject {
+  kind: PopulationKind;
+  id: string;
+  name: string;
+}
+
+export interface PopulationInput {
+  request_id?: string;
+  population: PopulationSubject;
+  size?: number | null;
+  profile_depth?: ProfileDepth;
+}
+
+/** The whole price of a population search, as one number. */
+export interface PopulationQuote {
+  population: PopulationSubject;
+  size: number | null;
+  profile_depth: ProfileDepth;
+  credits: number;
+  max_people: number;
+  pricing_version: string;
+}
+
+export interface Population {
+  kind: PopulationKind;
+  id: string;
+  name: string;
+  size: number | null;
+  profile_depth: ProfileDepth;
+  credits_quoted: number;
+  status: PopulationStatus;
+}
+
 export interface Failure {
   code: string;
   message: string;
@@ -52,6 +89,8 @@ export interface SearchResponse {
   candidate_discovery: boolean;
   profile_depth: ProfileDepth;
   include_profile: boolean;
+  /** Present on a population search. */
+  population?: Population;
   results: SearchResult[];
   created_at: string;
   updated_at: string;

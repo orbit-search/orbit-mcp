@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
-import { searchOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
+import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
   return {
@@ -33,9 +33,12 @@ const signalsSchema = z
   })
   .strict();
 
+/** Terminal states that are MCP errors, as search_people reports them: some or all of the work failed. */
+const PARTIAL_OR_FAILED: ReadonlySet<string> = new Set(["completed_with_errors", "failed"]);
+
 export function createOrbitServer(apiKey: string): McpServer {
   const client = new OrbitV3Client({ apiKey });
-  const server = new McpServer({ name: "orbit-mcp", version: "2.2.0" });
+  const server = new McpServer({ name: "orbit-mcp", version: "2.3.0" });
 
   server.registerTool(
     "get_credit_usage",
@@ -71,6 +74,72 @@ export function createOrbitServer(apiKey: string): McpServer {
       try {
         const result = await client.searchAndWait({ query, signals, candidate_discovery, profile_depth, limit, request_id });
         return toolResult(result, result.status !== "completed");
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  const populationInput = {
+    population: z.object({
+      kind: z.enum(["company", "school"]).describe("What the population is: the current employees of a company, or the alumni of a school."),
+      id: z.string().regex(/^\d{1,20}$/).describe("The numeric id of the company or school."),
+      name: z.string().min(1).max(200).describe("The company or school name."),
+    }).strict(),
+    size: z.number().int().min(0).optional().describe("How many people the population has, when known."),
+    profile_depth: z.enum(["partial", "full"]).default("partial").describe("The depth every person in the population is built to. A full population costs more than a partial one."),
+  };
+
+  server.registerTool(
+    "quote_population_search",
+    {
+      description: "Price a search for everyone in one population: every current employee of a company, or everyone who attended a school. Returns the whole cost as one number in credits. This read starts no work and reserves no credits. Quote before search_population and confirm the cost with the user.",
+      outputSchema: populationQuoteOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: populationInput,
+    },
+    async ({ population, size, profile_depth }) => {
+      try { return toolResult(await client.quotePopulation({ population, size, profile_depth })); }
+      catch (error) { return toolError(error); }
+    },
+  );
+
+  server.registerTool(
+    "search_population",
+    {
+      description: "Search everyone in one population: every current employee of a company, or everyone who attended a school. Reserves the quoted credits and returns the search snapshot at once; the search keeps running in Orbit and adds people to its results as it finds them. Poll get_search_status with the returned search_id until status is terminal. Results are append-only.",
+      outputSchema: populationSearchOutputSchema,
+      // A population search builds profiles; an omitted request_id creates new work.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      inputSchema: {
+        ...populationInput,
+        request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical search."),
+      },
+    },
+    async ({ population, size, profile_depth, request_id }) => {
+      try {
+        const result = await client.startPopulation({ population, size, profile_depth, request_id });
+        return toolResult(result, PARTIAL_OR_FAILED.has(result.status));
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_search_status",
+    {
+      description: "Read the latest snapshot of a v3 search by search_id without starting new work. Use it to follow a population search, or any search whose earlier response was still running. Space polls out.",
+      outputSchema: searchSnapshotOutputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        search_id: z.string().min(1).max(500).describe("The search_id returned by search_people or search_population."),
+      },
+    },
+    async ({ search_id }) => {
+      try {
+        const result = await client.getSearch(search_id);
+        return toolResult(result, PARTIAL_OR_FAILED.has(result.status));
       } catch (error) {
         return toolError(error);
       }

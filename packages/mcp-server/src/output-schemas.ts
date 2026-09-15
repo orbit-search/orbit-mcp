@@ -72,6 +72,40 @@ export const searchOutputSchema = z.object({
   links: z.object({ status: z.string().describe("Relative v3 search-status URL.") }).passthrough(),
 }).passthrough();
 
+const populationSubject = z.object({
+  kind: z.enum(["company", "school"]).describe("What the population is: the current employees of a company, or the alumni of a school."),
+  id: z.string().describe("The numeric id of the company or school."),
+  name: z.string().describe("The company or school name."),
+}).passthrough();
+
+export const populationQuoteOutputSchema = z.object({
+  population: populationSubject,
+  size: z.number().int().nullable().describe("The population's size as given, or null."),
+  profile_depth: z.enum(["partial", "full"]).describe("The depth the quote priced."),
+  credits: z.number().finite().describe("The whole cost of the search, as one number. Reserved when the search starts."),
+  max_people: z.number().int().describe("The most people one population search covers."),
+  pricing_version: z.string().describe("The pricing catalog version the quote used."),
+}).passthrough();
+
+export const populationSchema = z.object({
+  kind: z.enum(["company", "school"]),
+  id: z.string(),
+  name: z.string(),
+  size: z.number().int().nullable().describe("The population's size as given, or null."),
+  profile_depth: z.enum(["partial", "full"]).describe("The depth every person is built to."),
+  credits_quoted: z.number().finite().describe("The credits reserved when the search started."),
+  status: z.enum(["running", "completed", "completed_with_errors", "failed", "cancelled"]).describe("Where the population search is."),
+}).passthrough().describe("Present on a population search: the subject, the depth, the reserved credits and the status.");
+
+/** A search snapshot as read while it may still run: the same envelope, with running allowed and the population block when the search is one. */
+export const searchSnapshotOutputSchema = searchOutputSchema.extend({
+  status: z.enum(["running", "completed", "completed_with_errors", "failed"]).describe("Search state at the time of the read; running means more results can arrive."),
+  population: populationSchema.optional(),
+});
+
+/** The snapshot a population search returns: the population block is always present. */
+export const populationSearchOutputSchema = searchSnapshotOutputSchema.extend({ population: populationSchema });
+
 export const profileOutputSchema = z.object({
   billing: billingSchema.optional(),
   profile_id: z.string().describe("Canonical Orbit profile identifier."),

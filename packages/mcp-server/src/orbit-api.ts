@@ -9,6 +9,8 @@ import type {
   SearchInput,
   SearchResponse,
   SearchSignals,
+  PopulationInput,
+  PopulationQuote,
 } from "./types.js";
 
 const DEFAULT_BASE_URL = "https://api.orbitsearch.com";
@@ -164,6 +166,35 @@ export class OrbitV3Client {
       () => this.requestWithRetry<SearchResponse>(`/v3/search/${encodeURIComponent(initial.search_id)}`),
       TERMINAL_SEARCH_STATUSES,
     );
+  }
+
+  /** The latest snapshot of a search, without starting new work. */
+  getSearch(searchId: string): Promise<SearchResponse> {
+    return this.requestWithRetry(`/v3/search/${encodeURIComponent(searchId)}`);
+  }
+
+  private static populationBody(input: PopulationInput, withRequestId: boolean): JsonObject {
+    const name = input.population.name.trim();
+    if (!name) throw new Error("population.name is required");
+    return {
+      ...(withRequestId ? { request_id: input.request_id?.trim() || randomUUID() } : {}),
+      population: { kind: input.population.kind, id: input.population.id.trim(), name },
+      size: typeof input.size === "number" ? input.size : null,
+      profile_depth: input.profile_depth ?? "partial",
+    };
+  }
+
+  /** The whole price of a population search. Starts no work and reserves no credits. */
+  quotePopulation(input: PopulationInput): Promise<PopulationQuote> {
+    return this.requestWithRetry("/v3/search/populations/quote", { method: "POST", body: JSON.stringify(OrbitV3Client.populationBody(input, false)) });
+  }
+
+  /**
+   * Starts a population search and returns its first snapshot at once. The search keeps running
+   * in Orbit and adds people as it finds them; read it again with getSearch.
+   */
+  startPopulation(input: PopulationInput): Promise<SearchResponse> {
+    return this.requestWithRetry("/v3/search/populations", { method: "POST", body: JSON.stringify(OrbitV3Client.populationBody(input, true)) });
   }
 
   getProfile(profileId: string): Promise<ProfileReadResponse> {
