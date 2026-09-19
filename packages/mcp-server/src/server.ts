@@ -38,7 +38,19 @@ const PARTIAL_OR_FAILED: ReadonlySet<string> = new Set(["completed_with_errors",
 
 export function createOrbitServer(apiKey: string): McpServer {
   const client = new OrbitV3Client({ apiKey });
-  const server = new McpServer({ name: "orbit-mcp", version: "2.3.0" });
+  // `name` stays the programmatic id. `title` is what MCP clients show, and
+  // `icons` is how they render a logo; without them a client falls back to the
+  // raw name and a placeholder. See the Implementation schema in the MCP spec.
+  const server = new McpServer({
+    name: "orbit-mcp",
+    title: "Orbit",
+    version: "2.3.0",
+    description: "Search people and read source-backed Orbit profiles, enrich context, and manage directories.",
+    websiteUrl: "https://developer.orbitsearch.com",
+    icons: [
+      { src: "https://developer.orbitsearch.com/orbit-icon-512.png", mimeType: "image/png", sizes: ["512x512"] },
+    ],
+  });
 
   server.registerTool(
     "get_credit_usage",
