@@ -10,17 +10,35 @@ people search, rich profiles, enrichment, and organization-scoped directory
 management. Directory tools require an OAuth user connection; API keys alone
 support the search and enrichment tools, not directory management.
 
-For a remote/headless agent, use `orbit-mcp login --scope 'search.read
-directories.read directories.write'` when the issuer discovery advertises
-`device_authorization_endpoint`. Share only `verification_uri_complete` and
-`user_code` with the user. They sign in on their own device, match the code, and
-click **Approve login**; the running CLI connects automatically. Do not open the
-remote browser, ask for passwords/tokens, or request a pasted callback URL. Keep
-credentials in the private agent-side login file. Use `orbit-mcp tools`/`call` or
-configure `orbit-mcp stdio` after login. Denial/expiry ends the attempt. If discovery
-lacks the endpoint, report that remote approval is not enabled there. Existing
-hosted MCP clients retain their account-linking UI. Request only needed scopes;
-read-only directory work can omit `directories.write`.
+For remote agents, connect to `https://api.orbitsearch.com/mcp-auth/agent`.
+This uses ordinary MCP tools and does not require host-specific OAuth support,
+a CLI, or a browser on the agent's computer. Availability requires the gateway
+and edge release; if the login tools are absent, report that deployment limitation.
+Existing hosted connectors retain their native account-linking UI.
+
+1. Call `orbit_login`, requesting only needed permissions (`search.read` plus
+   directory scopes only for requested directory work). Keep `login_request`
+   private. The server starts listening before it returns the link.
+2. Call `orbit_wait_for_login` with `login_request` and `wait_seconds: 0`
+   **before sharing the link**, confirming the request is pending.
+3. Send only the clickable `login_url` to the user. Its code is already included.
+   Tell them to open it on their own device and sign in; sign-in finishes the
+   connection automatically. Never ask for passwords, a code, tokens, or a callback.
+4. Keep calling `orbit_wait_for_login` with the same handle until connected,
+   honoring `retry_after` (including after a temporary interruption). Use one
+   waiter per login request. Calls can
+   wait up to 25 seconds each. Do not stop after delivering the link, or require
+   the user to tell you when they finished. Denial/expiry ends the attempt.
+5. Keep the returned `connection_token` private and pass it to `orbit_list_tools`
+   and `orbit_call_tool` on every call. Discover the underlying tool schemas,
+   then use their names and arguments through `orbit_call_tool`. Use
+   `orbit_logout` when asked to disconnect. Never show or log either private
+   handle; OAuth tokens, Orbit keys, and user sessions remain on the server.
+
+The connection token is a separate application credential, not an MCP session ID.
+It authorizes this MCP bridge only, not direct REST calls. If it expires or is
+revoked, start a new login. Native OAuth clients can alternatively use the
+advertised device grant in their private authentication layer.
 
 Read [directory workflows](references/workflows.md) before using directory tools.
 Discover organization and directory IDs; do not guess targets or grant IDs.

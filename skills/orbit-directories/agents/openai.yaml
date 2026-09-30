@@ -6,6 +6,6 @@ dependencies:
   tools:
     - type: "mcp"
       value: "orbit"
-      description: "Orbit general MCP server"
+      description: "Orbit remote login and general MCP tools"
       transport: "streamable_http"
-      url: "https://api.orbitsearch.com/mcp"
+      url: "https://api.orbitsearch.com/mcp-auth/agent"

@@ -2,6 +2,15 @@
 
 General MCP server for Orbit people search, profiles, enrichment, and directory management. The hosted endpoint is `https://api.orbitsearch.com/mcp`. Search and enrichment support OAuth sign-in or an Orbit Developer API key; directory management requires a signed-in Orbit user and the appropriate organization permissions.
 
+Remote agents can use `https://api.orbitsearch.com/mcp-auth/agent` for ordinary
+MCP login tools, without a CLI, remote browser, or host-specific OAuth integration.
+Call `orbit_login`, confirm the waiter with `orbit_wait_for_login` before sharing
+the returned link, and keep waiting while the user signs in on their own device.
+The URL already contains the code; the user sends nothing back. Then pass the
+private `connection_token` to `orbit_list_tools` and `orbit_call_tool` to use the
+tools below. Never display private handles. The gateway and edge companion
+release is required; this README alone does not establish production availability.
+
 ## Tools
 
 | Tool | Purpose | Orbit API |
