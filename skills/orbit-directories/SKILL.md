@@ -16,9 +16,13 @@ a CLI, or a browser on the agent's computer. Availability requires the gateway
 and edge release; if the login tools are absent, report that deployment limitation.
 Existing hosted connectors retain their native account-linking UI.
 
-1. Call `orbit_login`, requesting only needed permissions (`search.read` plus
-   directory scopes only for requested directory work). Keep `login_request`
-   private. The server starts listening before it returns the link.
+1. Call `orbit_login`, requesting only needed permissions. Use `search.read`
+   for people research. Listing or reading directories also needs
+   `directories.read`; `search_directory` and directory changes need
+   `directories.write` as well, even when the task is research. For directory
+   research request `["search.read", "directories.read", "directories.write"]`.
+   Keep `login_request` private. The server starts listening before returning
+   the link.
 2. Call `orbit_wait_for_login` with `login_request` and `wait_seconds: 0`
    **before sharing the link**, confirming the request is pending.
 3. Send only the clickable `login_url` to the user. Its code is already included.
