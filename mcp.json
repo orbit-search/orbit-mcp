@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "orbit": {
+      "type": "http",
+      "url": "https://api.orbitsearch.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ORBIT_API_KEY}"
+      }
+    }
+  }
+}
