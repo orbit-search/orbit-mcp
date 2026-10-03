@@ -97,12 +97,27 @@ export interface SearchResponse {
   links: { status: string };
 }
 
-export interface ProfileReadResponse {
+export interface ProfileJsonReadResponse {
   billing?: OperationBilling;
   profile_id: string;
   generation_level: number;
   profile: JsonObject;
 }
+
+export interface ProfileMarkdownReadResponse {
+  billing?: OperationBilling;
+  profile_id: string;
+  generation_level: number | null;
+  format: "markdown";
+  markdown: {
+    schema_version: "orbit.profile.markdown.v1";
+    entrypoint: "user.md";
+    manifest: { path: string; title: string; status: "available" | "empty" | "unavailable" }[];
+    files: Record<string, string>;
+  };
+}
+
+export type ProfileReadResponse = ProfileJsonReadResponse | ProfileMarkdownReadResponse;
 
 export interface EnrichResponse {
   billing?: OperationBilling;
