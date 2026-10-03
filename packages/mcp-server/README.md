@@ -27,13 +27,16 @@ release is required; this README alone does not establish production availabilit
 
 The three search/profile tools declare output schemas and return `structuredContent` alongside
 serialized JSON in `content` by default. With `get_profile` and `format: "markdown"`,
-`content` contains a metadata block followed by one readable text block per file;
+`content` contains a file-map block followed by one readable text block per file;
 `structuredContent` retains the complete package and billing receipt. Schemas describe the v3
 response envelopes; profile bodies and new API fields remain open-ended so no
 person context or source evidence is dropped. Tool errors retain `isError: true`;
 exception payloads are `{ error: string }` in text content only, outside the
 successful output schema. This keeps schema-validating clients from hiding the
 actionable error behind a structured-output validation failure.
+
+In Markdown mode, profile IDs, generation levels and billing bookkeeping remain
+in `structuredContent` and do not appear in the readable file-map block.
 
 Annotations mark `get_profile` and `get_credit_usage` as read-only; only the usage lookup is idempotent, while independent profile reads consume credits. Search may build
 profiles; enrichment may regenerate and replace existing context. Neither write

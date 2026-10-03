@@ -175,7 +175,7 @@ export function createOrbitServer(apiKey: string): McpServer {
         if ("format" in result && result.format === "markdown") {
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify({ profile_id: result.profile_id, generation_level: result.generation_level, billing: result.billing, format: result.format, manifest: result.markdown.manifest }, null, 2) },
+              { type: "text" as const, text: JSON.stringify({ entrypoint: result.markdown.entrypoint, manifest: result.markdown.manifest }, null, 2) },
               ...result.markdown.manifest.map(file => ({ type: "text" as const, text: `File: ${file.path}\n\n${result.markdown.files[file.path]}` })),
             ],
             structuredContent: { ...result },

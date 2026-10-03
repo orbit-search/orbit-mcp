@@ -49,7 +49,10 @@ test("get_profile advertises Markdown and returns real text blocks plus the inta
     assert.notEqual(result.isError, true);
     assert.deepEqual(result.structuredContent, body);
     assert.deepEqual(profileOutputSchema.parse(result.structuredContent), body);
-    assert.deepEqual(JSON.parse(result.content[0].text), { profile_id: body.profile_id, generation_level: body.generation_level, billing, format: "markdown", manifest: body.markdown.manifest });
+    assert.deepEqual(JSON.parse(result.content[0].text), { entrypoint: body.markdown.entrypoint, manifest: body.markdown.manifest });
+    assert(!result.content.some(block => block.text.includes(body.profile_id)));
+    assert(!result.content[0].text.includes("generation_level"));
+    assert(!result.content[0].text.includes("billing"));
     assert.equal(result.content.length, body.markdown.manifest.length + 1);
     for (let i = 0; i < body.markdown.manifest.length; i++) {
       const path = body.markdown.manifest[i].path;
