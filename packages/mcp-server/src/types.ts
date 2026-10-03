@@ -111,8 +111,8 @@ export interface ProfileMarkdownReadResponse {
   format: "markdown";
   markdown: {
     schema_version: "orbit.profile.markdown.v1";
-    entrypoint: "user.md";
-    manifest: { path: string; title: string; status: "available" | "empty" | "unavailable" }[];
+    entrypoint: "USER.md";
+    manifest: { path: string; title: string; status: "available" }[];
     files: Record<string, string>;
   };
 }

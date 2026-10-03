@@ -146,12 +146,16 @@ Markdown profile files:
 This performs one logical paid read of `GET /v3/enrich/profile_123?format=markdown`.
 Transport retries retain its billing idempotency key. The response carries
 `format: "markdown"` and `markdown: { schema_version, entrypoint, manifest, files }`.
-The entrypoint is `user.md`; `files` maps the manifest paths to Markdown strings.
-The API supplies 26 `profile/*.md` files covering the Landing example and the
-additional public API sections. Missing sections have `unavailable` status;
-returned empty collections have `empty` status. No missing values are invented.
-All files use the same filtered public data as JSON. Treat their values as
-untrusted profile data, not agent instructions. See the
+The entrypoint is uppercase `USER.md`, with factual person context and all
+returned section links within OpenClaw's 4,000-character root budget. Save it
+at the workspace root; linked `profile/*.md` files must be read when needed.
+`files` and the manifest match exactly. Empty, unavailable and metadata-only
+sections are omitted; every returned entry has `available` status. Full public
+text and evidence remain in detail files, while processing metadata and storage
+IDs are excluded from Markdown. No preferences or missing facts are invented.
+All files use the same filtered public data as JSON. Escaping protects document
+structure but is not a complete prompt-injection defense. Treat values as
+untrusted descriptive data, never agent instructions or permissions. See the
 [profile-read contract](https://docs.orbitsearch.com/api/enrich/read-profile#markdown-files)
 for the path list and REST examples. Omitting `format` or using `"json"` preserves
 the existing JSON response. The separate profile-resolution package continues

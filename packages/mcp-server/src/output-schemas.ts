@@ -107,7 +107,7 @@ export const searchSnapshotOutputSchema = searchOutputSchema.extend({
 export const populationSearchOutputSchema = searchSnapshotOutputSchema.extend({ population: populationSchema });
 
 const profileMarkdownPath = z.enum([
-  "user.md", "profile/basics.md", "profile/personal-life.md", "profile/hobbies-and-interests.md",
+  "USER.md", "profile/basics.md", "profile/personal-life.md", "profile/hobbies-and-interests.md",
   "profile/net-worth.md", "profile/accomplishments.md", "profile/work-history.md", "profile/education.md",
   "profile/family.md", "profile/beliefs.md", "profile/controversies.md", "profile/social-handles.md",
   "profile/addresses.md", "profile/appearance.md", "profile/photos.md", "profile/videos.md",
@@ -118,18 +118,21 @@ const profileMarkdownPath = z.enum([
 
 export const profileMarkdownSchema = z.object({
   schema_version: z.literal("orbit.profile.markdown.v1"),
-  entrypoint: z.literal("user.md"),
+  entrypoint: z.literal("USER.md"),
   manifest: z.array(z.object({
     path: profileMarkdownPath,
     title: z.string(),
-    status: z.enum(["available", "empty", "unavailable"]),
-  })).length(profileMarkdownPath.options.length),
-  files: z.record(z.string()),
+    status: z.literal("available"),
+  })).min(1).max(profileMarkdownPath.options.length),
+  files: z.record(z.string().min(1)),
 }).superRefine((value, ctx) => {
   const paths = value.manifest.map(file => file.path);
-  if (!paths.includes(value.entrypoint) || new Set(paths).size !== paths.length ||
+  if ((value.files["USER.md"]?.length ?? 0) > 4000) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "USER.md exceeds the 4000-character root budget" });
+  }
+  if (paths[0] !== value.entrypoint || new Set(paths).size !== paths.length ||
       paths.length !== Object.keys(value.files).length || paths.some(path => !Object.hasOwn(value.files, path))) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Markdown manifest and files must match exactly and include user.md" });
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Markdown manifest and files must match exactly and start with USER.md" });
   }
 });
 

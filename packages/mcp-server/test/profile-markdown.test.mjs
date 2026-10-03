@@ -33,9 +33,12 @@ async function withMcp(responseBody, run, status = 200) {
 }
 
 test("get_profile advertises Markdown and returns real text blocks plus the intact package and billing", async () => {
-  assert.equal(body.markdown.manifest.length, 27);
-  assert.equal(Object.keys(body.markdown.files).length, 27);
-  assert.deepEqual(new Set(body.markdown.manifest.map(file => file.status)), new Set(["available", "empty", "unavailable"]));
+  assert.equal(body.markdown.entrypoint, "USER.md");
+  assert.equal(body.markdown.manifest.length, 8);
+  assert.equal(Object.keys(body.markdown.files).length, 8);
+  assert.deepEqual(new Set(body.markdown.manifest.map(file => file.status)), new Set(["available"]));
+  assert(body.markdown.files["USER.md"].length <= 4000);
+  assert(!Object.hasOwn(body.markdown.files, "profile/videos.md"));
   await withMcp(body, async (client, calls) => {
     const { tools } = await client.listTools();
     const tool = tools.find(tool => tool.name === "get_profile");
@@ -99,11 +102,25 @@ for (const status of [401, 403, 402]) {
   });
 }
 
+test("a sparse root-only package remains usable as text with no empty section placeholders", async () => {
+  const sparse = { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.slice(0, 1), files: { "USER.md": "# User Profile\n\nNo public personal context is available.\n" } } };
+  await withMcp(sparse, async client => {
+    const result = await client.callTool({ name: "get_profile", arguments: { profile_id: "sparse", format: "markdown" } });
+    assert.notEqual(result.isError, true);
+    assert.deepEqual(result.structuredContent, sparse);
+    assert.equal(result.content.length, 2);
+    assert.equal(result.content[1].text, `File: USER.md\n\n${sparse.markdown.files["USER.md"]}`);
+  });
+});
+
 for (const corrupt of [
-  { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.slice(0, 1), files: { "user.md": body.markdown.files["user.md"] } } },
+  { ...body, markdown: { ...body.markdown, entrypoint: "user.md" } },
+  { ...body, markdown: { ...body.markdown, files: { ...body.markdown.files, "USER.md": "x".repeat(4001) } } },
+  { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.slice(1) } },
+  { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.map((file, i) => i === 1 ? { ...file, status: "empty" } : file) } },
   { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.map(file => file.path === "profile/education.md" ? { ...file, path: "profile/unknown.md" } : file), files: Object.fromEntries(Object.entries(body.markdown.files).map(([path, text]) => [path === "profile/education.md" ? "profile/unknown.md" : path, text])) } },
   { ...body, markdown: { ...body.markdown, manifest: [{ path: "../escape.md", title: "Escape", status: "available" }] } },
-  { ...body, markdown: { ...body.markdown, files: { "user.md": "private-upstream-marker" } } },
+  { ...body, markdown: { ...body.markdown, files: { "USER.md": "private-upstream-marker" } } },
   { ...body, markdown: { ...body.markdown, manifest: [...body.markdown.manifest, body.markdown.manifest[0]] } },
   { ...body, markdown: { ...body.markdown, files: { ...body.markdown.files, "extra.md": "private-upstream-marker" } } },
   { profile_id: "canonical", generation_level: 2, profile: {} },
