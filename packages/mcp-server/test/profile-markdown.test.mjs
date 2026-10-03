@@ -117,6 +117,7 @@ test("a sparse root-only package remains usable as text with no empty section pl
 });
 
 for (const corrupt of [
+  ...["profile/appearance.md", "profile/videos.md", "profile/connections.md"].map(path => ({ ...body, markdown: { ...body.markdown, manifest: [...body.markdown.manifest, { path, title: "Unsupported", status: "available" }], files: { ...body.markdown.files, [path]: "# Unsupported\n\nprivate-upstream-marker\n" } } })),
   { ...body, markdown: { ...body.markdown, entrypoint: "user.md" } },
   { ...body, markdown: { ...body.markdown, files: { ...body.markdown.files, "USER.md": "x".repeat(4001) } } },
   { ...body, markdown: { ...body.markdown, manifest: body.markdown.manifest.slice(1) } },

@@ -110,8 +110,8 @@ const profileMarkdownPath = z.enum([
   "USER.md", "profile/basics.md", "profile/personal-life.md", "profile/hobbies-and-interests.md",
   "profile/net-worth.md", "profile/accomplishments.md", "profile/work-history.md", "profile/education.md",
   "profile/family.md", "profile/beliefs.md", "profile/controversies.md", "profile/social-handles.md",
-  "profile/addresses.md", "profile/appearance.md", "profile/photos.md", "profile/videos.md",
-  "profile/connections.md", "profile/references.md", "profile/bio.md", "profile/best-qualities.md",
+  "profile/addresses.md", "profile/photos.md",
+  "profile/references.md", "profile/bio.md", "profile/best-qualities.md",
   "profile/events-timeline.md", "profile/portfolio.md", "profile/research-papers.md", "profile/github-repos.md",
   "profile/media-credits.md", "profile/music-credits.md", "profile/books.md",
 ]);
