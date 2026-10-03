@@ -55,7 +55,7 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
     for (const tool of tools) {
       assert.equal(tool.outputSchema.type, "object");
-      assert(tool.outputSchema.required.length >= 3);
+      assert(tool.outputSchema.required.length >= (tool.name === "get_profile" ? 2 : 3));
       assert.equal(tool.outputSchema.additionalProperties, true);
     }
     assert.deepEqual(tools[0].annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });

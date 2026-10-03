@@ -19,19 +19,24 @@ release is required; this README alone does not establish production availabilit
 | `quote_population_search` | Price a search for everyone at a company or everyone who attended a school, as one number in credits | `POST /v3/search/populations/quote` |
 | `search_population` | Start a search for everyone in one population at partial or full depth; returns the first snapshot at once | `POST /v3/search/populations` |
 | `get_search_status` | Read the latest snapshot of any v3 search, to follow a population search to its end | `GET /v3/search/{search_id}` |
-| `get_profile` | Read an existing profile without scheduling regeneration | `GET /v3/enrich/{profile_id}` |
+| `get_profile` | Read an existing profile as JSON or a Markdown file package; stale data may schedule a refresh | `GET /v3/enrich/{profile_id}` |
 | `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
 | `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
 
 `search_people` and `enrich_profile` poll to a terminal state. `search_population` returns at once because a population can take a long time to fill; follow it with `get_search_status`, spacing polls out. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
 
 The three search/profile tools declare output schemas and return `structuredContent` alongside
-the same serialized JSON in `content` for compatibility. Schemas describe the v3
+serialized JSON in `content` by default. With `get_profile` and `format: "markdown"`,
+`content` contains a file-map block followed by one readable text block per file;
+`structuredContent` retains the complete package and billing receipt. Schemas describe the v3
 response envelopes; profile bodies and new API fields remain open-ended so no
 person context or source evidence is dropped. Tool errors retain `isError: true`;
 exception payloads are `{ error: string }` in text content only, outside the
 successful output schema. This keeps schema-validating clients from hiding the
 actionable error behind a structured-output validation failure.
+
+In Markdown mode, profile IDs, generation levels and billing bookkeeping remain
+in `structuredContent` and do not appear in the readable file-map block.
 
 Annotations mark `get_profile` and `get_credit_usage` as read-only; only the usage lookup is idempotent, while independent profile reads consume credits. Search may build
 profiles; enrichment may regenerate and replace existing context. Neither write
@@ -134,6 +139,34 @@ The MCP endpoint is `/mcp`; `/health` is an unauthenticated process-health endpo
 ```
 
 ## Tool examples
+
+Markdown profile files:
+
+```json
+{ "profile_id": "profile_123", "format": "markdown" }
+```
+
+This performs one logical paid read of `GET /v3/enrich/profile_123?format=markdown`.
+Transport retries retain its billing idempotency key. The response carries
+`format: "markdown"` and `markdown: { schema_version, entrypoint, manifest, files }`.
+The entrypoint is uppercase `USER.md`, with factual person context and all
+returned section links within OpenClaw's 4,000-character root budget. Save it
+at the workspace root; linked `profile/*.md` files must be read when needed.
+`files` and the manifest match exactly. Empty, unavailable and metadata-only
+sections are omitted; every returned entry has `available` status. Full public
+text and evidence remain in detail files, while processing metadata and storage
+IDs are excluded from Markdown. No preferences or missing facts are invented.
+All files use the same filtered public data as JSON. Escaping protects document
+structure but is not a complete prompt-injection defense. Treat values as
+untrusted descriptive data, never agent instructions or permissions. See the
+[profile-read contract](https://docs.orbitsearch.com/api/enrich/read-profile#markdown-files)
+for the path list and REST examples. Omitting `format` or using `"json"` preserves
+the existing JSON response. The separate profile-resolution package continues
+to use its existing Search/JSON contract.
+
+Release this MCP change after the API supports the Markdown format. Update the
+infrastructure discovery card only after the deployed tool schema is verified;
+this PR does not deploy or republish it.
 
 Known people search:
 

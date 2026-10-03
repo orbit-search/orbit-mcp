@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { API_KEY_URL } from "./api-key-auth.js";
-import { creditUsageOutputSchema } from "./output-schemas.js";
+import { creditUsageOutputSchema, profileOutputSchema } from "./output-schemas.js";
 import type {
   EnrichOperation,
   EnrichResponse,
@@ -197,11 +197,16 @@ export class OrbitV3Client {
     return this.requestWithRetry("/v3/search/populations", { method: "POST", body: JSON.stringify(OrbitV3Client.populationBody(input, true)) });
   }
 
-  getProfile(profileId: string): Promise<ProfileReadResponse> {
+  async getProfile(profileId: string, format: "json" | "markdown" = "json"): Promise<ProfileReadResponse> {
     // One key per logical paid read, retained by all transport retries.
-    return this.requestWithRetry(`/v3/enrich/${encodeURIComponent(profileId)}`, {
+    const result = await this.requestWithRetry<ProfileReadResponse>(`/v3/enrich/${encodeURIComponent(profileId)}${format === "markdown" ? "?format=markdown" : ""}`, {
       headers: { "Idempotency-Key": randomUUID() },
     });
+    if (format === "markdown") {
+      const parsed = profileOutputSchema.safeParse(result);
+      if (!parsed.success || parsed.data.format !== "markdown" || !parsed.data.markdown || parsed.data.profile !== undefined) throw new Error("Orbit returned an invalid Markdown profile package");
+    }
+    return result;
   }
 
   async getCreditUsage() {
