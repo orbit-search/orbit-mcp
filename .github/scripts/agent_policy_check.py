@@ -307,7 +307,8 @@ def evaluate(
         )
 
     ui_hits = [path for path in paths if matches_any(path, policy.get("uiPaths", []))]
-    body = pr.get("body") or ""
+    # The PR template's own comments mention desktop and mobile; only the author's text counts.
+    body = re.sub(r"<!--.*?-->", "", pr.get("body") or "", flags=re.S)
     if ui_hits:
         media = media_count(body)
         has_media = (
@@ -684,7 +685,9 @@ def main() -> int:
     ):
         author = pr["user"]["login"].lower()
         # Ask the owners of the PR's target branch, the same policy that judged it.
-        owners = (github.file_at(POLICY_PATH, pr["base"]["sha"]) or policy).get("owners", [])
+        owners = (github.file_at(POLICY_PATH, pr["base"]["sha"]) or policy).get(
+            "owners", []
+        )
         reviewers = [owner for owner in owners if owner.lower() != author]
         try:
             github.request(

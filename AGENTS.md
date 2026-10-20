@@ -31,7 +31,10 @@ gates below.
   outside reviewer; ask a new Codex or Claude thread for a second opinion.
 - **Gates.** `.github/agent-policy.json` lists the owners
   (NicholasDominici, Vitor-Bukovitz) and the gated paths. The `agent-policy` commit status
-  shows what needs a human. Ask for approval only for a gate:
+  shows what needs a human for those paths. Gates without a path rule (an
+  existing API contract, spend limits, taste) are your judgement: when your
+  change touches one, ask for approval and record it. Ask for approval only
+  for a gate:
   - billing (how we charge, credits, prices, refunds)
   - a change to an existing developer API field, type, error or behavior
   - CockroachDB migrations

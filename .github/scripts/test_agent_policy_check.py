@@ -311,6 +311,14 @@ class EvaluateTest(unittest.TestCase):
             [r.kind for r in result.requirements], ["gate:developer-api-contract"]
         )
 
+    def test_template_comments_do_not_count_as_labels(self):
+        body = "<!-- desktop and mobile screenshots --> ![a](https://x/a.png) ![b](https://x/b.png)"
+        self.assertFalse(
+            check.evaluate(
+                POLICY, pr(body=body), files("web/page.tsx"), [record("ui-small")], {}
+            ).passed
+        )
+
     def test_one_screenshot_counts_once(self):
         url = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab"
         self.assertEqual(check.media_count(f"Desktop ![d]({url}) Mobile {url}"), 1)
