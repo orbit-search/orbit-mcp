@@ -10,6 +10,12 @@ on:
     types: [opened, synchronize, reopened, edited, ready_for_review, closed]
   issue_comment:
     types: [created, edited, deleted]
+  # A new policy or checker on the default branch rechecks every open PR.
+  push:
+    paths:
+      - ".github/agent-policy.json"
+      - ".github/scripts/agent_policy_check.py"
+      - ".github/workflows/agent-policy.yml"
 
 permissions:
   contents: read
@@ -18,17 +24,18 @@ permissions:
   statuses: write
 
 concurrency:
-  # One status covers every PR that shares a head commit, so group by head when the event has it.
-  group: agent-policy-${{ github.event.pull_request.head.sha || github.event.issue.number }}
+  # One queue per PR (PR events and comments share it): a newer run cancels an
+  # older one, so an older result can never overwrite a newer one.
+  group: agent-policy-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   evaluate:
-    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github

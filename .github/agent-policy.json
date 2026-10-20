@@ -29,10 +29,9 @@
   ],
   "uiPaths": [],
   "noBehaviorPaths": [
-    "**/*.md",
     "docs/**",
-    ".github/**",
-    ".greptile/**",
+    "**/README*.md",
+    "**/CHANGELOG*.md",
     "test/**",
     "tests/**",
     "**/__tests__/**",

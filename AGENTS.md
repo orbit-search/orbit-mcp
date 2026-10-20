@@ -14,9 +14,9 @@ gates below.
    is your real name. Commits, pushes and PRs are always yours.
 2. `infisical login` (the shared Orbit project). The bot's key lives in
    Infisical prod `/orbit-agent`; you never need to read it.
-3. Install the wrapper from `orbit-search/orbit-infrastructure`:
-   `ln -s "$PWD/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh` (from a
-   checkout of that repo), then check `orbit-agent-gh whoami`.
+3. Install the wrapper from a checkout of `orbit-search/orbit-infrastructure`:
+   `mkdir -p ~/.local/bin && ln -sf "$PWD/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
+   Make sure `~/.local/bin` is on your `PATH`, then check `orbit-agent-gh whoami`.
 
 ### Rules
 

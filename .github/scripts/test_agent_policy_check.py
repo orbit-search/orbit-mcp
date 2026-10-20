@@ -9,7 +9,11 @@ from pathlib import Path
 from unittest import mock
 
 # The checker lives in .github/scripts/ of the repo that holds this test.
-_ROOT = next(p for p in Path(__file__).resolve().parents if (p / ".github/scripts/agent_policy_check.py").exists())
+_ROOT = next(
+    p
+    for p in Path(__file__).resolve().parents
+    if (p / ".github/scripts/agent_policy_check.py").exists()
+)
 sys.path.insert(0, str(_ROOT / ".github/scripts"))
 
 import agent_policy_check as check  # noqa: E402
@@ -19,8 +23,16 @@ OLD = "b" * 40
 POLICY = {
     "owners": ["NicholasDominici", "jonnybcw"],
     "gates": [
-        {"id": "billing", "reason": "Billing", "paths": ["src/services/*billing*.ts", "src/billing/**"]},
-        {"id": "developer-api-contract", "reason": "Contract", "contractSnapshot": "tests/contracts/snap.json"},
+        {
+            "id": "billing",
+            "reason": "Billing",
+            "paths": ["src/services/*billing*.ts", "src/billing/**"],
+        },
+        {
+            "id": "developer-api-contract",
+            "reason": "Contract",
+            "contractSnapshot": "tests/contracts/snap.json",
+        },
     ],
     "uiPaths": ["web/**"],
     "noBehaviorPaths": ["**/*.md", "tests/**", "src/tests/**"],
@@ -44,13 +56,22 @@ def files(*names):
 
 
 def record(
-    kind, approver="NicholasDominici", commit=HEAD, association="OWNER", words='"ship it"', where="agent session"
+    kind,
+    approver="NicholasDominici",
+    commit=HEAD,
+    association="OWNER",
+    words='"ship it"',
+    where="agent session",
 ):
     body = (
         f"{check.RECORD_MARKER}\n**Approval record**\n- Kind: {kind}\n- Approved by: @{approver}\n"
         f"- Words: {words}\n- Where: {where}\n- Commit: {commit}\n"
     )
-    return {"body": body, "author_association": association, "user": {"login": "NicholasDominici"}}
+    return {
+        "body": body,
+        "author_association": association,
+        "user": {"login": "NicholasDominici"},
+    }
 
 
 def carry(from_sha, to_sha):
@@ -68,8 +89,16 @@ class GlobTest(unittest.TestCase):
         self.assertTrue(check.matches_any("docs/x/README.md", ["**/*.md"]))
 
     def test_single_star_stays_in_directory(self):
-        self.assertTrue(check.matches_any("src/services/developer-api-billing.ts", ["src/services/*billing*.ts"]))
-        self.assertFalse(check.matches_any("src/services/sub/billing.ts", ["src/services/*billing*.ts"]))
+        self.assertTrue(
+            check.matches_any(
+                "src/services/developer-api-billing.ts", ["src/services/*billing*.ts"]
+            )
+        )
+        self.assertFalse(
+            check.matches_any(
+                "src/services/sub/billing.ts", ["src/services/*billing*.ts"]
+            )
+        )
 
 
 class EvaluateTest(unittest.TestCase):
@@ -79,62 +108,110 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue(result.passed)
 
     def test_billing_gate_needs_owner_record_on_head(self):
-        result = check.evaluate(POLICY, pr(), files("src/services/developer-api-billing.ts"), [], {})
+        result = check.evaluate(
+            POLICY, pr(), files("src/services/developer-api-billing.ts"), [], {}
+        )
         self.assertFalse(result.passed)
         result = check.evaluate(
-            POLICY, pr(), files("src/services/developer-api-billing.ts"), [record("gate:billing")], {}
+            POLICY,
+            pr(),
+            files("src/services/developer-api-billing.ts"),
+            [record("gate:billing")],
+            {},
         )
         self.assertTrue(result.passed)
 
     def test_record_for_old_commit_needs_a_carry_chain(self):
         changed = files("src/billing/x.ts")
-        self.assertFalse(check.evaluate(POLICY, pr(), changed, [record("gate:billing", commit=OLD)], {}).passed)
+        self.assertFalse(
+            check.evaluate(
+                POLICY, pr(), changed, [record("gate:billing", commit=OLD)], {}
+            ).passed
+        )
         comments = [record("gate:billing", commit=OLD), carry(OLD, HEAD)]
         self.assertTrue(check.evaluate(POLICY, pr(), changed, comments, {}).passed)
 
     def test_non_owner_approver_and_outside_comment_do_not_count(self):
         changed = files("src/billing/x.ts")
         self.assertFalse(
-            check.evaluate(POLICY, pr(), changed, [record("gate:billing", approver="hunterrice")], {}).passed
+            check.evaluate(
+                POLICY,
+                pr(),
+                changed,
+                [record("gate:billing", approver="hunterrice")],
+                {},
+            ).passed
         )
         forged = record("gate:billing", association="NONE")
         self.assertFalse(check.evaluate(POLICY, pr(), changed, [forged], {}).passed)
 
     def test_records_from_the_agent_app_count(self):
         changed = files("src/billing/x.ts")
-        bot = {**record("gate:billing", association="NONE"), "user": {"login": "orbit-harness[bot]"}}
+        bot = {
+            **record("gate:billing", association="NONE"),
+            "user": {"login": "orbit-harness[bot]"},
+        }
         self.assertFalse(check.evaluate(POLICY, pr(), changed, [bot], {}).passed)
         policy = {**POLICY, "agentLogins": ["orbit-harness[bot]"]}
         self.assertTrue(check.evaluate(policy, pr(), changed, [bot], {}).passed)
 
     def test_non_owner_behavior_change_needs_owner_clearance(self):
         author = pr(author="hunterrice", association="MEMBER")
-        result = check.evaluate(POLICY, author, files("src/endpoints/search.ts"), [], {})
+        result = check.evaluate(
+            POLICY, author, files("src/endpoints/search.ts"), [], {}
+        )
         self.assertEqual([r.kind for r in result.requirements], ["owner-clearance"])
-        result = check.evaluate(POLICY, author, files("src/endpoints/search.ts"), [record("owner-clearance")], {})
+        result = check.evaluate(
+            POLICY,
+            author,
+            files("src/endpoints/search.ts"),
+            [record("owner-clearance")],
+            {},
+        )
         self.assertTrue(result.passed)
 
     def test_non_owner_docs_and_tests_change_needs_nothing(self):
         author = pr(author="hunterrice", association="MEMBER")
-        self.assertTrue(check.evaluate(POLICY, author, files("README.md", "tests/a.test.ts"), [], {}).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, author, files("README.md", "tests/a.test.ts"), [], {}
+            ).passed
+        )
 
     def test_one_record_can_meet_two_requirements(self):
         author = pr(author="hunterrice", association="MEMBER")
         comments = [record("owner-clearance, gate:billing")]
-        self.assertTrue(check.evaluate(POLICY, author, files("src/billing/x.ts"), comments, {}).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, author, files("src/billing/x.ts"), comments, {}
+            ).passed
+        )
 
     def test_a_partial_file_list_fails_closed(self):
         big = {**pr(), "changed_files": 3500}
         result = check.evaluate(POLICY, big, files("README.md"), [], {})
         self.assertEqual([r.kind for r in result.requirements], ["gate:large-pr"])
-        self.assertTrue(check.evaluate(POLICY, big, files("README.md"), [record("gate:large-pr")], {}).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, big, files("README.md"), [record("gate:large-pr")], {}
+            ).passed
+        )
 
     def test_write_access_decides_inside_or_outside(self):
         private_member = pr(association="CONTRIBUTOR")
         insiders = {"nicholasdominici"}
-        self.assertTrue(check.evaluate(POLICY, private_member, files("README.md"), [], {}, insiders).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, private_member, files("README.md"), [], {}, insiders
+            ).passed
+        )
         stranger = pr(author="someone", association="MEMBER")
-        kinds = [r.kind for r in check.evaluate(POLICY, stranger, files("README.md"), [], {}, insiders).requirements]
+        kinds = [
+            r.kind
+            for r in check.evaluate(
+                POLICY, stranger, files("README.md"), [], {}, insiders
+            ).requirements
+        ]
         self.assertIn("outside-author", kinds)
 
     def test_records_from_private_members_count_with_insiders(self):
@@ -142,35 +219,68 @@ class EvaluateTest(unittest.TestCase):
         comment = record("gate:billing", association="CONTRIBUTOR")
         comment["user"] = {"login": "NicholasDominici"}
         self.assertFalse(check.evaluate(POLICY, pr(), changed, [comment], {}).passed)
-        self.assertTrue(check.evaluate(POLICY, pr(), changed, [comment], {}, {"nicholasdominici"}).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, pr(), changed, [comment], {}, {"nicholasdominici"}
+            ).passed
+        )
 
     def test_outside_author_needs_owner_record(self):
         outsider = pr(author="someone", association="CONTRIBUTOR")
-        kinds = [r.kind for r in check.evaluate(POLICY, outsider, files("README.md"), [], {}).requirements]
+        kinds = [
+            r.kind
+            for r in check.evaluate(
+                POLICY, outsider, files("README.md"), [], {}
+            ).requirements
+        ]
         self.assertEqual(kinds, ["outside-author"])
 
     def test_contract_change_kinds(self):
         self.assertEqual(
-            check.contract_change({"a": {"type": "string"}}, {"a": {"type": "string"}, "b": {}}), "additive"
+            check.contract_change(
+                {"a": {"type": "string"}}, {"a": {"type": "string"}, "b": {}}
+            ),
+            "additive",
         )
-        self.assertEqual(check.contract_change({"a": {"type": "string"}}, {"a": {"type": "number"}}), "changed")
+        self.assertEqual(
+            check.contract_change({"a": {"type": "string"}}, {"a": {"type": "number"}}),
+            "changed",
+        )
         self.assertEqual(check.contract_change({"a": 1, "b": 2}, {"a": 1}), "changed")
-        self.assertEqual(check.contract_change({"sourceFile": "x", "a": 1}, {"sourceFile": "y", "a": 1}), "none")
+        self.assertEqual(
+            check.contract_change(
+                {"sourceFile": "x", "a": 1}, {"sourceFile": "y", "a": 1}
+            ),
+            "none",
+        )
         variants = [{"type": "null"}, {"type": "object", "properties": {"a": {}}}]
         grown = [{"type": "null"}, {"type": "object", "properties": {"a": {}, "b": {}}}]
-        self.assertEqual(check.contract_change({"variants": variants}, {"variants": grown}), "additive")
-        self.assertEqual(check.contract_change({"variants": variants}, {"variants": variants[:1]}), "changed")
+        self.assertEqual(
+            check.contract_change({"variants": variants}, {"variants": grown}),
+            "additive",
+        )
+        self.assertEqual(
+            check.contract_change({"variants": variants}, {"variants": variants[:1]}),
+            "changed",
+        )
 
     def test_api_fields_named_like_metadata_are_compared(self):
         def snapshot(kind):
             return {
                 "description": "doc",
                 "contracts": {
-                    "Dto": {"sourceFile": "a.ts", "shape": {"properties": {"description": {"shape": {"type": kind}}}}}
+                    "Dto": {
+                        "sourceFile": "a.ts",
+                        "shape": {
+                            "properties": {"description": {"shape": {"type": kind}}}
+                        },
+                    }
                 },
             }
 
-        self.assertEqual(check.contract_change(snapshot("string"), snapshot("number")), "changed")
+        self.assertEqual(
+            check.contract_change(snapshot("string"), snapshot("number")), "changed"
+        )
         moved = snapshot("string")
         moved["contracts"]["Dto"]["sourceFile"] = "b.ts"
         moved["description"] = "new doc"
@@ -183,13 +293,33 @@ class EvaluateTest(unittest.TestCase):
             record("gate:billing", where=""),
             record("gate:billing", words='"<what the owner said>"'),
         ):
-            self.assertFalse(check.evaluate(POLICY, pr(), changed, [comment], {}).passed)
+            self.assertFalse(
+                check.evaluate(POLICY, pr(), changed, [comment], {}).passed
+            )
 
     def test_only_a_changed_contract_needs_the_gate(self):
         changed = files("tests/contracts/snap.json")
-        self.assertTrue(check.evaluate(POLICY, pr(), changed, [], {"tests/contracts/snap.json": "additive"}).passed)
-        result = check.evaluate(POLICY, pr(), changed, [], {"tests/contracts/snap.json": "changed"})
-        self.assertEqual([r.kind for r in result.requirements], ["gate:developer-api-contract"])
+        self.assertTrue(
+            check.evaluate(
+                POLICY, pr(), changed, [], {"tests/contracts/snap.json": "additive"}
+            ).passed
+        )
+        result = check.evaluate(
+            POLICY, pr(), changed, [], {"tests/contracts/snap.json": "changed"}
+        )
+        self.assertEqual(
+            [r.kind for r in result.requirements], ["gate:developer-api-contract"]
+        )
+
+    def test_one_screenshot_counts_once(self):
+        url = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab"
+        self.assertEqual(check.media_count(f"Desktop ![d]({url}) Mobile {url}"), 1)
+        self.assertEqual(
+            check.media_count(
+                f'Desktop <img src="{url}"> Mobile ![m](https://x/m.png)'
+            ),
+            2,
+        )
 
     def test_ui_change_needs_media_and_approval_or_small_record(self):
         changed = files("web/page.tsx")
@@ -197,8 +327,16 @@ class EvaluateTest(unittest.TestCase):
         self.assertFalse(no_media.passed)
         body = "Desktop ![d](https://x/d.png) Mobile ![m](https://x/m.png)"
         self.assertFalse(check.evaluate(POLICY, pr(body=body), changed, [], {}).passed)
-        self.assertTrue(check.evaluate(POLICY, pr(body=body), changed, [record("ui-small")], {}).passed)
-        self.assertTrue(check.evaluate(POLICY, pr(body=body), changed, [record("gate:ui")], {}).passed)
+        self.assertTrue(
+            check.evaluate(
+                POLICY, pr(body=body), changed, [record("ui-small")], {}
+            ).passed
+        )
+        self.assertTrue(
+            check.evaluate(
+                POLICY, pr(body=body), changed, [record("gate:ui")], {}
+            ).passed
+        )
 
 
 class FakeGitHub:
@@ -226,10 +364,16 @@ class FakeGitHub:
         return self.prs[int(path.rsplit("/", 1)[1])]
 
     def paginate(self, path):
+        if path.startswith("/pulls?"):
+            return list(self.prs.values())
         number = int(path.split("/")[2])
         if self.fail_on and self.fail_on in path:
             raise check.urllib.error.URLError("GitHub API unavailable")
-        return self.files_by_pr[number] if path.endswith("/files") else self.comments_by_pr[number]
+        return (
+            self.files_by_pr[number]
+            if path.endswith("/files")
+            else self.comments_by_pr[number]
+        )
 
     def has_write_access(self, login):
         return login.lower() in {"nicholasdominici", "jonnybcw", "hunterrice"}
@@ -239,10 +383,17 @@ class FakeGitHub:
 
 
 class MainTest(unittest.TestCase):
-    def run_main(self, fake, number=1, **event_fields):
+    def run_main(
+        self, fake, number=1, event_name="pull_request_target", **event_fields
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             event = Path(tmp) / "event.json"
-            event.write_text(json.dumps({"pull_request": {"number": number}, **event_fields}))
+            payload = (
+                event_fields
+                if event_name == "push"
+                else {"pull_request": {"number": number}, **event_fields}
+            )
+            event.write_text(json.dumps(payload))
             policy = Path(tmp) / "policy.json"
             policy.write_text(json.dumps(POLICY))
             env = {
@@ -250,9 +401,12 @@ class MainTest(unittest.TestCase):
                 "GITHUB_EVENT_PATH": str(event),
                 "GITHUB_TOKEN": "x",
                 "AGENT_POLICY_PATH": str(policy),
-                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_EVENT_NAME": event_name,
             }
-            with mock.patch.dict(os.environ, env), mock.patch.object(check, "GitHub", lambda repo, token: fake):
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch.object(check, "GitHub", lambda repo, token: fake),
+            ):
                 return check.main()
 
     def test_status_is_pending_before_the_result(self):
@@ -261,7 +415,9 @@ class MainTest(unittest.TestCase):
         self.assertEqual([s["state"] for s in fake.statuses], ["pending", "success"])
 
     def test_a_failed_recheck_replaces_an_earlier_success(self):
-        fake = FakeGitHub({1: pr()}, {1: files("src/billing/x.ts")}, {1: []}, fail_on="/comments")
+        fake = FakeGitHub(
+            {1: pr()}, {1: files("src/billing/x.ts")}, {1: []}, fail_on="/comments"
+        )
         with self.assertRaises(check.urllib.error.URLError):
             self.run_main(fake)
         self.assertEqual([s["state"] for s in fake.statuses], ["pending", "error"])
@@ -279,7 +435,9 @@ class MainTest(unittest.TestCase):
         self.assertIn("#2", fake.statuses[-1]["description"])
 
     def test_a_failed_pr_listing_replaces_an_earlier_success(self):
-        fake = FakeGitHub({1: pr()}, {1: files("src/app.py")}, {1: []}, fail_on="/commits/")
+        fake = FakeGitHub(
+            {1: pr()}, {1: files("src/app.py")}, {1: []}, fail_on="/commits/"
+        )
         with self.assertRaises(check.urllib.error.URLError):
             self.run_main(fake)
         self.assertEqual([s["state"] for s in fake.statuses][-1], "error")
@@ -298,10 +456,24 @@ class MainTest(unittest.TestCase):
 
     def test_each_pr_follows_its_target_branch_policy(self):
         fake = FakeGitHub({1: pr()}, {1: files("src/app.py")}, {1: []})
-        fake.policies = {OLD: {**POLICY, "gates": [{"id": "all", "reason": "Everything", "paths": ["src/**"]}]}}
+        fake.policies = {
+            OLD: {
+                **POLICY,
+                "gates": [{"id": "all", "reason": "Everything", "paths": ["src/**"]}],
+            }
+        }
         self.run_main(fake)
         self.assertEqual(fake.statuses[-1]["state"], "failure")
         self.assertIn("gate:all", fake.statuses[-1]["description"])
+
+    def test_a_policy_push_rechecks_every_open_pr(self):
+        fake = FakeGitHub(
+            {1: pr(number=1), 2: pr(number=2)},
+            {1: files("src/app.py"), 2: files("src/app.py")},
+            {1: [], 2: []},
+        )
+        self.run_main(fake, event_name="push", ref="refs/heads/main")
+        self.assertEqual([s["state"] for s in fake.statuses], ["pending", "success"])
 
     def shared_head(self):
         approved = pr(number=1, base="main")

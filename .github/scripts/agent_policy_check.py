@@ -44,10 +44,21 @@ MEMBER_ASSOCIATIONS = {"OWNER", "MEMBER"}
 RECORD_AUTHOR_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 CONTRACT_METADATA_KEYS = {"description", "sourceFile"}
 SHA_PATTERN = re.compile(r"\b[0-9a-f]{40}\b")
-MEDIA_PATTERN = re.compile(
-    r"!\[[^\]]*\]\([^)]+\)|<img\b|<video\b|github\.com/user-attachments/assets/[0-9a-f-]+",
+# One piece of media = one distinct URL, whether it appears as a Markdown image,
+# an <img>/<video> tag or a bare GitHub attachment link.
+MEDIA_URL_PATTERN = re.compile(
+    r"!\[[^\]]*\]\(\s*<?([^)\s>]+)|<(?:img|video)\b[^>]*\bsrc=[\"']([^\"']+)|(https://github\.com/user-attachments/assets/[0-9a-f-]+)",
     re.IGNORECASE,
 )
+
+
+def media_count(body: str) -> int:
+    return len(
+        {
+            next(group for group in match.groups() if group)
+            for match in MEDIA_URL_PATTERN.finditer(body)
+        }
+    )
 
 
 @dataclass
@@ -101,12 +112,18 @@ def matches_any(path: str, patterns: list[str]) -> bool:
 
 def _field(body: str, name: str) -> str:
     # [ \t] and not \s: an empty value must not run into the next line.
-    match = re.search(rf"^[ \t]*[-*]?[ \t]*{name}[ \t]*:[ \t]*(.*?)[ \t]*$", body, re.IGNORECASE | re.MULTILINE)
+    match = re.search(
+        rf"^[ \t]*[-*]?[ \t]*{name}[ \t]*:[ \t]*(.*?)[ \t]*$",
+        body,
+        re.IGNORECASE | re.MULTILINE,
+    )
     return match.group(1) if match else ""
 
 
 def parse_records(
-    comments: list[dict], agent_logins: set[str] | None = None, insiders: set[str] | None = None
+    comments: list[dict],
+    agent_logins: set[str] | None = None,
+    insiders: set[str] | None = None,
 ) -> list[Record]:
     """Read approval and carry records from comments by people with write access or the agent App.
 
@@ -128,17 +145,40 @@ def parse_records(
         if not commit_match:
             continue
         if RECORD_MARKER in body:
-            kinds = {kind.strip().lower() for kind in _field(body, "Kind").split(",") if kind.strip()}
-            approver = _field(body, "Approved by").lstrip("@").split()[0] if _field(body, "Approved by") else ""
+            kinds = {
+                kind.strip().lower()
+                for kind in _field(body, "Kind").split(",")
+                if kind.strip()
+            }
+            approver = (
+                _field(body, "Approved by").lstrip("@").split()[0]
+                if _field(body, "Approved by")
+                else ""
+            )
             # The evidence: what the owner said and where. A template placeholder is not evidence.
             evidence = [_field(body, "Words").strip("\"' "), _field(body, "Where")]
-            if kinds and approver and all(value and not value.startswith("<") for value in evidence):
-                records.append(Record(kinds=kinds, approver=approver.lower(), commit=commit_match.group(0)))
+            if (
+                kinds
+                and approver
+                and all(value and not value.startswith("<") for value in evidence)
+            ):
+                records.append(
+                    Record(
+                        kinds=kinds,
+                        approver=approver.lower(),
+                        commit=commit_match.group(0),
+                    )
+                )
         elif CARRY_MARKER in body:
             from_match = SHA_PATTERN.search(_field(body, "From").lower())
             if from_match and _field(body, "Reason"):
                 records.append(
-                    Record(kinds=set(), approver="", commit=commit_match.group(0), carry_from=from_match.group(0))
+                    Record(
+                        kinds=set(),
+                        approver="",
+                        commit=commit_match.group(0),
+                        carry_from=from_match.group(0),
+                    )
                 )
     return records
 
@@ -150,7 +190,11 @@ def approved_commits(head: str, records: list[Record]) -> set[str]:
     while changed:
         changed = False
         for record in records:
-            if record.carry_from and record.commit in commits and record.carry_from not in commits:
+            if (
+                record.carry_from
+                and record.commit in commits
+                and record.carry_from not in commits
+            ):
                 commits.add(record.carry_from)
                 changed = True
     return commits
@@ -170,7 +214,9 @@ def contract_change(base: object, head: object, field_map: bool = False) -> str:
                 continue
             if key not in head:
                 return "changed"
-            inner = contract_change(base_value, head[key], field_map=key == "properties")
+            inner = contract_change(
+                base_value, head[key], field_map=key == "properties"
+            )
             if inner == "changed":
                 return "changed"
             if inner == "additive":
@@ -210,16 +256,26 @@ def evaluate(
         hits = [path for path in paths if matches_any(path, gate.get("paths", []))]
         if hits:
             evaluation.requirements.append(
-                Requirement(f"gate:{gate['id']}", f"{gate['reason']} ({', '.join(sorted(hits)[:3])})")
+                Requirement(
+                    f"gate:{gate['id']}",
+                    f"{gate['reason']} ({', '.join(sorted(hits)[:3])})",
+                )
             )
         snapshot = gate.get("contractSnapshot")
         if snapshot and contract_changes.get(snapshot) == "changed":
             evaluation.requirements.append(
-                Requirement(f"gate:{gate['id']}", f"{gate['reason']} ({snapshot} changed an existing shape)")
+                Requirement(
+                    f"gate:{gate['id']}",
+                    f"{gate['reason']} ({snapshot} changed an existing shape)",
+                )
             )
 
     if author.lower() not in owners:
-        behavior = [path for path in paths if not matches_any(path, policy.get("noBehaviorPaths", []))]
+        behavior = [
+            path
+            for path in paths
+            if not matches_any(path, policy.get("noBehaviorPaths", []))
+        ]
         if behavior:
             evaluation.requirements.append(
                 Requirement(
@@ -232,7 +288,8 @@ def evaluate(
         # The files API lists at most 3,000 files: never decide on a partial list.
         evaluation.requirements.append(
             Requirement(
-                "gate:large-pr", f"GitHub listed {listed} of {pr['changed_files']} changed files; an owner reviews it"
+                "gate:large-pr",
+                f"GitHub listed {listed} of {pr['changed_files']} changed files; an owner reviews it",
             )
         )
     outside = (
@@ -241,13 +298,19 @@ def evaluate(
         else pr.get("author_association") not in MEMBER_ASSOCIATIONS
     )
     if outside:
-        evaluation.requirements.append(Requirement("outside-author", f"@{author} has no write access to this repo"))
+        evaluation.requirements.append(
+            Requirement("outside-author", f"@{author} has no write access to this repo")
+        )
 
     ui_hits = [path for path in paths if matches_any(path, policy.get("uiPaths", []))]
     body = pr.get("body") or ""
     if ui_hits:
-        media = len(MEDIA_PATTERN.findall(body))
-        has_media = media >= 2 and re.search(r"desktop", body, re.I) and re.search(r"mobile", body, re.I)
+        media = media_count(body)
+        has_media = (
+            media >= 2
+            and re.search(r"desktop", body, re.I)
+            and re.search(r"mobile", body, re.I)
+        )
         evaluation.requirements.append(
             Requirement(
                 "ui-media",
@@ -256,10 +319,15 @@ def evaluate(
             )
         )
         evaluation.requirements.append(
-            Requirement("gate:ui", "UI change; a human approves from the media unless the change is small")
+            Requirement(
+                "gate:ui",
+                "UI change; a human approves from the media unless the change is small",
+            )
         )
 
-    records = parse_records(comments, {login.lower() for login in policy.get("agentLogins", [])}, insiders)
+    records = parse_records(
+        comments, {login.lower() for login in policy.get("agentLogins", [])}, insiders
+    )
     commits = approved_commits(pr["head"]["sha"], records)
     for requirement in evaluation.requirements:
         if requirement.kind == "ui-media":
@@ -280,17 +348,27 @@ def evaluate(
 def describe(evaluation: Evaluation) -> str:
     if not evaluation.requirements:
         return "No human approval needed"
-    missing = [requirement.kind for requirement in evaluation.requirements if not requirement.met]
+    missing = [
+        requirement.kind
+        for requirement in evaluation.requirements
+        if not requirement.met
+    ]
     if not missing:
-        return "All approvals recorded: " + ", ".join(requirement.kind for requirement in evaluation.requirements)
+        return "All approvals recorded: " + ", ".join(
+            requirement.kind for requirement in evaluation.requirements
+        )
     return "Needs: " + ", ".join(missing)
 
 
 def summary_markdown(evaluation: Evaluation, head: str) -> str:
     lines = [f"## agent-policy: {describe(evaluation)}", ""]
     for requirement in evaluation.requirements:
-        lines.append(f"- {'met' if requirement.met else 'MISSING'} `{requirement.kind}`: {requirement.reason}")
-    missing = [r.kind for r in evaluation.requirements if not r.met and r.kind != "ui-media"]
+        lines.append(
+            f"- {'met' if requirement.met else 'MISSING'} `{requirement.kind}`: {requirement.reason}"
+        )
+    missing = [
+        r.kind for r in evaluation.requirements if not r.met and r.kind != "ui-media"
+    ]
     if missing:
         lines += [
             "",
@@ -325,15 +403,23 @@ class GitHub:
         self.repo = repo
         self.token = token
 
-    def request(self, method: str, path: str, payload: object | None = None, raw: bool = False) -> object:
-        url = path if path.startswith("https://") else f"https://api.github.com/repos/{self.repo}{path}"
+    def request(
+        self, method: str, path: str, payload: object | None = None, raw: bool = False
+    ) -> object:
+        url = (
+            path
+            if path.startswith("https://")
+            else f"https://api.github.com/repos/{self.repo}{path}"
+        )
         data = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(
             url,
             data=data,
             method=method,
             headers={
-                "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
+                "Accept": "application/vnd.github.raw"
+                if raw
+                else "application/vnd.github+json",
                 "Authorization": f"Bearer {self.token}",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
@@ -345,7 +431,9 @@ class GitHub:
                 return body.decode() if raw else json.loads(body or b"null")
             except urllib.error.URLError as error:
                 # Retry reads on network errors and 5xx; a 4xx answer is final.
-                retryable = not isinstance(error, urllib.error.HTTPError) or error.code >= 500
+                retryable = (
+                    not isinstance(error, urllib.error.HTTPError) or error.code >= 500
+                )
                 if method != "GET" or not retryable or attempt == 2:
                     raise
                 time.sleep(2 * (attempt + 1))
@@ -365,7 +453,9 @@ class GitHub:
 
     def has_write_access(self, login: str) -> bool:
         try:
-            answer = self.request("GET", f"/collaborators/{urllib.parse.quote(login)}/permission")
+            answer = self.request(
+                "GET", f"/collaborators/{urllib.parse.quote(login)}/permission"
+            )
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 return False
@@ -374,7 +464,9 @@ class GitHub:
 
     def file_at(self, path: str, ref: str) -> object | None:
         try:
-            text = self.request("GET", f"/contents/{urllib.parse.quote(path)}?ref={ref}", raw=True)
+            text = self.request(
+                "GET", f"/contents/{urllib.parse.quote(path)}?ref={ref}", raw=True
+            )
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 return None
@@ -382,7 +474,9 @@ class GitHub:
         return json.loads(str(text))
 
 
-def contract_changes_for(github: GitHub, policy: dict, pr: dict, files: list[dict]) -> dict[str, str]:
+def contract_changes_for(
+    github: GitHub, policy: dict, pr: dict, files: list[dict]
+) -> dict[str, str]:
     changes = {}
     changed = {entry["filename"]: entry for entry in files}
     for gate in policy.get("gates", []):
@@ -393,7 +487,9 @@ def contract_changes_for(github: GitHub, policy: dict, pr: dict, files: list[dic
             else:
                 base = github.file_at(snapshot, pr["base"]["sha"])
                 head = github.file_at(snapshot, pr["head"]["sha"])
-                changes[snapshot] = "additive" if base is None else contract_change(base, head)
+                changes[snapshot] = (
+                    "additive" if base is None else contract_change(base, head)
+                )
     return changes
 
 
@@ -404,11 +500,25 @@ def evaluate_pr(github: GitHub, policy: dict, pr: dict) -> Evaluation:
     files = github.paginate(f"/pulls/{pr['number']}/files")
     comments = github.paginate(f"/issues/{pr['number']}/comments")
     # Write access decides who is inside the company; author_association hides private org members.
-    marked = [c for c in comments if RECORD_MARKER in (c.get("body") or "") or CARRY_MARKER in (c.get("body") or "")]
-    logins = {pr["user"]["login"]} | {(c.get("user") or {}).get("login") for c in marked}
+    marked = [
+        c
+        for c in comments
+        if RECORD_MARKER in (c.get("body") or "")
+        or CARRY_MARKER in (c.get("body") or "")
+    ]
+    logins = {pr["user"]["login"]} | {
+        (c.get("user") or {}).get("login") for c in marked
+    }
     logins.discard(None)
     insiders = {login.lower() for login in logins if github.has_write_access(login)}
-    return evaluate(policy, pr, files, comments, contract_changes_for(github, policy, pr, files), insiders)
+    return evaluate(
+        policy,
+        pr,
+        files,
+        comments,
+        contract_changes_for(github, policy, pr, files),
+        insiders,
+    )
 
 
 def open_prs_at(github: GitHub, head: str, known: dict | None = None) -> list[dict]:
@@ -422,7 +532,9 @@ def open_prs_at(github: GitHub, head: str, known: dict | None = None) -> list[di
     if known and known.get("state") == "open" and known["head"]["sha"] == head:
         numbers.add(known["number"])
     prs = [
-        known if known and number == known["number"] else github.request("GET", f"/pulls/{number}")
+        known
+        if known and number == known["number"]
+        else github.request("GET", f"/pulls/{number}")
         for number in sorted(numbers)
     ]
     # Re-read state: the commit-to-PR index can lag a close or a push.
@@ -435,11 +547,18 @@ def set_status(github: GitHub, head: str, state: str, description: str) -> None:
     github.request(
         "POST",
         f"/statuses/{head}",
-        {"state": state, "context": STATUS_CONTEXT, "description": description[:140], "target_url": run_url},
+        {
+            "state": state,
+            "context": STATUS_CONTEXT,
+            "description": description[:140],
+            "target_url": run_url,
+        },
     )
 
 
-def publish(github: GitHub, policy: dict, head: str, list_prs: Callable[[], list[dict]]) -> dict[int, Evaluation]:
+def publish(
+    github: GitHub, policy: dict, head: str, list_prs: Callable[[], list[dict]]
+) -> dict[int, Evaluation]:
     """Evaluate every open PR at `head` and set one combined status on it."""
     # Pending first, before any read: a recheck that cannot finish must not
     # leave an earlier success in place.
@@ -448,14 +567,20 @@ def publish(github: GitHub, policy: dict, head: str, list_prs: Callable[[], list
         prs = list_prs()
         results = [(item, evaluate_pr(github, policy, item)) for item in prs]
     except Exception:
-        set_status(github, head, "error", "agent-policy could not finish; rerun the agent-policy workflow")
+        set_status(
+            github,
+            head,
+            "error",
+            "agent-policy could not finish; rerun the agent-policy workflow",
+        )
         raise
     if not results:
         set_status(github, head, "success", "No open pull request on this commit")
         return {}
 
     summary = "\n".join(
-        f"### PR #{item['number']} into {item['base']['ref']}\n\n" + summary_markdown(evaluation, head)
+        f"### PR #{item['number']} into {item['base']['ref']}\n\n"
+        + summary_markdown(evaluation, head)
         for item, evaluation in results
     )
     print(summary)
@@ -467,7 +592,9 @@ def publish(github: GitHub, policy: dict, head: str, list_prs: Callable[[], list
     if len(results) == 1:
         description = describe(results[0][1])
     else:
-        description = "; ".join(f"#{item['number']}: {describe(evaluation)}" for item, evaluation in results)
+        description = "; ".join(
+            f"#{item['number']}: {describe(evaluation)}" for item, evaluation in results
+        )
     set_status(github, head, "success" if passed else "failure", description)
     return {item["number"]: evaluation for item, evaluation in results}
 
@@ -476,11 +603,31 @@ def main() -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     event = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
     github = GitHub(repo, os.environ["GITHUB_TOKEN"])
+    policy = json.load(
+        open(os.environ.get("AGENT_POLICY_PATH", POLICY_PATH), encoding="utf-8")
+    )
+    if os.environ.get("GITHUB_EVENT_NAME") == "push":
+        # The policy or the checker changed on the default branch: every open PR
+        # into it gets a fresh status under the new rules.
+        branch = event.get("ref", "").removeprefix("refs/heads/")
+        heads = {}
+        for item in github.paginate(
+            f"/pulls?state=open&base={urllib.parse.quote(branch)}"
+        ):
+            heads.setdefault(item["head"]["sha"], item)
+        for head, item in heads.items():
+            publish(
+                github,
+                policy,
+                head,
+                lambda head=head, item=item: open_prs_at(github, head, known=item),
+            )
+        print(f"Rechecked {len(heads)} open PR heads into {branch}")
+        return 0
     number = (event.get("pull_request") or event.get("issue") or {}).get("number")
     if not number:
         print("No pull request in this event")
         return 0
-    policy = json.load(open(os.environ.get("AGENT_POLICY_PATH", POLICY_PATH), encoding="utf-8"))
     # Mark the event's head pending before the first read, so a failed read
     # cannot leave an earlier success on it.
     event_head = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
@@ -490,7 +637,12 @@ def main() -> int:
         pr = github.request("GET", f"/pulls/{number}")
     except Exception:
         if event_head and event.get("action") != "closed":
-            set_status(github, event_head, "error", "agent-policy could not finish; rerun the agent-policy workflow")
+            set_status(
+                github,
+                event_head,
+                "error",
+                "agent-policy could not finish; rerun the agent-policy workflow",
+            )
         raise
 
     # A head this PR closed on or moved away from may still carry a combined
@@ -509,14 +661,26 @@ def main() -> int:
     head = pr["head"]["sha"]
     results = publish(github, policy, head, lambda: open_prs_at(github, head, known=pr))
     own = results[pr["number"]]
-    needs_owner = any(r.kind == "owner-clearance" and not r.met for r in own.requirements)
-    if needs_owner and os.environ.get("GITHUB_EVENT_NAME", "").startswith("pull_request"):
+    needs_owner = any(
+        r.kind == "owner-clearance" and not r.met for r in own.requirements
+    )
+    if needs_owner and os.environ.get("GITHUB_EVENT_NAME", "").startswith(
+        "pull_request"
+    ):
         author = pr["user"]["login"].lower()
-        reviewers = [owner for owner in policy.get("owners", []) if owner.lower() != author]
+        reviewers = [
+            owner for owner in policy.get("owners", []) if owner.lower() != author
+        ]
         try:
-            github.request("POST", f"/issues/{number}/labels", {"labels": ["needs-owner"]})
+            github.request(
+                "POST", f"/issues/{number}/labels", {"labels": ["needs-owner"]}
+            )
             if reviewers:
-                github.request("POST", f"/pulls/{number}/requested_reviewers", {"reviewers": reviewers})
+                github.request(
+                    "POST",
+                    f"/pulls/{number}/requested_reviewers",
+                    {"reviewers": reviewers},
+                )
         except urllib.error.HTTPError as error:
             print(f"Could not label or request owners: {error}", file=sys.stderr)
     return 0
