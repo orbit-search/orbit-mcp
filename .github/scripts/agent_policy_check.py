@@ -53,6 +53,7 @@ MEDIA_URL_PATTERN = re.compile(
 
 
 def media_count(body: str) -> int:
+    """Count distinct media URLs in a PR body."""
     return len(
         {
             next(group for group in match.groups() if group)
@@ -84,6 +85,7 @@ class Evaluation:
 
     @property
     def passed(self) -> bool:
+        """True when every requirement is met."""
         return all(requirement.met for requirement in self.requirements)
 
 
@@ -107,11 +109,13 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 def matches_any(path: str, patterns: list[str]) -> bool:
+    """True when the path matches one of the glob patterns."""
     return any(glob_to_regex(pattern).match(path) for pattern in patterns)
 
 
 def _field(body: str, name: str) -> str:
     # [ \t] and not \s: an empty value must not run into the next line.
+    """Read the value of a `- Name: value` line in a record comment."""
     match = re.search(
         rf"^[ \t]*[-*]?[ \t]*{name}[ \t]*:[ \t]*(.*?)[ \t]*$",
         body,
@@ -346,6 +350,7 @@ def evaluate(
 
 
 def describe(evaluation: Evaluation) -> str:
+    """One-line status description for an evaluation."""
     if not evaluation.requirements:
         return "No human approval needed"
     missing = [
@@ -361,6 +366,7 @@ def describe(evaluation: Evaluation) -> str:
 
 
 def summary_markdown(evaluation: Evaluation, head: str) -> str:
+    """Job summary listing each requirement and the record templates."""
     lines = [f"## agent-policy: {describe(evaluation)}", ""]
     for requirement in evaluation.requirements:
         lines.append(
@@ -400,12 +406,14 @@ def summary_markdown(evaluation: Evaluation, head: str) -> str:
 
 class GitHub:
     def __init__(self, repo: str, token: str) -> None:
+        """Keep the repository and the token for API calls."""
         self.repo = repo
         self.token = token
 
     def request(
         self, method: str, path: str, payload: object | None = None, raw: bool = False
     ) -> object:
+        """Call the GitHub REST API; reads retry network errors and 5xx twice."""
         url = (
             path
             if path.startswith("https://")
@@ -440,6 +448,7 @@ class GitHub:
         raise AssertionError("unreachable")
 
     def paginate(self, path: str) -> list[dict]:
+        """Read up to 30 pages of a list endpoint."""
         items: list[dict] = []
         for page in range(1, 31):
             sep = "&" if "?" in path else "?"
@@ -452,6 +461,7 @@ class GitHub:
         return items
 
     def has_write_access(self, login: str) -> bool:
+        """True when the login has admin, maintain or write access to the repo."""
         try:
             answer = self.request(
                 "GET", f"/collaborators/{urllib.parse.quote(login)}/permission"
@@ -463,6 +473,7 @@ class GitHub:
         return answer.get("permission") in {"admin", "maintain", "write"}
 
     def file_at(self, path: str, ref: str) -> object | None:
+        """Read and parse a JSON file at a ref; None when it does not exist."""
         try:
             text = self.request(
                 "GET", f"/contents/{urllib.parse.quote(path)}?ref={ref}", raw=True
@@ -477,6 +488,7 @@ class GitHub:
 def contract_changes_for(
     github: GitHub, policy: dict, pr: dict, files: list[dict]
 ) -> dict[str, str]:
+    """Classify each changed contract snapshot as none, additive or changed."""
     changes = {}
     changed = {entry["filename"]: entry for entry in files}
     for gate in policy.get("gates", []):
@@ -496,6 +508,7 @@ def contract_changes_for(
 def evaluate_pr(github: GitHub, policy: dict, pr: dict) -> Evaluation:
     # Each PR follows the policy of its own target branch (merged, so trusted);
     # the default branch's copy applies when that branch has none.
+    """Evaluate one PR against its target branch's policy."""
     policy = github.file_at(POLICY_PATH, pr["base"]["sha"]) or policy
     files = github.paginate(f"/pulls/{pr['number']}/files")
     comments = github.paginate(f"/issues/{pr['number']}/comments")
@@ -523,7 +536,7 @@ def evaluate_pr(github: GitHub, policy: dict, pr: dict) -> Evaluation:
 
 def open_prs_at(github: GitHub, head: str, known: dict | None = None) -> list[dict]:
     """Every open PR whose head is this commit; one commit status covers all of them."""
-    associated = github.request("GET", f"/commits/{head}/pulls")
+    associated = github.request("GET", f"/commits/{head}/pulls?per_page=100")
     numbers = {
         item["number"]
         for item in associated or []
@@ -542,6 +555,7 @@ def open_prs_at(github: GitHub, head: str, known: dict | None = None) -> list[di
 
 
 def set_status(github: GitHub, head: str, state: str, description: str) -> None:
+    """Write the agent-policy commit status on a head commit."""
     repo = github.repo
     run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
     github.request(
@@ -600,6 +614,7 @@ def publish(
 
 
 def main() -> int:
+    """Entry point for the agent-policy workflow."""
     repo = os.environ["GITHUB_REPOSITORY"]
     event = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
     github = GitHub(repo, os.environ["GITHUB_TOKEN"])
@@ -668,9 +683,9 @@ def main() -> int:
         "pull_request"
     ):
         author = pr["user"]["login"].lower()
-        reviewers = [
-            owner for owner in policy.get("owners", []) if owner.lower() != author
-        ]
+        # Ask the owners of the PR's target branch, the same policy that judged it.
+        owners = (github.file_at(POLICY_PATH, pr["base"]["sha"]) or policy).get("owners", [])
+        reviewers = [owner for owner in owners if owner.lower() != author]
         try:
             github.request(
                 "POST", f"/issues/{number}/labels", {"labels": ["needs-owner"]}
