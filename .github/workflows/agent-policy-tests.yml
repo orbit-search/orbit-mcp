@@ -1,0 +1,23 @@
+# Unit tests for the agent-policy checker, run on the PR's own copy with a
+# read-only token.
+name: agent-policy-tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/**"
+      - ".github/agent-policy.json"
+      - ".github/workflows/agent-policy.yml"
+      - ".github/workflows/agent-policy-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: python3 -m json.tool .github/agent-policy.json > /dev/null
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
