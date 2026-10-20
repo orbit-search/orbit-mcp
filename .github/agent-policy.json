@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "about": "Agent review policy read by .github/scripts/agent_policy_check.py from the base branch. Agents merge their own PRs; humans approve only the gates below, in words. See AGENTS.md 'Agent review and release policy'.",
+  "owners": [
+    "NicholasDominici",
+    "Vitor-Bukovitz"
+  ],
+  "ownersRule": "The top 3 committers to the default branch in the last 6 months who are current orbit-search members (bots excluded), plus NicholasDominici for backend and orbit repos. Refresh when people join or leave.",
+  "agentLogins": [
+    "orbit-harness[bot]"
+  ],
+  "gates": [
+    {
+      "id": "billing",
+      "reason": "Changes how we charge (credits, prices, payments, paywall, entitlements)",
+      "paths": [
+        "packages/profile-server/src/billing.ts"
+      ]
+    },
+    {
+      "id": "agent-policy",
+      "reason": "Changes the approval rules themselves",
+      "paths": [
+        ".github/agent-policy.json",
+        ".github/scripts/agent_policy_check.py",
+        ".github/workflows/agent-policy.yml"
+      ]
+    }
+  ],
+  "uiPaths": [],
+  "noBehaviorPaths": [
+    "**/*.md",
+    "docs/**",
+    ".github/**",
+    ".greptile/**",
+    "test/**",
+    "tests/**",
+    "**/__tests__/**",
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/*_test.go",
+    "**/*_test.py",
+    "**/test_*.py"
+  ]
+}

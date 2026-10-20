@@ -1,0 +1,12 @@
+{
+  "files": [
+    {
+      "path": "REVIEW.md",
+      "description": "What a review must catch in this repo, severity labels and output format"
+    },
+    {
+      "path": "AGENTS.md",
+      "description": "Repo rules for every agent, including the agent review and release policy"
+    }
+  ]
+}
