@@ -720,7 +720,6 @@ def rollback_suggestion(
 ) -> dict:
     """target: an earlier release than record["previous"] (a new error traced to an older unjudged release)."""
     previous = target or record.get("previous") or {}
-    command = service.kit_command("release_rollback.py") + rollback_to_flag(target)
     return {
         "created_at": rr.utc_now(),
         "phase": phase,
@@ -734,8 +733,8 @@ def rollback_suggestion(
             **({"rollback_to": target["rollback_to"]} if target and target.get("rollback_to") else {}),
         },
         "how": [
-            f"{command} plan     # dry run: prints every Deployment change",
-            f"{command} run --reason '<why>'     # starts the rollback build",
+            f"{rollback_cli(service, 'plan', target)}     # dry run: prints every Deployment change",
+            f"{rollback_cli(service, 'run', target)} --reason '<why>'     # starts the rollback build",
         ],
         "note": (
             "The watch-window build starts the rollback itself; a human can also start it."
@@ -745,10 +744,17 @@ def rollback_suggestion(
     }
 
 
-def rollback_to_flag(target: dict | None) -> str:
+def rollback_to_flag(target: dict | str | None) -> str:
     """The --to of a rollback command: empty for the default ("previous"), else the suggested target."""
+    if isinstance(target, str):
+        return "" if target in ("", "previous") else f" --to {target}"
     to = (target or {}).get("rollback_to") or (target or {}).get("release_id")
     return f" --to {to}" if to else ""
+
+
+def rollback_cli(service: rc.Service, sub: str, target: dict | str | None = None) -> str:
+    """`release_rollback.py <plan|run> [--service S] [--to T]`: the flags after the subcommand, as its parser takes them."""
+    return service.kit_command("release_rollback.py", sub) + rollback_to_flag(target)
 
 
 def new_error_regression(problem: dict) -> dict:
@@ -955,9 +961,9 @@ def apply_result(
             # A new error traced to an earlier unjudged release rolls back past that release.
             target = rs.rollback_target(record, store, new_errors.get("problems") or [], new_errors.get("scope") or {})
         chain = result.get("chain") or []
-        if target is None and len(chain) > 1 and any(item["kind"] != "new_error" for item in result["regressions"]):
-            # A metric judged over several unjudged releases cannot tell which one regressed:
-            # roll back to what ran before the oldest of them.
+        if len(chain) > 1 and any(item["kind"] != "new_error" for item in result["regressions"]):
+            # A metric or check judged over several unjudged releases cannot tell which one regressed:
+            # roll back to what ran before the oldest of them, also when a new error names a later one.
             oldest = rs._read(store, chain[-1]) or {}
             previous = oldest.get("previous") or {}
             target = {
@@ -1006,9 +1012,14 @@ def apply_result(
     return saved
 
 
-def post_warnings(service: rc.Service, store: rr.Store, record: dict, warnings: list[dict]) -> None:
-    """Post the fresh warnings; mark them posted only when Slack took them. Never raises."""
-    if not warnings or not rr.post_slack(warning_line(service, record, warnings, store)):
+def post_warnings(
+    service: rc.Service, store: rr.Store, record: dict, warnings: list[dict], command: str | None = None
+) -> None:
+    """Post the fresh warnings; mark them posted only when Slack took them. Never raises.
+
+    command: how a human rolls back (default: release_rollback.py run; light services pass their own).
+    """
+    if not warnings or not rr.post_slack(warning_line(service, record, warnings, store, command)):
         return
     names = {warning["name"] for warning in warnings}
 
@@ -1023,14 +1034,17 @@ def post_warnings(service: rc.Service, store: rr.Store, record: dict, warnings: 
         print(f"WARNING: could not mark the warnings posted: {error}", file=sys.stderr, flush=True)
 
 
-def warning_line(service: rc.Service, record: dict, warnings: list[dict], store: rr.Store) -> str:
+def warning_line(
+    service: rc.Service, record: dict, warnings: list[dict], store: rr.Store, command: str | None = None
+) -> str:
     """Slack: findings that do not roll back (no clear suspect, no runtime code). A human decides."""
     where = store.location(rr.record_name(record["release_id"]))
     items = " | ".join(_clip(item["text"], 300) for item in warnings[:3])
+    how = command or f"{rollback_cli(service, 'run')} --reason '<why>'"
     return (
         f":warning: {service.title} release-verify {record['commit'][:9]}: {len(warnings)} finding(s) that do not "
         f"roll back on their own: {items}. Please look; roll back with "
-        f"{service.kit_command('release_rollback.py')} run --reason '<why>' if the release caused it. Record {where}"
+        f"{how} if the release caused it. Record {where}"
     )
 
 
@@ -1514,7 +1528,7 @@ def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: b
     return "\n".join(facts), "\n".join(steps)
 
 
-def suggested_command(service: rc.Service, record: dict) -> str:
+def suggested_command(service: rc.Service, record: dict, sub: str = "run") -> str:
     """The rollback command for this release's suggested target (with --to when it is not the default)."""
     target = (record.get("rollback_suggestion") or {}).get("target") or None
     if (
@@ -1523,7 +1537,7 @@ def suggested_command(service: rc.Service, record: dict) -> str:
         and not target.get("rollback_to")
     ):
         target = None
-    return service.kit_command("release_rollback.py") + rollback_to_flag(target)
+    return rollback_cli(service, sub, target)
 
 
 def rollback_alert(
@@ -1559,7 +1573,7 @@ def rollback_alert(
             f"A rollback to `{target[:9]}` started (<{build_url}|rollback build>); its result follows in this channel."
         )
     else:
-        manual = command or f"{suggested_command(service, record)} run --reason '<why>'"
+        manual = command or f"{suggested_command(service, record)} --reason '<why>'"
         header = f":rotating_light: {service.title} prod release failed release-verify"
         what = f"Tier check_only: no automatic rollback. Roll back by hand to `{target[:9]}`: `{manual}`."
     blocks = [
@@ -1617,9 +1631,9 @@ def prod_state(service: rc.Service, store: rr.Store, record: dict) -> tuple[str 
     """(why this release's window ends, why the checkpoint must wait), each None when it does not.
 
     It ends when a newer record is the latest or a rollback build runs. It waits while another
-    prod build is changing the cluster: its result decides whether this release still runs. A
-    build that has not reached its first cluster change (building, waiting for its turn, held by
-    the gate) changes nothing, so the checks go on.
+    prod build is changing the cluster (it holds the prod lock, or it takes no lock and has passed
+    its first cluster change): its result decides whether this release still runs. A build that
+    is still building, waiting for its turn or waiting at the gate changes nothing, so the checks go on.
     """
     pointer, _ = store.read("latest.json")
     if pointer and pointer.get("release_id") != record["release_id"]:
@@ -1637,6 +1651,9 @@ def prod_state(service: rc.Service, store: rr.Store, record: dict) -> tuple[str 
     ]
     if busy:
         return None, f"build {busy[0].describe()} is changing prod"
+    lock = rr.lock_holder(store, rr.build_alive(service.prod))
+    if lock and lock.get("holder") != own_build:
+        return None, f"the {lock.get('kind')} build {lock.get('holder')} holds the prod lock"
     return None, None
 
 
@@ -1849,7 +1866,7 @@ def builds_changing_prod(service: rc.Service, own_build: str | None) -> tuple[bo
 
 
 # How long the watch follows the rollback build it started.
-ROLLBACK_WAIT_SECONDS = 3000
+ROLLBACK_WAIT_SECONDS = 4200
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED", "EXPIRED"})
 
 
@@ -1860,6 +1877,7 @@ def follow_rollback(
     build_id: str,
     claim_id: str,
     *,
+    target: str = "previous",
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
     get_build: Callable[[str], object] | None = None,
@@ -1896,7 +1914,7 @@ def follow_rollback(
         print(f"WARNING: could not mark the rollback failed: {error}", file=sys.stderr, flush=True)
     rr.post_slack(
         f":x: {service.title} automatic rollback build {build_id} ended {status}; prod may still run the failed "
-        f"release {release_id}. Roll back by hand: {service.kit_command('release_rollback.py')} run --reason '<why>' "
+        f"release {release_id}. Roll back by hand: {rollback_cli(service, 'run', target)} --reason '<why>' "
         f"({rr.build_url(service.prod, build_id)})"
     )
     return status
@@ -1925,7 +1943,6 @@ def start_rollback(
     release_id = record["release_id"]
     short = record["commit"][:9]
     title = service.title
-    command = service.kit_command("release_rollback.py")
     run = runner or rr.run_command
     changing = builds or builds_changing_prod
     if os.environ.get("RELEASE_AUTO_ROLLBACK", "").strip() != "1":
@@ -1945,10 +1962,15 @@ def start_rollback(
                 print(f"No automatic rollback: {(pointer or {}).get('release_id')} replaced {release_id}", flush=True)
                 return None
             own_running, others = changing(service, own_build)
+            lock = rr.lock_holder(store, rr.build_alive(service.prod))
+            if lock and lock.get("holder") != own_build:
+                # A deploy build past its gate: what it deploys replaces this release.
+                others = [*others, f"{lock.get('kind')} build {lock.get('holder')} (holds the prod lock)"]
             if others:
                 rr.post_slack(
                     f":warning: {title} release-verify {short} failed, but {others[0]} changes prod now, so no "
-                    f"automatic rollback started. Check prod; roll back by hand with {command} run if needed."
+                    f"automatic rollback started. Check prod; roll back by hand with "
+                    f"{suggested_command(service, current)} --reason '<why>' if needed."
                 )
                 return None
             if not own_running:
@@ -2016,14 +2038,14 @@ def start_rollback(
         print(f"WARNING: the automatic rollback did not start: {error}", file=sys.stderr, flush=True)
         rr.post_slack(
             f":x: {title} release-verify {short} failed and the automatic rollback did not start: {str(error)[:200]}. "
-            f"Roll back by hand: {suggested_command(service, record)} run --reason '<why>'"
+            f"Roll back by hand: {suggested_command(service, record)} --reason '<why>'"
         )
         return None
     url = rr.build_url(service.prod, build_id)
     print(f"Automatic rollback build {build_id} started: {url}", flush=True)
     rr.post_slack(*rollback_alert(service, current, url, store.location(rr.record_name(release_id))))
     if follow:
-        follow_rollback(service, store, release_id, build_id, claim_id)
+        follow_rollback(service, store, release_id, build_id, claim_id, target=target)
     return build_id
 
 

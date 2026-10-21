@@ -7,6 +7,7 @@ every repository that vendors the kit.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -489,6 +490,141 @@ class RollbackTest(unittest.TestCase):
                 self.assertEqual(rb.cmd_apply(args, SERVICE, store, clients), 0)
 
 
+class LockTest(unittest.TestCase):
+    """One build at a time changes prod: deploys from the gate to `finish`, rollbacks during apply."""
+
+    def test_acquire_wait_take_over_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            running = {"deploy1"}
+            alive = lambda build_id: build_id in running  # noqa: E731
+            rr.acquire_lock(store, "deploy1", "deploy", alive, wait_seconds=60)
+            self.assertEqual(rr.lock_holder(store, alive)["holder"], "deploy1")
+            # A second build waits while the holder runs and gives up at its deadline.
+            ticks = iter(range(0, 1000, 30))
+            with self.assertRaises(rr.RecordError) as raised:
+                rr.acquire_lock(
+                    store, "rb1", "rollback", alive, wait_seconds=60, sleep=lambda _: None, clock=lambda: next(ticks)
+                )
+            self.assertIn("deploy build deploy1 still holds", str(raised.exception))
+            # The holder ended without freeing the lock: the next build takes it over.
+            running.clear()
+            self.assertIsNone(rr.lock_holder(store, alive))
+            running.add("rb1")
+            rr.acquire_lock(store, "rb1", "rollback", alive, wait_seconds=60)
+            lock, _ = store.read(rr.LOCK_OBJECT)
+            self.assertEqual((lock["holder"], lock["took_over_from"]), ("rb1", "deploy1"))
+            rr.release_lock(store, "deploy1")  # not the holder: nothing changes
+            self.assertEqual(rr.lock_holder(store, alive)["holder"], "rb1")
+            rr.release_lock(store, "rb1")
+            self.assertIsNone(rr.lock_holder(store, alive))
+
+    def test_only_one_of_two_racing_builds_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            real_write = store.write
+
+            def racing_write(name, data, generation):
+                # Another build writes first, at the same generation this one read.
+                if data.get("holder") == "b":
+                    real_write(name, {"holder": "a", "kind": "deploy", "at": "x"}, generation)
+                return real_write(name, data, generation)
+
+            ticks = iter(range(0, 1000, 30))
+            with mock.patch.object(store, "write", racing_write), self.assertRaises(rr.RecordError):
+                rr.acquire_lock(
+                    store,
+                    "b",
+                    "deploy",
+                    lambda _: True,
+                    wait_seconds=60,
+                    sleep=lambda _: None,
+                    clock=lambda: next(ticks),
+                )
+            self.assertEqual(store.read(rr.LOCK_OBJECT)[0]["holder"], "a")
+
+    def test_gate_keeps_the_lock_only_on_go(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = _stores(tmp)
+            api = mock.Mock()
+            api.ongoing_rollbacks.return_value = []
+            waits = {"api": api, "alive": lambda _: True, "sleep": lambda _: None}
+            with rg.gate_lock(stores, "deploy1", **waits) as lock:
+                self.assertEqual(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"], "deploy1")
+            self.assertFalse(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"])
+            with rg.gate_lock(stores, "deploy2", **waits) as lock:
+                lock.keep()
+            self.assertEqual(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"], "deploy2")
+
+    def test_deploy_gives_the_lock_to_a_new_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stores = _stores(tmp)
+            api = mock.Mock()
+            rollback = mock.Mock(describe=lambda: "rb1")
+            # The rollback starts after the wait and before the lock: the deploy lets it go first.
+            api.ongoing_rollbacks.side_effect = [[], [rollback], [rollback], [], []]
+            holders: list = []
+            real_release = rr.release_lock
+
+            def release(store, holder):
+                holders.append(store.read(rr.LOCK_OBJECT)[0]["holder"])
+                real_release(store, holder)
+
+            with mock.patch.object(rr, "release_lock", release):
+                rg.take_prod_lock(stores, "deploy1", api=api, alive=lambda _: True, sleep=lambda _: None)
+            self.assertEqual(holders, ["deploy1"])
+            self.assertEqual(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"], "deploy1")
+
+    def test_rollback_apply_holds_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _save(store, _record())
+            clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+            args = mock.Mock(dry_run=False, reason="bad", target="previous", build_id="rb1", expect_latest="")
+            args.requested_by = "test"
+            seen: list = []
+
+            def apply(*_args):
+                seen.append(store.read(rr.LOCK_OBJECT)[0]["holder"])
+                return 0
+
+            with mock.patch.object(rb, "_apply", apply):
+                self.assertEqual(rb.cmd_apply(args, SERVICE, store, clients, alive=lambda _: True), 0)
+            self.assertEqual(seen, ["rb1"])
+            self.assertFalse(store.read(rr.LOCK_OBJECT)[0]["holder"])
+            args.build_id = ""
+            with self.assertRaises(rr.RecordError):
+                rb.cmd_apply(args, SERVICE, store, clients, alive=lambda _: True)
+
+    def test_finish_frees_the_deploy_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(status="deploying", build={"id": "deploy1"})
+            _save(store, record, latest=False)
+            rr.acquire_lock(store, "deploy1", "deploy", lambda _: True, wait_seconds=60)
+            args = mock.Mock(release_id_file=None, release_id=record["release_id"], status="deployed")
+            clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+            rr.cmd_finish(args, PROD, store, clients)
+            self.assertFalse(store.read(rr.LOCK_OBJECT)[0]["holder"])
+
+    def test_watch_waits_for_a_lock_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(build={"id": "own"})
+            _save(store, record)
+            rr.acquire_lock(store, "deploy2", "deploy", lambda _: True, wait_seconds=60)
+            api = mock.Mock()
+            api.ongoing_rollbacks.return_value = []
+            api.list_builds.return_value = []
+            with (
+                mock.patch.object(rv, "GoogleApi", return_value=api),
+                mock.patch.object(rr, "build_alive", return_value=lambda _: True),
+            ):
+                ended, busy = rv.prod_state(SERVICE, store, record)
+            self.assertIsNone(ended)
+            self.assertIn("deploy2 holds the prod lock", busy)
+
+
 # --------------------------------------------------------------------------- release-verify
 
 
@@ -632,6 +768,28 @@ class VerdictTest(unittest.TestCase):
             self.assertEqual(saved["verdict"]["status"], "failed")
             self.assertEqual(saved["rollback_suggestion"]["target"]["commit"], PREVIOUS)
             self.assertIn("log:x", saved["warnings"])
+
+    def test_metric_over_a_chain_rolls_back_past_the_oldest(self) -> None:
+        """A new error names the newer release, but a check failed over both: the target is before the oldest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            older = _record(release_id="20261021T080000Z-ddddddddd", commit="d" * 40, previous={"commit": "e" * 40})
+            newer = _record(previous={"release_id": older["release_id"], "commit": "d" * 40})
+            _save(store, older, latest=False)
+            _save(store, newer)
+            regressions = [
+                {"kind": "new_error", "name": "log:x", "text": "new line"},
+                {"kind": "check", "name": "health", "text": "health: HTTP 503"},
+            ]
+            result = self._result(
+                result="failed", regressions=regressions, chain=[newer["release_id"], older["release_id"]]
+            )
+            named = {"release_id": older["release_id"], "commit": "d" * 40, "rollback_to": None}
+            with mock.patch.object(rs, "rollback_target", return_value=named):
+                saved = rv.apply_result(SERVICE, store, newer, result, final=True, token=None)
+            target = saved["rollback_suggestion"]["target"]
+            self.assertEqual(target["rollback_to"], f"previous-of:{older['release_id']}")
+            self.assertEqual(target["commit"], "e" * 40)
 
 
 class AlertTest(unittest.TestCase):
@@ -955,6 +1113,55 @@ class ReviewFixTest(unittest.TestCase):
         ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/a.ts", source)}
         self.assertEqual(ranges, {"a": (1, 4), "b": (5, 5), "method": (7, 9)})
 
+    def test_braces_in_signatures(self) -> None:
+        """Braces in parameters and return types are not the body (orbit-search-web, embeddings-api, mobile)."""
+        source = (
+            "export async function fetchProfile(id: string, options = {}) {\n"  # 1
+            "  log.error('x');\n"
+            "  return call(id);\n"
+            "}\n"  # 4
+            "async function handle(msg: Msg): Promise<{ shouldAck: boolean }> {\n"  # 5
+            "  if (!msg) {\n"
+            "    return { shouldAck: true };\n"
+            "  }\n"
+            "  return { shouldAck: false };\n"
+            "}\n"  # 10
+            "export async function fetchJson<T>(\n"  # 11
+            "  url: string,\n"
+            "  init: { headers?: Record<string, string> } = {},\n"
+            "): Promise<{ ok: boolean; body: T }> {\n"
+            "  return request(url, init);\n"
+            "}\n"  # 16
+            "function oneLine() { return 1; }\n"  # 17
+            "const build = (rows: Row[]) =>\n"  # 18
+            "  rows.map((row) => {\n"
+            "    return row.id;\n"
+            "  });\n"  # 21
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/a.ts", source)}
+        self.assertEqual(ranges["fetchProfile"], (1, 4))
+        self.assertEqual(ranges["handle"], (5, 10))
+        self.assertEqual(ranges["fetchJson"], (11, 16))
+        self.assertEqual(ranges["oneLine"], (17, 17))
+        self.assertEqual(ranges["build"], (18, 21))
+        go = (
+            "func objectList(names []string, allowed map[string]struct{}, limit int) ([]Object, error) {\n"  # 1
+            "\tfor _, n := range names {\n"
+            "\t\tuse(n)\n"
+            "\t}\n"
+            "\treturn nil, nil\n"
+            "}\n"  # 6
+            "func small() int { return 1 }\n"  # 7
+            "func (s *Server) object(\n"  # 8
+            "\tctx context.Context,\n"
+            "\tid string,\n"
+            ") (map[string]struct{}, error) {\n"
+            "\treturn load(ctx, id)\n"
+            "}\n"  # 13
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("internal/x.go", go)}
+        self.assertEqual(ranges, {"objectList": (1, 6), "small": (7, 7), "object": (8, 13)})
+
     def test_python_ranges(self) -> None:
         source = "def a():\n    x = 1\n\n    return x\n\nLIMIT = 3\n"
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/a.py", source)], [(1, 4)])
@@ -1049,10 +1256,12 @@ class ReviewFixTest(unittest.TestCase):
                     record["release_id"],
                     "rb1",
                     "c1",
+                    target="previous-of:r1",
                     sleep=lambda _: None,
                     get_build=lambda _: mock.Mock(status="FAILURE"),
                 )
             self.assertEqual(status, "FAILURE")
+            self.assertIn("--to previous-of:r1", slack.call_args[0][0])
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["auto_rollback"]["status"], "failed")
             self.assertFalse(rv.claim_blocks(saved, "other", datetime(2026, 10, 21, 11, tzinfo=rr.UTC)))
@@ -1081,6 +1290,38 @@ class ReviewFixTest(unittest.TestCase):
         self.assertNotIn("--to", rv.suggested_command(SERVICE, plain))
         suggestion = rv.rollback_suggestion(SERVICE, record, [], "window_15m", None, {"rollback_to": "previous-of:x"})
         self.assertIn("--to previous-of:x", suggestion["how"][0])
+
+    def test_printed_commands_parse(self) -> None:
+        """With several services, the copied commands put --service and --to where each parser takes them."""
+        record = _record(
+            rollback_suggestion={"target": {"commit": PREVIOUS, "release_id": None, "rollback_to": "previous-of:x"}}
+        )
+        seen: list = []
+        parse = argparse.ArgumentParser.parse_args
+
+        def capture(self, argv=None, namespace=None):
+            seen.append(parse(self, argv, namespace))
+            raise KeyError("stop")
+
+        with mock.patch.object(rc, "single_service", return_value=False):
+            commands = [
+                rv.suggested_command(SERVICE, record) + " --reason why",
+                rv.suggested_command(SERVICE, record, "plan"),
+                rv.rollback_suggestion(SERVICE, record, [], "window_15m", None, {"rollback_to": "previous-of:x"})[
+                    "how"
+                ][1].split("#")[0],
+                SERVICE.kit_command("release_gate.py", "resume") + " --reason why",
+            ]
+        for command in commands:
+            words = command.replace("'<why>'", "why").split()
+            self.assertEqual(words[:2], ["python3", words[1]])
+            script = words[1].rsplit("/", 1)[-1]
+            module = {"release_rollback.py": rb, "release_gate.py": rg}[script]
+            with mock.patch.object(argparse.ArgumentParser, "parse_args", capture), self.assertRaises(KeyError):
+                module.main(words[2:])
+            self.assertEqual(seen[-1].service, "demo", command)
+            if script == "release_rollback.py":
+                self.assertEqual(seen[-1].to, "previous-of:x", command)
 
     def test_default_retry_after_a_rollback_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1207,6 +1448,85 @@ class LightTest(unittest.TestCase):
         text = kit.rendered(service)["release/services/demo-composer.release-verify.yaml"]
         self.assertIn('--service "${_SERVICE}" watch \\', text)
         self.assertIn('tags: ["demo-composer-release-verify"]', text)
+
+    def test_airflow_lists_read_every_page(self) -> None:
+        service = rl.parse_light(light_data("composer"))
+        airflow = rl.Airflow.__new__(rl.Airflow)
+        runs = [{"dag_id": f"d{index % 3}"} for index in range(250)]
+
+        def get(path):
+            offset = int(path.rsplit("offset=", 1)[1])
+            return {"dag_runs": runs[offset : offset + rl.AIRFLOW_PAGE_SIZE], "total_entries": len(runs)}
+
+        airflow.get = get
+        now = datetime(2026, 10, 21, 12, tzinfo=rr.UTC)
+        self.assertEqual(sum(airflow.failed_runs(now - timedelta(hours=1), now).values()), 250)
+        # An answer that stops short of total_entries is not complete: the check is inconclusive.
+        airflow.get = lambda path: {"dag_runs": runs[:10] if "offset=0" in path else [], "total_entries": 250}
+        with self.assertRaises(rr.RecordError):
+            airflow.failed_runs(now - timedelta(hours=1), now)
+        self.assertEqual(service.kind, "composer")
+
+    def test_failed_import_check_stays_red_when_the_record_write_fails(self) -> None:
+        service = rl.parse_light(light_data("composer"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _save(store, _record())
+            marker = Path(tmp) / "failed"
+            args = mock.Mock(
+                release_id=_record()["release_id"], wait=False, failed_marker=str(marker), force_fail=False
+            )
+            failed = rv.Check("import_errors", "failed", ["1 file", "dags/new.py: NameError"])
+            with (
+                mock.patch.object(rl, "deploy_checks", return_value=([failed], {})),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rr, "update_record", side_effect=rr.RecordError("GCS down")),
+                self.assertRaises(rr.RecordError),
+            ):
+                rl.cmd_check(args, service, store, mock.Mock())
+            self.assertTrue(marker.exists())
+
+    def test_alert_once_and_older_target(self) -> None:
+        service = rl.parse_light(light_data("composer"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            older = _record(release_id="20261021T080000Z-ddddddddd", commit="d" * 40, previous={"commit": "e" * 40})
+            newer = _record(previous={"release_id": older["release_id"], "commit": "d" * 40})
+            _save(store, older, latest=False)
+            _save(store, newer)
+            new_errors = {
+                "problems": [{"clear": True, "suspects": [{"release_id": older["release_id"]}]}],
+                "scope": {"releases": [newer["release_id"], older["release_id"]]},
+            }
+            regression = {"kind": "new_error", "name": "dag:x", "text": "DAG x fails"}
+            with mock.patch.object(rv, "suspected_prs", return_value=[]), mock.patch.object(rl, "rr_token"):
+                saved = rl._fail(service, store, newer, "window_15m", [regression], new_errors)
+            suggestion = saved["rollback_suggestion"]
+            self.assertEqual(suggestion["target"]["rollback_to"], f"previous-of:{older['release_id']}")
+            self.assertTrue(suggestion["how"][0].endswith(f"--sha={'e' * 40}"))
+            with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+                rl.alert(service, store, saved)
+                rl.alert(service, store, rr.read_record(store, newer["release_id"]))
+            self.assertEqual(slack.call_count, 1)
+            self.assertIn(f"--sha={'e' * 40}", json.dumps(slack.call_args[0][1]))
+
+    def test_watch_waits_for_a_running_sync(self) -> None:
+        service = rl.parse_light(light_data("composer"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(build={"id": "own"})
+            _save(store, record)
+            answers = iter([["sync2"], []])
+            with mock.patch.object(rl, "running_deploys", side_effect=lambda *_: next(answers)):
+                self.assertIsNone(rl.wait_for_deploys(service, store, record, sleep=lambda _: None))
+            with mock.patch.object(rl, "running_deploys", return_value=["sync3"]):
+                self.assertEqual(rl.replaced_by(service, store, record), "deploy build sync3")
+
+    def test_light_warning_names_its_own_rollback(self) -> None:
+        service = rl.parse_light(light_data("composer"))
+        line = rv.warning_line(service, _record(), [{"text": "x"}], rr.LocalStore(Path("/tmp")), "gcloud builds x")
+        self.assertIn("roll back with gcloud builds x if", line)
+        self.assertNotIn("release_rollback.py", line)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,12 @@ The repo owns only `release/services/<service>.json` and the build files that
   window ended together with the newer one.
 - The automatic rollback claims the record with a generation-conditional write and
   passes `_EXPECT_LATEST`, so it refuses when prod moved on.
+- One build at a time changes prod. The prod lock (`<store>/<service>/prod/lock.json`,
+  a generation-conditional write) belongs to a build id: a deploy build takes it in
+  its gate step (`check-prod` or `check-direct` with `--build-id "$BUILD_ID"`), decides
+  the gate while it holds it, and frees it in `release_record.py finish`; a rollback
+  build holds it for its apply. A build that ended frees it too. A deploy lets a
+  rollback that runs go first, so the rollback's hold decides whether it deploys.
 - After a rollback, deploys hold until a revert of the held PRs, a commit with the
   trailer `Fixes-release: <release id>`, or `release_gate.py resume`.
 - Test runs say `TEST RUN, nothing is wrong` first and never roll back.

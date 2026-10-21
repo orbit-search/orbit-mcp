@@ -84,7 +84,8 @@ steps:
           - "ROLLBACK_DRY_RUN=${{_DRY_RUN}}"
           - "ROLLBACK_EXPECT_LATEST=${{_EXPECT_LATEST}}"
       secretEnv: ["WEBHOOK_ORBIT"]
-      timeout: "2700s"
+      # Up to 30 min for the prod lock (release_rollback.py LOCK_WAIT_SECONDS), then the apply.
+      timeout: "3600s"
 
 substitutions:
     _TARGET: previous
@@ -97,7 +98,7 @@ substitutions:
 # promote_release_guard.py and release_verify.py find running rollbacks by this tag.
 tags: ["{service}-rollback"]
 serviceAccount: "projects/{project}/serviceAccounts/cloud-build@{project}.iam.gserviceaccount.com"
-timeout: "3000s"
+timeout: "3900s"
 options:
     logging: CLOUD_LOGGING_ONLY
 

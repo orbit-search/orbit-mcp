@@ -911,7 +911,8 @@ def _patterns_for(path: str) -> list[re.Pattern[str]]:
 
 STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`')
 LINE_COMMENT_RE = re.compile(r"//.*$")
-BRACE_LOOKAHEAD = 5
+# How many lines a function signature may span before its body opens.
+SIGNATURE_LINES = 15
 
 
 def _code_only(line: str) -> str:
@@ -922,25 +923,39 @@ def _code_only(line: str) -> str:
 def _brace_end(lines: list[str], start: int) -> int:
     """The last line (1-based) of a brace-delimited body whose definition is on line `start`.
 
-    The body opens at the first "{" on the definition line or the next few lines and
-    closes where the braces balance. A definition whose statement ends (";") before
-    any brace, such as a one-line arrow function, ends on that line.
+    Braces inside the signature (a default `options = {}`, a `Promise<{ ok: boolean }>`
+    return type, a Go `map[string]struct{}` parameter) are not the body. The signature
+    ends on the first line, at most SIGNATURE_LINES on, where every "(" and "[" has
+    closed; the body opens at the last "{" of that line when the line ends with it,
+    and closes where the braces balance. A signature line that holds a whole body
+    (`func f() int { return 1 }`) or ends a statement (`const f = (x) => x;`) ends there.
     """
-    depth, opened = 0, False
-    for index in range(start - 1, len(lines)):
-        code = _code_only(lines[index])
-        for char in code:
+    nesting = 0
+    for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
+        code = _code_only(lines[index]).rstrip()
+        nesting += sum(code.count(char) for char in "([") - sum(code.count(char) for char in ")]")
+        if nesting > 0:
+            continue
+        if code.endswith("{"):
+            return _close_of(lines, index, code.rindex("{"))
+        if code.endswith(";") or (code.endswith("}") and code.count("{") and code.count("{") == code.count("}")):
+            return index + 1
+    return start
+
+
+def _close_of(lines: list[str], index: int, column: int) -> int:
+    """The line (1-based) of the "}" that closes the "{" at lines[index][column] (code only)."""
+    depth = 0
+    for number in range(index, len(lines)):
+        code = _code_only(lines[number]).rstrip()
+        for char in code[column:] if number == index else code:
             if char == "{":
-                depth, opened = depth + 1, True
-            elif char == "}" and opened:
+                depth += 1
+            elif char == "}":
                 depth -= 1
                 if depth == 0:
-                    return index + 1
-        if not opened and (code.rstrip().endswith(";") or index - (start - 1) >= BRACE_LOOKAHEAD):
-            return (
-                index + 1 if code.rstrip().endswith(";") else start
-            )  # a statement with no body: `const f = (x) => x;`
-    return len(lines) if opened else start
+                    return number + 1
+    return len(lines)
 
 
 def _indent_end(lines: list[str], start: int) -> int:
@@ -1395,10 +1410,11 @@ def rollback_target(record: dict, store: rr.Store, problems: list[dict], scope: 
         return None
     holder = _read(store, oldest)
     previous = (holder or {}).get("previous") or {}
-    if not previous.get("workloads") and not previous.get("release_id"):
+    if not previous.get("workloads") and not previous.get("release_id") and not previous.get("commit"):
         return None
     # "previous-of:<id>" is what ran before that release, from its own "before" snapshot: it works also
-    # when that release is the first one the kit recorded (no recorded predecessor).
+    # when that release is the first one the kit recorded (no recorded predecessor). A light service
+    # (Composer, Cloud Run) keeps only the commit, which is all its rollback command needs.
     return {
         "release_id": previous.get("release_id"),
         "commit": previous.get("commit"),

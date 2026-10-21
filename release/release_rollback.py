@@ -41,6 +41,7 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -212,10 +213,13 @@ def print_plan(service: rc.Service, plan: Plan) -> None:
 
 
 def assert_alone(service: rc.Service, own_build_id: str | None) -> None:
-    """Refuse while a prod deploy build or another rollback (not a dry run) runs."""
+    """Refuse while a prod deploy build or another rollback (not a dry run) runs.
+
+    The rollback holds the prod lock here. A deploy build past its gate holds that lock until its
+    `finish` step, so this check only catches builds that take no lock (retired triggers). A deploy
+    build before its first cluster change waits at the gate for this rollback, so it does not block.
+    """
     api = GoogleApi(service.project, service.region)
-    # A deploy build that has not reached its first cluster change waits for this rollback
-    # (its single-flight and gate steps wait for running rollbacks), so only one past that point blocks.
     running = [build for build in api.list_builds(service.prod.running_deploys_filter()) if build.changing_cluster]
     if running:
         raise rr.RecordError(f"a prod deploy build is changing prod ({running[0].describe()}); wait for it, then retry")
@@ -276,17 +280,43 @@ def cmd_plan(args: argparse.Namespace, service: rc.Service, store: rr.Store, cli
         return 1
     print(
         "\nDry run: nothing changed. Start the rollback with: "
-        f"{service.kit_command('release_rollback.py')} run --reason '<why>'"
+        f"{service.kit_command('release_rollback.py', 'run')} --reason '<why>'"
     )
     return 0
 
 
-def cmd_apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
-    """Run inside the rollback build: guard, record, apply, verify, record."""
+# How long a rollback build waits for the prod lock (a deploy build holds it from its gate to its
+# `finish` step). The rollback step's timeout leaves room for the apply after that wait.
+LOCK_WAIT_SECONDS = 1800
+
+
+def cmd_apply(
+    args: argparse.Namespace,
+    service: rc.Service,
+    store: rr.Store,
+    clients: rr.Clients,
+    *,
+    alive: Callable[[str], bool] | None = None,
+) -> int:
+    """Run inside the rollback build: take the prod lock, then guard, record, apply, verify, record."""
+    if args.dry_run:
+        # A dry run changes nothing, so it takes no lock.
+        return _apply(args, service, store, clients)
+    if not args.reason.strip():
+        raise rr.RecordError("--reason is required: say why prod rolls back")
+    if not args.build_id:
+        raise rr.RecordError("--build-id is required: the rollback build holds the prod lock while it applies")
+    alive = alive or rr.build_alive(service.prod)
+    rr.acquire_lock(store, args.build_id, "rollback", alive, wait_seconds=LOCK_WAIT_SECONDS)
+    try:
+        return _apply(args, service, store, clients)
+    finally:
+        rr.release_lock(store, args.build_id)
+
+
+def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
     env = service.prod
     title = service.title
-    if not args.dry_run and not args.reason.strip():
-        raise rr.RecordError("--reason is required: say why prod rolls back")
     assert_alone(service, args.build_id)
     latest, target, before, plan = _plan_for(service, store, clients, args.target)
     if args.expect_latest and latest["release_id"] != args.expect_latest:

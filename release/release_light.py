@@ -97,9 +97,8 @@ class LightService:
     def window_config(self) -> str:
         return f"release/services/{self.name}.release-verify.yaml"
 
-    def kit_command(self, script: str) -> str:
-        flag = "" if rc.single_service() else f" --service {self.name}"
-        return f"python3 release/{script}{flag}"
+    def kit_command(self, script: str, sub: str = "") -> str:
+        return rc.kit_command(self.name, script, sub)
 
     @property
     def env(self) -> rc.Environment:
@@ -238,6 +237,11 @@ def snapshot_cloud_run(service: LightService, runner: Runner) -> dict[str, dict]
     return out
 
 
+# Airflow list pages: a day of failures of the five-minute DAGs fits in a few pages.
+AIRFLOW_PAGE_SIZE = 100
+AIRFLOW_MAX_PAGES = 50
+
+
 class Airflow:
     """Read-only Airflow REST API of a Composer environment (the build identity's token)."""
 
@@ -263,24 +267,41 @@ class Airflow:
         request = urllib.request.Request(f"{self.uri}{path}", headers={"Authorization": f"Bearer {self.token()}"})
         return _http_json(request)
 
+    def all_items(self, path: str, key: str) -> list[dict]:
+        """Every item of a paged Airflow list; an answer that does not reach total_entries raises.
+
+        A partial list would make an old failure look new, so it never passes as complete.
+        """
+        items: list[dict] = []
+        separator = "&" if "?" in path else "?"
+        for _ in range(AIRFLOW_MAX_PAGES):
+            payload = self.get(f"{path}{separator}limit={AIRFLOW_PAGE_SIZE}&offset={len(items)}")
+            page = payload.get(key) or []
+            items.extend(page)
+            total = int(payload.get("total_entries") or 0)
+            if len(items) >= total or not page:
+                if len(items) < total:
+                    raise rr.RecordError(f"Airflow {path} returned {len(items)} of {total} entries")
+                return items
+        raise rr.RecordError(f"Airflow {path} has more than {AIRFLOW_MAX_PAGES * AIRFLOW_PAGE_SIZE} entries")
+
     def import_errors(self) -> dict[str, str]:
         """{filename: first line of the error} of every DAG file that does not import now."""
-        payload = self.get("/api/v2/importErrors?limit=200")
         return {
             str(item.get("filename")): str(item.get("stack_trace") or "").strip().splitlines()[-1:][0]
             if item.get("stack_trace")
             else ""
-            for item in payload.get("import_errors") or []
+            for item in self.all_items("/api/v2/importErrors", "import_errors")
         }
 
     def failed_runs(self, start: datetime, end: datetime) -> dict[str, int]:
         """{dag_id: failed runs} that ended in [start, end)."""
         query = (
-            f"/api/v2/dags/~/dagRuns?state=failed&limit=200"
+            f"/api/v2/dags/~/dagRuns?state=failed"
             f"&end_date_gte={start.strftime('%Y-%m-%dT%H:%M:%SZ')}&end_date_lte={end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
         )
         out: dict[str, int] = {}
-        for run in self.get(query).get("dag_runs") or []:
+        for run in self.all_items(query, "dag_runs"):
             out[str(run.get("dag_id"))] = out.get(str(run.get("dag_id")), 0) + 1
         return out
 
@@ -462,16 +483,36 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
     return 0
 
 
-def _fail(service: LightService, store: rr.Store, record: dict, phase: str, regressions: list[dict]) -> dict:
-    """Set the failed verdict and the suggestion (the rollback command for a human)."""
+def _fail(
+    service: LightService,
+    store: rr.Store,
+    record: dict,
+    phase: str,
+    regressions: list[dict],
+    new_errors: dict | None = None,
+) -> dict:
+    """Set the failed verdict and the suggestion (the rollback command for a human).
+
+    A window that judges several releases together and blames an older one suggests
+    what ran before that older release, from its own record.
+    """
+    base = record
+    target = None
+    if new_errors:
+        target = rs.rollback_target(record, store, new_errors.get("problems") or [], new_errors.get("scope") or {})
+        if target:
+            base = rr.read_record(store, target["rollback_to"].split(":", 1)[1])
     suggestion = {
         "created_at": rr.utc_now(),
         "phase": phase,
         "summary": f"{len(regressions)} problem(s): " + "; ".join(item["text"] for item in regressions[:3]),
         "regressions": regressions,
         "suspected_prs": rv.suspected_prs(service, record, regressions, rr_token(service)),
-        "target": {"commit": (record.get("previous") or {}).get("commit")},
-        "how": [rollback_command(service, record)],
+        "target": {
+            "commit": (base.get("previous") or {}).get("commit"),
+            **({"rollback_to": target["rollback_to"]} if target else {}),
+        },
+        "how": [rollback_command(service, base)],
         "note": "Tier check_only: a human rolls back.",
     }
 
@@ -495,14 +536,37 @@ def rr_token(service: LightService) -> str | None:
         return None
 
 
+def suggested(service: LightService, record: dict) -> str:
+    """The saved suggestion's rollback command, else the one that undoes this release."""
+    how = (record.get("rollback_suggestion") or {}).get("how") or []
+    return how[0] if how else rollback_command(service, record)
+
+
 def alert(service: LightService, store: rr.Store, record: dict) -> None:
-    """The failed-release Slack alert with the author ping, a fix prompt and the rollback command."""
+    """The failed-release Slack alert with the author ping, a fix prompt and the rollback command.
+
+    Sent once per release: the deploy check and the watch both reach a failed verdict,
+    and only a post that Slack did not take is sent again.
+    """
     if os.environ.get("RELEASE_SLACK_DISABLED", "").strip() == "1":
         print("Test run: no alert", flush=True)
         return
+    if (record.get("alert") or {}).get("posted"):
+        print("The failed-release alert was sent already", flush=True)
+        return
     location = store.location(rr.record_name(record["release_id"]))
-    text, blocks = rv.rollback_alert(service, record, None, location, command=rollback_command(service, record))
-    rr.post_slack(text, blocks)
+    text, blocks = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
+    if not rr.post_slack(text, blocks):
+        return
+    try:
+        rr.update_record(
+            store,
+            record["release_id"],
+            lambda current: current.__setitem__("alert", {"posted": True, "at": rr.utc_now()}),
+            "alert_posted",
+        )
+    except (rr.RecordError, GuardError, OSError) as error:
+        print(f"WARNING: could not mark the alert sent: {error}", file=sys.stderr, flush=True)
 
 
 def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -517,6 +581,9 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         for line in check.details[:12]:
             print(f"      {line}")
     failed = [check for check in checks if check.status == "failed"]
+    if failed and args.failed_marker:
+        # First: a record or Slack write that fails below must not turn a known failure green.
+        Path(args.failed_marker).write_text("true\n", encoding="utf-8")
     result = {"phase": "deploy", "at": rr.utc_now(), "checks": [asdict(check) for check in checks]}
     saved = rr.update_record(
         store,
@@ -542,8 +609,6 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
             )
         else:
             alert(service, store, saved)
-        if args.failed_marker:
-            Path(args.failed_marker).write_text("true\n", encoding="utf-8")
         return rv.EXIT_FAILED
     minutes = " and ".join(f"+{value}" for value in service.checkpoints)
     rr.post_slack(
@@ -586,6 +651,50 @@ def evaluate_window(service: LightService, store: rr.Store, record: dict, runner
     return {"scope": scope.summary(), "parts": parts, "problems": [problem.summary() for problem in problems]}
 
 
+# How long a checkpoint waits for another deploy build of the service.
+DEPLOY_WAIT_SECONDS = 2700
+
+
+def running_deploys(service: LightService, own_build: str | None) -> list[str]:
+    """Other deploy builds of the service that run now."""
+    names = " OR ".join(f'substitutions.TRIGGER_NAME="{name}"' for name in service.deploy_triggers)
+    running = f'({names}) AND (status="PENDING" OR status="QUEUED" OR status="WORKING")'
+    builds = GoogleApi(service.project, service.region).list_builds(running)
+    return [build.describe() for build in builds if build.id != own_build]
+
+
+def replaced_by(service: LightService, store: rr.Store, record: dict) -> str | None:
+    """The newer release, or the deploy build that runs now, that replaces this release; None if neither."""
+    pointer, _ = store.read("latest.json")
+    if pointer and pointer.get("release_id") != record["release_id"]:
+        return f"release {pointer['release_id']}"
+    running = running_deploys(service, (record.get("build") or {}).get("id"))
+    return f"deploy build {running[0]}" if running else None
+
+
+def wait_for_deploys(
+    service: LightService,
+    store: rr.Store,
+    record: dict,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> str | None:
+    """Wait while another deploy build runs; return the newer release that replaced this one, else None."""
+    deadline = clock() + DEPLOY_WAIT_SECONDS
+    while True:
+        pointer, _ = store.read("latest.json")
+        if pointer and pointer.get("release_id") != record["release_id"]:
+            return f"release {pointer['release_id']}"
+        running = running_deploys(service, (record.get("build") or {}).get("id"))
+        if not running:
+            return None
+        if clock() >= deadline:
+            raise rr.RecordError(f"deploy build {running[0]} still runs after {DEPLOY_WAIT_SECONDS // 60} min")
+        print(f"Waiting: deploy build {running[0]} runs", flush=True)
+        sleep(60)
+
+
 def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
     record = rr.read_record(store, args.release_id)
     if (record.get("verdict") or {}).get("status") == "failed":
@@ -599,12 +708,15 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         if wait > 0:
             print(f"Waiting {wait / 60:.1f} min for the +{minutes} min checkpoint", flush=True)
             time.sleep(wait)
-        pointer, _ = store.read("latest.json")
-        if pointer and pointer.get("release_id") != record["release_id"]:
-            print(f"Superseded by {pointer['release_id']}; the watch stops", flush=True)
-            return rv.EXIT_OK
         try:
+            if replaced := wait_for_deploys(service, store, record):
+                print(f"Superseded by {replaced}; the watch stops", flush=True)
+                return rv.EXIT_OK
             new_errors = evaluate_window(service, store, record, runner, datetime.now(rr.UTC))
+            # A deploy that started during the checks changed what they read: they judge no release.
+            if replaced := replaced_by(service, store, record):
+                print(f"Superseded by {replaced} during the checks; the watch stops", flush=True)
+                return rv.EXIT_OK
         except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
             continue
@@ -635,11 +747,11 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         for problem in new_errors["problems"]:
             print(f"   {'FAILS' if problem['clear'] else 'warns'}  {problem['text'][:300]}")
         if regressions:
-            saved = _fail(service, store, saved, key, regressions)
+            saved = _fail(service, store, saved, key, regressions, new_errors)
             alert(service, store, saved)
             return rv.EXIT_OK
         if fresh:
-            rv.post_warnings(service, store, saved, fresh)
+            rv.post_warnings(service, store, saved, fresh, command=rollback_command(service, saved))
         if last:
             checked = new_errors["parts"].get("logs", {}).get("status") == "checked"
             status = "passed" if checked else "inconclusive"

@@ -121,7 +121,7 @@ def resume_hint(service: rc.Service, release_id: str, prs: list[dict]) -> str:
     revert = f"merge a revert of {numbers}, or " if numbers else ""
     return (
         f"{revert}merge a commit whose message has the trailer `Fixes-release: {release_id}`, "
-        f"or run `{service.kit_command('release_gate.py')} resume --reason '<why>'`"
+        f"or run `{service.kit_command('release_gate.py', 'resume')} --reason '<why>'`"
     )
 
 
@@ -249,7 +249,7 @@ def _frozen(stores: Stores) -> Decision | None:
     return Decision(
         "frozen",
         f"automatic prod deploys are frozen by {freeze.get('by')} since {freeze.get('at')}: {freeze.get('reason')}",
-        f"run `{stores.service.kit_command('release_gate.py')} unfreeze --reason '<why>'`",
+        f"run `{stores.service.kit_command('release_gate.py', 'unfreeze')} --reason '<why>'`",
     )
 
 
@@ -444,7 +444,7 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
         print(f"WARNING: the prod promote did not start: {error}", file=sys.stderr, flush=True)
         rr.post_slack(
             f":x: {title} dev verify passed for {short}, but the prod promote did not start: {str(error)[:200]}. "
-            f"Start it by hand: {service.kit_command('release_gate.py')} promote --commit {args.commit}"
+            f"Start it by hand: {service.kit_command('release_gate.py', 'promote')} --commit {args.commit}"
         )
     return EXIT_GO
 
@@ -458,20 +458,23 @@ def _skip(args: argparse.Namespace, decision: Decision) -> None:
 def cmd_check_prod(args: argparse.Namespace, stores: Stores) -> int:
     """Prod build of the full tier, after preflight: 0 go, 4 skip (frozen, held, stale), 1 blocked.
 
-    The image preflight resolved must be the digest that dev verify checked.
+    The image preflight resolved must be the digest that dev verify checked. With --build-id the
+    build takes the prod lock first and keeps it on go, until `release_record.py finish`.
     """
     images = {rr.IMAGE_ROLE: Path(args.image_file).read_text(encoding="utf-8").strip()}
-    decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images)
-    print(f"Gate: {decision.status}: {decision.reason}", flush=True)
-    if decision.go:
-        if decision.fix_seen:
-            note_fix(stores, decision.fix_seen[0], decision.fix_seen[1], args.commit, "prod build")
-        return EXIT_GO
+    with gate_lock(stores, args.build_id) as lock:
+        decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images)
+        print(f"Gate: {decision.status}: {decision.reason}", flush=True)
+        if decision.go:
+            lock.keep()
+            if decision.fix_seen:
+                note_fix(stores, decision.fix_seen[0], decision.fix_seen[1], args.commit, "prod build")
+            return EXIT_GO
     _skip(args, decision)
     return EXIT_ERROR if decision.status == "unverified" else EXIT_SKIP
 
 
-# How long a prod build without a dev stage waits at the gate for a running rollback.
+# How long a prod build waits at the gate for a running rollback, and for the prod lock.
 ROLLBACK_WAIT_SECONDS = 2700
 
 
@@ -498,16 +501,77 @@ def wait_for_rollbacks(
 
 
 def cmd_check_direct(args: argparse.Namespace, stores: Stores) -> int:
-    """Prod build of a service without a dev stage, before its first change: 0 go, 4 skip (frozen, held)."""
-    wait_for_rollbacks(stores.service)
-    decision = decide_direct(stores, args.commit, rr.github_token(stores.service.prod))
-    print(f"Gate: {decision.status}: {decision.reason}", flush=True)
-    if decision.go:
-        if decision.fix_seen:
-            note_fix(stores, decision.fix_seen[0], decision.fix_seen[1], args.commit, "prod build")
-        return EXIT_GO
+    """Prod build of a service without a dev stage, before its first change: 0 go, 4 skip (frozen, held).
+
+    With --build-id the build takes the prod lock first and keeps it on go, until `release_record.py finish`.
+    """
+    with gate_lock(stores, args.build_id) as lock:
+        decision = decide_direct(stores, args.commit, rr.github_token(stores.service.prod))
+        print(f"Gate: {decision.status}: {decision.reason}", flush=True)
+        if decision.go:
+            lock.keep()
+            if decision.fix_seen:
+                note_fix(stores, decision.fix_seen[0], decision.fix_seen[1], args.commit, "prod build")
+            return EXIT_GO
     _skip(args, decision)
     return EXIT_SKIP
+
+
+class GateLock:
+    """The prod lock of a deploy build at its gate: freed on leaving unless keep() was called."""
+
+    def __init__(self, stores: Stores, build_id: str, **waits) -> None:
+        self.stores = stores
+        self.build_id = build_id
+        self.waits = waits
+        self.kept = False
+
+    def keep(self) -> None:
+        self.kept = True
+
+    def __enter__(self) -> GateLock:
+        if self.build_id:
+            take_prod_lock(self.stores, self.build_id, **self.waits)
+        else:
+            # A gate check by hand changes nothing, so it takes no lock.
+            wait_for_rollbacks(self.stores.service, **self.waits)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.build_id and not self.kept:
+            rr.release_lock(self.stores.prod, self.build_id)
+
+
+def gate_lock(stores: Stores, build_id: str, **waits) -> GateLock:
+    return GateLock(stores, build_id, **waits)
+
+
+def take_prod_lock(
+    stores: Stores,
+    build_id: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    api: GoogleApi | None = None,
+    alive: Callable[[str], bool] | None = None,
+) -> None:
+    """Take the prod lock for a deploy build; a running rollback goes first.
+
+    The deploy waits for running rollback builds before it takes the lock, and gives
+    the lock back when one started meanwhile: that rollback's apply waits for the
+    lock, and its hold must decide whether this build deploys.
+    """
+    service = stores.service
+    api = api or GoogleApi(service.project, service.region)
+    alive = alive or rr.build_alive(service.prod)
+    while True:
+        wait_for_rollbacks(service, sleep=sleep, clock=clock, api=api)
+        rr.acquire_lock(
+            stores.prod, build_id, "deploy", alive, wait_seconds=ROLLBACK_WAIT_SECONDS, sleep=sleep, clock=clock
+        )
+        if not api.ongoing_rollbacks(service.rollback_build_tag):
+            return
+        rr.release_lock(stores.prod, build_id)
 
 
 # --------------------------------------------------------------------------- human commands
@@ -564,7 +628,7 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
         return EXIT_GO
     release_hold(stores, pointer["release_id"], f"resumed by a human: {args.reason}", _who(args))
     after = (
-        f"`{service.kit_command('release_gate.py')} promote` promotes the newest verified commit now."
+        f"`{service.kit_command('release_gate.py', 'promote')}` promotes the newest verified commit now."
         if service.has_dev
         else "the next merge deploys."
     )
@@ -618,10 +682,12 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--commit", required=True)
     check.add_argument("--skip-reason-file")
     check.add_argument("--image-file", required=True, help="the image (repo@digest) preflight resolved")
+    check.add_argument("--build-id", default="", help="the prod build ($BUILD_ID): it takes the prod lock")
 
     direct = commands.add_parser("check-direct", help="prod build without a dev stage: 0 go, 4 skip")
     direct.add_argument("--commit", required=True)
     direct.add_argument("--skip-reason-file")
+    direct.add_argument("--build-id", default="", help="the prod build ($BUILD_ID): it takes the prod lock")
 
     commands.add_parser("status", help="freeze, hold and the newest dev release")
     for name in ("freeze", "unfreeze", "resume"):

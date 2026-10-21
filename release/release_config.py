@@ -227,10 +227,21 @@ class Service:
     def window_config(self) -> str:
         return f"release/services/{self.name}.release-verify.yaml"
 
-    def kit_command(self, script: str) -> str:
-        """How a human runs a kit script for this service (the Slack hints and fix prompts)."""
-        flag = "" if single_service() else f" --service {self.name}"
-        return f"python3 release/{script}{flag}"
+    def kit_command(self, script: str, sub: str = "") -> str:
+        """How a human runs a kit script's subcommand for this service (the Slack hints and fix prompts)."""
+        return kit_command(self.name, script, sub)
+
+
+# Scripts whose --service belongs to each subcommand; the others take it before the subcommand.
+SUBCOMMAND_SERVICE_FLAG = ("release_record.py", "release_rollback.py", "release_verify.py")
+
+
+def kit_command(service: str, script: str, sub: str = "") -> str:
+    """`python3 release/<script> <sub>` with --service where that script's parser takes it."""
+    flag = "" if single_service() else f" --service {service}"
+    if script in SUBCOMMAND_SERVICE_FLAG:
+        return f"python3 release/{script} {sub}{flag}".rstrip()
+    return f"python3 release/{script}{flag} {sub}".rstrip()
 
 
 def _require(data: dict, key: str, where: str) -> object:

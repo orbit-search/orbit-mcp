@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release_config as rc  # noqa: E402
-from promote_release_guard import GoogleApi, GuardError, _http_json, github_compare_status  # noqa: E402
+from promote_release_guard import ONGOING_STATUSES, GoogleApi, GuardError, _http_json, github_compare_status  # noqa: E402
 
 SCHEMA_VERSION = 1
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -416,6 +416,95 @@ def update_object(store: Store, name: str, change: Callable[[dict | None], dict]
     raise RecordError(f"{store.location(name)} kept changing; gave up after {attempts} attempts")
 
 
+# --------------------------------------------------------------------------- the prod lock
+
+# One build at a time changes prod: a deploy build from its gate step to `finish`, and a
+# rollback build during its apply. The holder is a build id; a holder build that ended no
+# longer holds the lock, so a build that failed half way blocks nobody.
+LOCK_OBJECT = "lock.json"
+LOCK_POLL_SECONDS = 15
+
+
+def build_alive(env: Environment) -> Callable[[str], bool]:
+    """Whether a build still runs; a build that cannot be read keeps the lock (the safe answer)."""
+    api = GoogleApi(env.project, env.region)
+
+    def alive(build_id: str) -> bool:
+        try:
+            return api.get_build(build_id).status in ONGOING_STATUSES
+        except GuardError as error:
+            print(
+                f"WARNING: cannot read build {build_id}; it keeps the prod lock: {error}", file=sys.stderr, flush=True
+            )
+            return True
+
+    return alive
+
+
+def lock_holder(store: Store, alive: Callable[[str], bool]) -> dict | None:
+    """The lock while a running build holds it, else None."""
+    current, _ = store.read(LOCK_OBJECT)
+    holder = (current or {}).get("holder")
+    return current if holder and alive(holder) else None
+
+
+def acquire_lock(
+    store: Store,
+    holder: str,
+    kind: str,
+    alive: Callable[[str], bool],
+    *,
+    wait_seconds: int,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Take the lock for build `holder`; wait while another running build holds it.
+
+    The write is conditional on the object's generation, so of two builds that
+    find the lock free only one gets it.
+    """
+    deadline = clock() + wait_seconds
+    announced = ""
+    while True:
+        current, generation = store.read(LOCK_OBJECT)
+        owner = (current or {}).get("holder") or ""
+        if not owner or owner == holder or not alive(owner):
+            lock = {"holder": holder, "kind": kind, "at": utc_now()}
+            if owner and owner != holder:
+                lock["took_over_from"] = owner
+            try:
+                store.write(LOCK_OBJECT, lock, generation)
+            except ConcurrentWrite:
+                continue
+            ended = f"; build {owner} had ended" if lock.get("took_over_from") else ""
+            print(f"Prod lock: held by {kind} build {holder}{ended}", flush=True)
+            return
+        if clock() >= deadline:
+            raise RecordError(
+                f"the {current.get('kind')} build {owner} still holds the prod lock after {wait_seconds // 60} min "
+                f"({store.location(LOCK_OBJECT)})"
+            )
+        if owner != announced:
+            print(f"Waiting for the prod lock: the {current.get('kind')} build {owner} holds it", flush=True)
+            announced = owner
+        sleep(LOCK_POLL_SECONDS)
+
+
+def release_lock(store: Store, holder: str | None) -> None:
+    """Free the lock when build `holder` holds it; otherwise do nothing."""
+    if not holder:
+        return
+    current, generation = store.read(LOCK_OBJECT)
+    if (current or {}).get("holder") != holder:
+        return
+    try:
+        store.write(LOCK_OBJECT, {"holder": "", "released_by": holder, "at": utc_now()}, generation)
+    except ConcurrentWrite:
+        # Another build took the lock over meanwhile: it is no longer ours to free.
+        return
+    print(f"Prod lock: freed by build {holder}", flush=True)
+
+
 def record_name(release_id: str) -> str:
     return f"releases/{release_id}.json"
 
@@ -700,6 +789,11 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     saved = update_record(store, release_id, finish, args.status)
     point_latest(store, saved)
     print(f"Release {release_id}: {args.status}; {store.location('latest.json')} points at it", flush=True)
+    # The deploy is over: a rollback may start now. A build that ends frees the lock too.
+    try:
+        release_lock(store, (saved.get("build") or {}).get("id"))
+    except (RecordError, GuardError, OSError) as error:
+        print(f"WARNING: could not free the prod lock; it ends with this build: {error}", file=sys.stderr, flush=True)
     return 0
 
 
