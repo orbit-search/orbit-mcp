@@ -1,0 +1,12 @@
+{
+  "_doc": "GitHub login -> Slack user id, for release alerts that mention a PR's author (release_verify.py rollback_alert and dev_verify_alert). `fallback` is mentioned when no suspected PR has a mapped author. Part of the release kit: edit it in orbit-infrastructure/release-kit/release/ and sync; deep-search and orbit-api keep their own copies.",
+  "fallback": ["U095N78G96F"],
+  "slack_ids": {
+    "GustavoMartinsDosSantos": "U0C9J8PCEKY",
+    "NicholasDominici": "U095N78G96F",
+    "Vitor-Bukovitz": "U0AGLMB60TS",
+    "hunterrice": "U095V4FS17E",
+    "jonnybcw": "U095N7BBQKD",
+    "simonosaur": "U095N76T59R"
+  }
+}

@@ -2,6 +2,14 @@
 
 Instructions for every agent (Codex, Claude, others) working in `orbit-mcp`. `CLAUDE.md` is a symlink to this file.
 
+## Deploys and the release check
+
+- A merge to `main` deploys both Cloud Run services (`cloudbuild.yaml`, trigger `orbit-mcp-deploy`) by
+  digest, behind single flight, with a release record, a deploy check and a watch window
+  (`docs/RELEASE_PIPELINE.md`). Agents never run the deploy trigger to ship; to ship, merge.
+- `release/` is a pinned copy of `orbit-infrastructure/release-kit`; change it there and sync. This repo
+  owns only `release/services/orbit-mcp.json`.
+
 ## Agent review and release policy
 
 These rules bind every agent and every model (Codex, Claude, others). Agents
@@ -50,6 +58,8 @@ gates below.
   format that the `agent-policy` check prints. A later commit that only fixes
   CI or a review finding keeps the approval with a carry record.
 - **Merge** when CI is green, every review thread is resolved and
-  `agent-policy` passes. Rollbacks are always started by a human.
+  `agent-policy` passes. Rollbacks are started by a human: a release that
+  fails its release check posts an alert with the rollback command
+  (`docs/RELEASE_PIPELINE.md`).
 - **A human owns each change:** the person who started the agent.
 

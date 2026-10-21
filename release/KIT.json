@@ -1,0 +1,19 @@
+{
+  "_doc": "Pinned copy of orbit-infrastructure/release-kit/release. Do not edit these files here; change the kit there and run release-kit/sync.py.",
+  "files": {
+    "README.md": "d9df2ea17453cce501e6a0c9dd3f595c578a1715a63f4a7be6c85572d924ad72",
+    "promote_release_guard.py": "aa9326e60c96bca7f6a7facb1da98272e6ebd1f24f381bf3ebc63825868b37cd",
+    "release_config.py": "976d8588053766453c37ed03761f9c36ff7c8e9b4a0d81b6fc0d1077800c11a7",
+    "release_gate.py": "92ef5da20e0c6492b064d807a6c2e7302257c9e2b23a16b879e2c0bc52079cbd",
+    "release_kit.py": "e5ac863512546150c4677a0b1dcdfb2cc983ac48ea7e9de6f6dd84389cff8a46",
+    "release_light.py": "9e6c69b2434ca03b83f6b9c7a090f2331cd4776c8634b2ec3ff97ed7cd5566b3",
+    "release_people.json": "c9c693e85419c29a52c05e7a6611ac12f13efe5b5a0f119a5d65a9ce0c1bd855",
+    "release_record.py": "e75fa0c830688e40d79949b38f48ea684da022d131819eb85094a4ce10f97948",
+    "release_rollback.py": "776f1858bf3e607559e50e3cb7236961700f56ac00f091a26b8490c7df9f4abe",
+    "release_signals.py": "8d0dac8d200f0324124dea3abe7b493ed8c57540c5484fb91dcfe185edd4fc89",
+    "release_verify.py": "a7e16b4f3371f226cff9947c1e2b52fb326ed7293ad614d0fb385f7ae54f9090",
+    "test_release_kit.py": "6f43e3a465438a5fda383d222e2bbc7a69c2e61092e04a52ed91a10a9795cf97"
+  },
+  "source": "orbit-search/orbit-infrastructure release-kit/release",
+  "version": "kit-d32c8707f198"
+}
