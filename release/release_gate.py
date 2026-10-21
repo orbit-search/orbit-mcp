@@ -86,6 +86,7 @@ class Decision:
 
     @property
     def go(self) -> bool:
+        """Whether the decision lets the commit deploy."""
         return self.status == "go"
 
 
@@ -117,6 +118,7 @@ def new_hold(service: rc.Service, rollback_id: str, rolled_back: dict) -> dict:
 
 
 def resume_hint(service: rc.Service, release_id: str, prs: list[dict]) -> str:
+    """How a human ends the hold: merge a revert of the PRs, merge a Fixes-release commit, or run resume."""
     numbers = ", ".join(f"#{item['pr']}" if item.get("pr") else str(item.get("sha", ""))[:9] for item in prs)
     revert = f"merge a revert of {numbers}, or " if numbers else ""
     return (
@@ -213,6 +215,7 @@ class Stores:
 
 
 def open_stores(service: rc.Service, uri: str = "", dry_run_dir: Path | None = None) -> Stores:
+    """Open the prod and dev record stores of the service (dry_run_dir: writes go only there)."""
     token = GoogleApi(service.project, service.region).access_token
     uri = uri or service.store
     return Stores(
@@ -227,11 +230,13 @@ def open_stores(service: rc.Service, uri: str = "", dry_run_dir: Path | None = N
 
 
 def freeze_state(stores: Stores) -> dict:
+    """The freeze object of the prod store; not frozen when it does not exist."""
     state, _ = stores.prod.read(FREEZE_OBJECT)
     return state or {"frozen": False}
 
 
 def dev_index(stores: Stores, commit: str) -> dict:
+    """The dev store index of a commit; empty when the service has no dev or the commit has no index."""
     if stores.dev is None:
         return {}
     index, _ = stores.dev.read(dev_commit_index(commit))
@@ -239,10 +244,12 @@ def dev_index(stores: Stores, commit: str) -> dict:
 
 
 def dev_verdict(stores: Stores, commit: str) -> dict:
+    """The newest dev verify verdict of a commit; empty when there is none."""
     return dev_index(stores, commit).get("verdict") or {}
 
 
 def _frozen(stores: Stores) -> Decision | None:
+    """A frozen decision when automatic prod deploys are frozen, else None."""
     freeze = freeze_state(stores)
     if not freeze.get("frozen"):
         return None
@@ -337,6 +344,7 @@ def release_hold(stores: Stores, rollback_id: str, how: str, by: str) -> None:
     """A human ends the hold of a rollback record: every commit may deploy again (idempotent)."""
 
     def change(current: dict) -> None:
+        """Mark the hold released with who, when and how; a released hold stays as it is."""
         hold = hold_of(stores.service, current)
         if hold.get("status") == "released":
             return
@@ -352,6 +360,7 @@ def note_fix(stores: Stores, rollback_id: str, how: str, commit: str, by: str) -
     its descendants pass (decide checks each commit's own history), until a deploy replaces the rollback."""
 
     def change(current: dict) -> None:
+        """Write the fixing commit on the hold; do nothing when that commit is already there."""
         hold = hold_of(stores.service, current)
         if (hold.get("fixed_by") or {}).get("commit") == commit:
             return
@@ -365,6 +374,7 @@ def note_fix(stores: Stores, rollback_id: str, how: str, commit: str, by: str) -
 
 
 def start_prod_build(service: rc.Service, commit: str, dev_build_id: str, *, dry_run: bool) -> str:
+    """Run the prod deploy trigger at the commit and return the build id (dry run: print the command only)."""
     command = [
         "gcloud",
         "builds",
@@ -384,11 +394,15 @@ def start_prod_build(service: rc.Service, commit: str, dev_build_id: str, *, dry
 
 
 def _build_url(service: rc.Service, build_id: str) -> str:
+    """The Cloud Console link of a build."""
     return f"https://console.cloud.google.com/cloud-build/builds;region={service.region}/{build_id}?project={service.project}"
 
 
 def _note_promote(stores: Stores, commit: str, promote: dict) -> None:
+    """Write the promote on the dev index of the commit; a failed write only prints a warning."""
+
     def change(current: dict | None) -> dict:
+        """The dev index with the promote field set."""
         updated = dict(current or {"commit": commit})
         updated["promote"] = promote
         return updated
@@ -450,6 +464,7 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
 
 
 def _skip(args: argparse.Namespace, decision: Decision) -> None:
+    """Write the skip reason and the resume hint to --skip-reason-file when it is given."""
     if args.skip_reason_file:
         hint = f" To resume: {decision.resume_hint}." if decision.resume_hint else ""
         Path(args.skip_reason_file).write_text(f"{decision.status}: {decision.reason}.{hint}\n", encoding="utf-8")
@@ -521,15 +536,18 @@ class GateLock:
     """The prod lock of a deploy build at its gate: freed on leaving unless keep() was called."""
 
     def __init__(self, stores: Stores, build_id: str, **waits) -> None:
+        """Keep the stores, the build id and the wait options; the lock is not kept yet."""
         self.stores = stores
         self.build_id = build_id
         self.waits = waits
         self.kept = False
 
     def keep(self) -> None:
+        """Keep the prod lock when the block ends (the deploy goes on)."""
         self.kept = True
 
     def __enter__(self) -> GateLock:
+        """Take the prod lock for a build; a check by hand only waits for running rollbacks."""
         if self.build_id:
             take_prod_lock(self.stores, self.build_id, **self.waits)
         else:
@@ -538,11 +556,13 @@ class GateLock:
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        """Free the prod lock unless keep() was called."""
         if self.build_id and not self.kept:
             rr.release_lock(self.stores.prod, self.build_id)
 
 
 def gate_lock(stores: Stores, build_id: str, **waits) -> GateLock:
+    """The prod lock of a deploy build at its gate, as a context manager."""
     return GateLock(stores, build_id, **waits)
 
 
@@ -578,10 +598,12 @@ def take_prod_lock(
 
 
 def _who(args: argparse.Namespace) -> str:
+    """Who runs the command: --by, else $USER, else the login name."""
     return args.by or os.environ.get("USER") or getpass.getuser()
 
 
 def cmd_status(args: argparse.Namespace, stores: Stores) -> int:
+    """Print the freeze, the hold, the prod release and the newest dev release."""
     service = stores.service
     freeze = freeze_state(stores)
     print(f"service: {service.name} (tier {service.tier})")
@@ -606,6 +628,7 @@ def cmd_status(args: argparse.Namespace, stores: Stores) -> int:
 
 
 def cmd_freeze(args: argparse.Namespace, stores: Stores, frozen: bool) -> int:
+    """Freeze or unfreeze automatic prod deploys with a reason, and tell Slack."""
     if not args.reason.strip():
         raise rr.RecordError("--reason is required")
     state = {"frozen": frozen, "by": _who(args), "reason": args.reason, "at": rr.utc_now()}
@@ -619,6 +642,7 @@ def cmd_freeze(args: argparse.Namespace, stores: Stores, frozen: bool) -> int:
 
 
 def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
+    """End the hold of the newest rollback with a reason, and tell Slack."""
     service = stores.service
     if not args.reason.strip():
         raise rr.RecordError("--reason is required")
@@ -663,6 +687,7 @@ def cmd_promote(args: argparse.Namespace, stores: Stores) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line, open the stores and run the command; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--service", help="service config name (release/services/<name>.json)")
     parser.add_argument(

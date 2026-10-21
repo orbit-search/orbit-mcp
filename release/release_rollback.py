@@ -66,6 +66,7 @@ class Step:
     action: str  # set, none, skip
 
     def line(self) -> str:
+        """One plan line for the step: already at the target, skipped, or current -> target."""
         if self.action == "none":
             return f"  = {self.workload}: already {self.target}"
         if self.action == "skip":
@@ -86,6 +87,7 @@ class Plan:
     problems: list[str]
 
     def changes(self) -> list[Step]:
+        """The steps that set a new image."""
         return [step for step in self.steps if step.action == "set"]
 
 
@@ -135,6 +137,7 @@ def target_reference(env: rc.Environment, digest: str, commit: str | None) -> st
 
 
 def build_plan(service: rc.Service, latest: dict, target: dict, live: dict[str, dict], token: str | None) -> Plan:
+    """Plan the rollback: one step per prod Deployment, the deploy files it leaves as they are, notes and problems."""
     env = service.prod
     steps = []
     for item in env.deployments:
@@ -192,6 +195,7 @@ def missing_images(service: rc.Service, plan: Plan, api: GoogleApi) -> list[str]
 
 
 def print_plan(service: rc.Service, plan: Plan) -> None:
+    """Print the plan: the target, each step, the files it does not roll back, the notes and the problems."""
     print(f"Rollback of {service.name} prod from {plan.from_release} ({str(plan.from_commit)[:9]})")
     print(f"  to {plan.target_release or 'the unrecorded release before it'} ({str(plan.target_commit)[:9]})")
     for role, image in sorted(plan.target_images.items()):
@@ -263,6 +267,7 @@ def apply_plan(plan: Plan, clients: rr.Clients) -> list[str]:
 
 
 def _plan_for(service: rc.Service, store: rr.Store, clients: rr.Clients, target: str) -> tuple[dict, dict, dict, Plan]:
+    """Resolve the target, read what runs now and build the plan, with the images the registry no longer holds."""
     latest, resolved = resolve_target(store, target)
     live = rr.snapshot_workloads(clients)
     plan = build_plan(service, latest, resolved, live, _token(service))
@@ -271,6 +276,7 @@ def _plan_for(service: rc.Service, store: rr.Store, clients: rr.Clients, target:
 
 
 def cmd_plan(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
+    """Dry run: print the plan (and write it as JSON with --json); 1 when the rollback is blocked."""
     _, _, _, plan = _plan_for(service, store, clients, args.to)
     print_plan(service, plan)
     if args.json:
@@ -315,6 +321,7 @@ def cmd_apply(
 
 
 def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
+    """Apply the rollback: write a rollback record, set the images, verify, and hold automatic prod deploys."""
     env = service.prod
     title = service.title
     assert_alone(service, args.build_id)
@@ -369,6 +376,7 @@ def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clien
     status = "deploy_failed" if failures else "deployed"
 
     def finish(current: dict) -> None:
+        """Write the result on the rollback record; a complete rollback also gets the promote hold."""
         current["workloads"] = after
         current["status"] = status
         current["times"]["deploy_finished"] = rr.utc_now()
@@ -397,6 +405,7 @@ def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clien
     rr.point_latest(store, saved)
 
     def mark_rolled_back(current: dict) -> None:
+        """Mark the release that was rolled back and name the rollback record."""
         current["status"] = "rolled_back"
         current["rolled_back_by"] = saved["release_id"]
 
@@ -466,6 +475,7 @@ def cmd_run(args: argparse.Namespace, service: rc.Service, store: rr.Store, clie
 
 
 def _token(service: rc.Service) -> str | None:
+    """The GitHub token of prod, or None (with a warning) when there is none."""
     try:
         return rr.github_token(service.prod)
     except GuardError as error:
@@ -474,6 +484,7 @@ def _token(service: rc.Service) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run plan, run or apply on prod; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
 

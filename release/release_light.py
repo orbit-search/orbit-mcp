@@ -95,9 +95,11 @@ class LightService:
 
     @property
     def window_config(self) -> str:
+        """The repository path of the release verify build config of this service."""
         return f"release/services/{self.name}.release-verify.yaml"
 
     def kit_command(self, script: str, sub: str = "") -> str:
+        """The command line of a kit script for this service (see release_config.kit_command)."""
         return rc.kit_command(self.name, script, sub)
 
     @property
@@ -124,6 +126,7 @@ class LightService:
 
 
 def parse_light(data: dict, path: Path | None = None) -> LightService:
+    """Parse a cloud_run or composer service config; raise ConfigError when it is invalid."""
     where = str(path or "service config")
     kind = str(data.get("kind") or "")
     if kind not in KINDS:
@@ -182,6 +185,7 @@ def parse_light(data: dict, path: Path | None = None) -> LightService:
 
 
 def load_light(name: str | None = None) -> LightService:
+    """Load the named service config, or the only one; the file name must be the service name."""
     name = name or os.environ.get("RELEASE_SERVICE", "").strip() or None
     files = rc.service_files()
     if name:
@@ -206,6 +210,7 @@ Runner = Callable[[list[str]], str]
 
 
 def gcloud_json(runner: Runner, *args: str) -> dict:
+    """Run a gcloud command with JSON output and decode it."""
     return json.loads(runner(["gcloud", *args, "--format=json"]))
 
 
@@ -246,6 +251,7 @@ class Airflow:
     """Read-only Airflow REST API of a Composer environment (the build identity's token)."""
 
     def __init__(self, service: LightService, runner: Runner, token: Callable[[], str]) -> None:
+        """Find the Airflow URI of the Composer environment; raise RecordError when there is none."""
         uri = runner(
             [
                 "gcloud",
@@ -264,6 +270,7 @@ class Airflow:
         self.token = token
 
     def get(self, path: str) -> dict:
+        """GET an Airflow API path with the bearer token and decode the JSON."""
         request = urllib.request.Request(f"{self.uri}{path}", headers={"Authorization": f"Bearer {self.token()}"})
         return _http_json(request)
 
@@ -307,6 +314,7 @@ class Airflow:
 
 
 def snapshot(service: LightService, runner: Runner, token: Callable[[], str]) -> dict[str, dict]:
+    """What runs now: the Cloud Run revisions, or the Composer DAG import errors."""
     if service.kind == "cloud_run":
         return snapshot_cloud_run(service, runner)
     try:
@@ -363,6 +371,7 @@ def check_import_errors(service: LightService, record: dict, after: dict[str, di
 def deploy_checks(
     service: LightService, record: dict, runner: Runner, token: Callable[[], str], get: rv.HttpGet = rv.http_get
 ) -> tuple[list[rv.Check], dict[str, dict]]:
+    """Run the deploy checks and the public smoke checks; return them with the snapshot after the deploy."""
     after = snapshot(service, runner, token)
     if service.kind == "cloud_run":
         checks = [check_cloud_run(record.get("previous_snapshot") or {}, after)]
@@ -403,6 +412,7 @@ def dag_failure_problems(
 
 
 def open_store(service: LightService, dry_run_dir: Path | None) -> rr.Store:
+    """Open the record store of the service (dry_run_dir: writes go only there)."""
     token = GoogleApi(service.project, service.region).access_token
     return rr.open_store(service.store, service.env, token, dry_run_dir)
 
@@ -419,15 +429,21 @@ def rollback_command(service: LightService, record: dict) -> str:
     snapshot_before = record.get("previous_snapshot") or {}
     commands = []
     for name in service.services:
-        revision = (snapshot_before.get(f"cloud_run/{name}") or {}).get("latest_ready") or "<previous revision>"
+        before = snapshot_before.get(f"cloud_run/{name}") or {}
+        # The revisions that served before the release: after a manual traffic move the newest ready
+        # revision may be one that serves nothing.
+        traffic = {revision: percent for revision, percent in (before.get("traffic") or {}).items() if percent}
+        split = ",".join(f"{revision}={percent}" for revision, percent in sorted(traffic.items()))
+        split = split or f"{before.get('latest_ready') or '<previous revision>'}=100"
         commands.append(
             f"gcloud run services update-traffic {name} --region={service.region} --project={service.project} "
-            f"--to-revisions={revision}=100"
+            f"--to-revisions={split}"
         )
     return " && ".join(commands)
 
 
 def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Take a snapshot and write a deploying record before the deploy; write its id to --release-id-file."""
     started_at = rr.utc_now()
     token = GoogleApi(service.project, service.region).access_token
     before = snapshot(service, runner, token)
@@ -467,12 +483,14 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
 
 
 def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Take a snapshot after the deploy, set the record status and point latest.json at it."""
     release_id = (
         Path(args.release_id_file).read_text(encoding="utf-8").strip() if args.release_id_file else args.release_id
     )
     after = snapshot(service, runner, GoogleApi(service.project, service.region).access_token)
 
     def finish(record: dict) -> None:
+        """Write the snapshot, the status and the deploy finish time on the record."""
         record["workloads"] = after
         record["status"] = args.status
         record.setdefault("times", {})["deploy_finished"] = rr.utc_now()
@@ -517,6 +535,7 @@ def _fail(
     }
 
     def change(current: dict) -> None:
+        """Set the failed verdict and the suggestion, unless the record has failed already."""
         if (current.get("verdict") or {}).get("status") != "failed":
             current["verdict"] = {
                 "status": "failed",
@@ -530,6 +549,7 @@ def _fail(
 
 
 def rr_token(service: LightService) -> str | None:
+    """The GitHub token of the service, or None when there is none."""
     try:
         return rr.github_token(service.env)
     except GuardError:
@@ -576,6 +596,8 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         print(f"Waiting {service.parse_wait_seconds} s for the DAG processor", flush=True)
         time.sleep(service.parse_wait_seconds)
     checks, after = deploy_checks(service, record, runner, GoogleApi(service.project, service.region).access_token)
+    if record.get("status") == "deploy_failed":
+        checks.insert(0, rv.Check("deploy", "failed", ["the deploy step failed (status deploy_failed)"]))
     for check in checks:
         print(f"   check {check.name}: {check.status}")
         for line in check.details[:12]:
@@ -653,6 +675,8 @@ def evaluate_window(service: LightService, store: rr.Store, record: dict, runner
 
 # How long a checkpoint waits for another deploy build of the service.
 DEPLOY_WAIT_SECONDS = 2700
+# How many times a checkpoint runs again when a deploy build starts during its checks.
+CHECKPOINT_ATTEMPTS = 3
 
 
 def running_deploys(service: LightService, own_build: str | None) -> list[str]:
@@ -695,7 +719,27 @@ def wait_for_deploys(
         sleep(60)
 
 
+def finish_inconclusive(service: LightService, store: rr.Store, record: dict, key: str, why: str) -> None:
+    """The last checkpoint could not run: the verdict is inconclusive (never left pending) and a human hears of it."""
+
+    def done(current: dict) -> None:
+        """Set the inconclusive verdict, unless the record has failed already."""
+        if (current.get("verdict") or {}).get("status") != "failed":
+            current["verdict"] = {"status": "inconclusive", "at": rr.utc_now(), "phase": key, "reasons": [why[:300]]}
+
+    try:
+        rr.update_record(store, record["release_id"], done, "verify_final", {"status": "inconclusive"})
+    except (rr.RecordError, GuardError, OSError) as error:
+        print(f"WARNING: could not save the inconclusive verdict: {error}", file=sys.stderr, flush=True)
+    rr.post_slack(
+        f":grey_question: {service.title} release-verify {record['commit'][:9]} inconclusive: the last checkpoint "
+        f"could not run ({why[:200]}). Check the release by hand. "
+        f"Record {store.location(rr.record_name(record['release_id']))}"
+    )
+
+
 def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Run the window checks at each checkpoint; fail and alert on a clear new error, else pass at the end."""
     record = rr.read_record(store, args.release_id)
     if (record.get("verdict") or {}).get("status") == "failed":
         alert(service, store, record)
@@ -709,16 +753,28 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             print(f"Waiting {wait / 60:.1f} min for the +{minutes} min checkpoint", flush=True)
             time.sleep(wait)
         try:
-            if replaced := wait_for_deploys(service, store, record):
-                print(f"Superseded by {replaced}; the watch stops", flush=True)
-                return rv.EXIT_OK
-            new_errors = evaluate_window(service, store, record, runner, datetime.now(rr.UTC))
-            # A deploy that started during the checks changed what they read: they judge no release.
-            if replaced := replaced_by(service, store, record):
-                print(f"Superseded by {replaced} during the checks; the watch stops", flush=True)
-                return rv.EXIT_OK
+            new_errors = None
+            for _ in range(CHECKPOINT_ATTEMPTS):
+                if replaced := wait_for_deploys(service, store, record):
+                    print(f"Superseded by {replaced}; the watch stops", flush=True)
+                    return rv.EXIT_OK
+                new_errors = evaluate_window(service, store, record, runner, datetime.now(rr.UTC))
+                # A deploy build that started during the checks may have changed what they read. Only a
+                # newer release ends the watch; a build that only runs makes the checkpoint run again.
+                if replaced := replaced_by(service, store, record):
+                    if replaced.startswith("release "):
+                        print(f"Superseded by {replaced} during the checks; the watch stops", flush=True)
+                        return rv.EXIT_OK
+                    print(f"{replaced} started during the checks; the checkpoint runs again", flush=True)
+                    new_errors = None
+                    continue
+                break
+            if new_errors is None:
+                raise rr.RecordError(f"deploy builds kept starting during {CHECKPOINT_ATTEMPTS} attempts")
         except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
+            if last:
+                finish_inconclusive(service, store, record, f"window_{minutes}m", str(error))
             continue
         key = f"window_{minutes}m"
         regressions = [rv.new_error_regression(problem) for problem in new_errors["problems"] if problem["clear"]]
@@ -731,6 +787,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         fresh: list[dict] = []
 
         def store_result(current: dict, key: str = key, result: dict = result) -> None:
+            """Save the checkpoint result and collect the warnings not posted yet into fresh."""
             current.setdefault("checks", {})[key] = result
             known = current.setdefault("warnings", {})
             fresh.clear()
@@ -757,6 +814,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             status = "passed" if checked else "inconclusive"
 
             def done(current: dict, status: str = status) -> None:
+                """Set the final verdict, unless the record has failed already."""
                 if (current.get("verdict") or {}).get("status") != "failed":
                     current["verdict"] = {"status": status, "at": rr.utc_now(), "phase": key}
 
@@ -770,6 +828,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
 
 
 def window_sources(service: LightService) -> list[Path]:
+    """The files the watch window build needs: the kit files and the runtime source files."""
     sources = [path for path in KIT_DIR.rglob("*") if path.is_file() and "__pycache__" not in path.parts]
     for prefix in service.code.source_prefixes:
         base = REPO_ROOT / prefix.rstrip("/")
@@ -785,6 +844,7 @@ def window_sources(service: LightService) -> list[Path]:
 
 
 def cmd_schedule_window(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Copy the sources and submit the watch window build; note its id on the record."""
     source = Path(args.source_dir)
     for path in window_sources(service):
         target = source / path.relative_to(REPO_ROOT)
@@ -842,18 +902,21 @@ def cmd_turn(args: argparse.Namespace, service: LightService, store: rr.Store, r
 
 
 def cmd_rollback_command(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Print the command that undoes a release."""
     record = rr.read_record(store, args.release_id)
     print(rollback_command(service, record))
     return rv.EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line, load the service and run the command; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--service", help="service config name (release/services/<name>.json)")
     parser.add_argument("--dry-run-dir", type=Path, help="read the real store, write records only under this directory")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def release_id_args(sub: argparse.ArgumentParser) -> None:
+        """Add the --release-id and --release-id-file options to a subcommand."""
         sub.add_argument("--release-id", default="latest")
         sub.add_argument("--release-id-file")
 

@@ -112,6 +112,7 @@ class NoAccess(Exception):
 
 
 def _iso(value: datetime) -> str:
+    """A time as an RFC 3339 UTC string with seconds."""
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -134,9 +135,11 @@ class Scope:
 
     @property
     def commit_release(self) -> dict[str, dict]:
+        """The release of each commit in the scope: sha -> release record."""
         return {commit["sha"]: release for release in self.releases for commit in release.get("commits") or []}
 
     def summary(self) -> dict:
+        """The scope for the record: release ids, commit count, baseline and window times, notes."""
         return {
             "releases": [release["release_id"] for release in self.releases],
             "commits": len(self.commits),
@@ -147,12 +150,14 @@ class Scope:
 
 
 def _times(record: dict) -> tuple[datetime, datetime]:
+    """(deploy started, deploy finished) of a record; finished is the start when the deploy has no finish time."""
     times = record.get("times") or {}
     started = rr.parse_utc(times["deploy_started"])
     return started, rr.parse_utc(times.get("deploy_finished") or times["deploy_started"])
 
 
 def _read(store: rr.Store, release_id: str | None) -> dict | None:
+    """The record of a release id, or None when there is no id or it cannot be read."""
     if not release_id:
         return None
     try:
@@ -252,9 +257,11 @@ class DatadogReader:
     """The Datadog reads of the new-error checks, over release_verify.DatadogClient's keys."""
 
     def __init__(self, dd) -> None:  # noqa: ANN001 - release_verify.DatadogClient (no import cycle)
+        """Wrap a release_verify.DatadogClient."""
         self.dd = dd
 
     def _call(self, method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict:
+        """Call the Datadog API; raise NoAccess on HTTP 401 or 403."""
         try:
             return self.dd.api(method, path, body=body, params=params)
         except GuardError as error:
@@ -263,6 +270,7 @@ class DatadogReader:
             raise
 
     def scalar(self, query: str, start: datetime, end: datetime) -> dict[str, float]:
+        """The sum of a metric query per group over [start, end); raise NoAccess on HTTP 401 or 403."""
         try:
             return self.dd.scalar(query, "sum", start, end)
         except GuardError as error:
@@ -271,6 +279,7 @@ class DatadogReader:
             raise
 
     def events(self, query: str, start: datetime, end: datetime, max_pages: int = 30) -> list[dict]:
+        """The Datadog events that match the query in [start, end), oldest first, over at most max_pages pages."""
         out: list[dict] = []
         cursor = ""
         for _ in range(max_pages):
@@ -335,6 +344,7 @@ class Problem:
     origins: list[str] = field(default_factory=list)
 
     def summary(self) -> dict:
+        """The problem for the record: its fields, with at most 5 origins and 5 suspects."""
         return {
             "kind": self.kind,
             "key": self.key,
@@ -452,6 +462,7 @@ def issue_problems(
 
 
 def _sum_spans(reader: DatadogReader, query: str, spans: list[Span]) -> dict[str, float]:
+    """The sum of a metric query per group over all the spans."""
     total: dict[str, float] = {}
     for start, end in spans:
         for key, value in reader.scalar(query, start, end).items():
@@ -460,6 +471,7 @@ def _sum_spans(reader: DatadogReader, query: str, spans: list[Span]) -> dict[str
 
 
 def failure_problems(reader: DatadogReader, scope: Scope, series: dict) -> list[Problem]:
+    """Compare the failure series of the window with the baseline (see judge_failures)."""
     base_fail = _sum_spans(reader, series["failures"], scope.baseline)
     cand_fail = _sum_spans(reader, series["failures"], [scope.window])
     base_all = _sum_spans(reader, series["all"], scope.baseline) if series.get("all") else {}
@@ -492,10 +504,12 @@ def judge_failures(
     rate_width = len(fields) - 1 if len(fields) > 1 else len(fields)
 
     def named(key: str, width: int) -> dict[str, str]:
+        """The first width fields of a group key, by field name."""
         parts = (key.split("|") + [""] * width)[:width]
         return {name: value for name, value in zip(fields[:width], parts)}
 
     def rollout(key: str) -> bool:
+        """Whether the failure type of a group key is a rollout failure, which never counts."""
         return len(fields) > 1 and key.split("|")[-1] in ROLLOUT_FAILURE_TYPES
 
     for key, count in sorted(cand_fail.items()):
@@ -518,6 +532,7 @@ def judge_failures(
             continue
 
         def failures_of(values: dict[str, float]) -> float:
+            """The failures of this group in a window, without the rollout failures."""
             return sum(v for k, v in values.items() if "|".join(k.split("|")[:rate_width]) == key and not rollout(k))
 
         base_n, cand_n = base_all.get(key, 0.0), cand_all.get(key, 0.0)
@@ -588,11 +603,13 @@ class CloudLogging:
     URL = "https://logging.googleapis.com/v2/entries:list"
 
     def __init__(self, project: str, token: Callable[[], str], clock: Callable[[], float] = time.monotonic) -> None:
+        """Keep the project, the token source and the clock."""
         self.project = project
         self.token = token
         self.clock = clock
 
     def _page(self, body: dict) -> dict:
+        """Read one page of log entries; raise NoAccess on HTTP 401 or 403."""
         request = urllib.request.Request(
             self.URL,
             data=json.dumps(body).encode("utf-8"),
@@ -706,6 +723,7 @@ def literal_fragments(message: str, minimum: int = 12) -> list[str]:
 
 
 def _is_pattern(text: str) -> bool:
+    """Whether the text is a log pattern: SEVERITY:logger: at the start."""
     return bool(re.match(r"^(WARNING|ERROR|CRITICAL):[\w.-]*:", text))
 
 
@@ -735,6 +753,7 @@ class PatternCount:
 
 
 def count_patterns(lines: Iterable[tuple[str, str, str, str, str]]) -> dict[str, PatternCount]:
+    """Count the log lines per pattern, with the pods, runs, newest time and an example line."""
     counts: dict[str, PatternCount] = {}
     for stamp, pod, container, severity, text in lines:
         pattern = log_pattern(text, severity, container)
@@ -789,6 +808,7 @@ def count_sites(patterns: dict[str, PatternCount]) -> dict[str, PatternCount]:
 
 
 def _clip(span: Span, bounds: Span) -> Span | None:
+    """The part of the span inside the bounds, or None when they do not overlap."""
     start, end = max(span[0], bounds[0]), min(span[1], bounds[1])
     return (start, end) if end > start else None
 
@@ -903,6 +923,7 @@ class Function:
 
 
 def _patterns_for(path: str) -> list[re.Pattern[str]]:
+    """The function definition patterns for the language of a path (Go, Python, else JavaScript)."""
     for extension in (".go", ".py"):
         if path.endswith(extension):
             return FUNCTION_PATTERNS[extension]
@@ -996,6 +1017,7 @@ def functions_of(path: str, text: str) -> list[Function]:
 
 
 def enclosing(functions: list[Function], line: int) -> Function | None:
+    """The innermost function that contains the line, or None."""
     inside = [f for f in functions if f.start <= line <= f.end]
     return min(inside, key=lambda f: f.end - f.start) if inside else None
 
@@ -1004,6 +1026,7 @@ class SourceTree:
     """The release's source tree (the watch build gets a copy): functions, what they call, literal search."""
 
     def __init__(self, root: Path, code: rc.Code) -> None:
+        """A source tree under root; it reads the files only when they are first needed."""
         self.root = root
         self.code = code
         self._texts: dict[str, str] | None = None
@@ -1013,9 +1036,11 @@ class SourceTree:
 
     @property
     def available(self) -> bool:
+        """Whether any source prefix exists under the root."""
         return any((self.root / prefix.rstrip("/")).exists() for prefix in self.code.source_prefixes)
 
     def texts(self) -> dict[str, str]:
+        """The text of every source file: repository path -> text (read once)."""
         if self._texts is None:
             self._texts = {}
             for prefix in self.code.source_prefixes:
@@ -1034,12 +1059,14 @@ class SourceTree:
         return self._texts
 
     def functions(self, path: str) -> list[Function]:
+        """The functions in a source file (parsed once)."""
         if path not in self._functions:
             text = self.texts().get(path)
             self._functions[path] = functions_of(path, text) if text is not None else []
         return self._functions[path]
 
     def _index(self) -> None:
+        """Index the functions by name and count the calls of each name (once)."""
         if self._callers is not None:
             return
         self._callers, self._by_name = {}, {}
@@ -1050,9 +1077,11 @@ class SourceTree:
                     self._callers[name] = self._callers.get(name, 0) + 1
 
     def enclosing(self, path: str, line: int) -> Function | None:
+        """The innermost function of a file that contains the line, or None."""
         return enclosing(self.functions(path), line)
 
     def find_text(self, needle: str) -> list[tuple[str, int]]:
+        """Where the text occurs in the source files: (path, line), at most 50."""
         out = []
         for path, text in self.texts().items():
             index = text.find(needle)
@@ -1079,6 +1108,7 @@ def origins(problem: Problem, tree: SourceTree) -> list[Function]:
     found: dict[tuple[str, str, int], Function] = {}
 
     def add(function: Function | None) -> None:
+        """Add a function to the origins found, once per path, name and start line."""
         if function is not None:
             found[(function.path, function.name, function.start)] = function
 
@@ -1176,6 +1206,7 @@ def github_text(path: str, token: str) -> str | None:
 
 
 def _words(problem: Problem) -> set[str]:
+    """The words of 5 or more characters in the fields and identifiers of a problem, lowercase."""
     text = " ".join([*problem.fields.values(), *problem.identifiers])
     return {word for word in re.split(r"[^a-z0-9]+", text.lower()) if len(word) >= 5}
 
@@ -1232,6 +1263,7 @@ def score_commit(
 
 
 def commit_changes(commits: list[dict], token: str | None, repo: str, code: rc.Code) -> dict[str, Change | None]:
+    """What each of the first 40 commits changes; None when the commit cannot be read."""
     out: dict[str, Change | None] = {}
     for commit in commits[:40]:
         if not token:
@@ -1340,6 +1372,7 @@ def check_new_errors(
     reader = DatadogReader(dd) if dd is not None else None
 
     def run(name: str, check: Callable[[], list[Problem]], needs: str | None, configured: bool) -> None:
+        """Run one check and save its status in parts; a check that cannot run is inconclusive."""
         if not configured:
             parts[name] = {"status": "not_configured", "detail": ""}
             return
@@ -1366,6 +1399,7 @@ def check_new_errors(
         problems.extend(found)
 
     def logs_check() -> list[Problem]:
+        """Find the new log errors and note the log check details."""
         found, notes = log_problems(
             logs, scope, now, env=service.prod, containers=signals.log_containers, min_spread=signals.log_min_spread
         )
@@ -1410,7 +1444,8 @@ def rollback_target(record: dict, store: rr.Store, problems: list[dict], scope: 
         return None
     holder = _read(store, oldest)
     previous = (holder or {}).get("previous") or {}
-    if not previous.get("workloads") and not previous.get("release_id") and not previous.get("commit"):
+    usable = previous.get("workloads") or previous.get("release_id") or previous.get("commit")
+    if not usable and not (holder or {}).get("previous_snapshot"):
         return None
     # "previous-of:<id>" is what ran before that release, from its own "before" snapshot: it works also
     # when that release is the first one the kit recorded (no recorded predecessor). A light service

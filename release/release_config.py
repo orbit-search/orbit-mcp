@@ -78,14 +78,17 @@ class Environment:
 
     @property
     def image_repository(self) -> str:
+        """The pull repository of the image that this environment runs."""
         return self.image.repository
 
     @property
     def main_deployment(self) -> str:
+        """The name of the first Deployment, the main one of the environment."""
         return self.deployments[0].name
 
     @property
     def deploy_trigger(self) -> str:
+        """The trigger that deploys this environment now (the first of deploy_triggers)."""
         return self.deploy_triggers[0]
 
     @property
@@ -155,15 +158,18 @@ class Code:
     deploy_prefixes: tuple[str, ...] = ("k8/", "Dockerfile", "cloudbuild.")
 
     def is_test(self, path: str) -> bool:
+        """Whether a path is a test file: it contains a test marker or its name starts with one."""
         name = path.rsplit("/", 1)[-1]
         return any(marker in path for marker in self.test_markers if "/" in marker or "." in marker) or any(
             name.startswith(marker) for marker in self.test_markers if marker.endswith("_")
         )
 
     def is_source(self, path: str) -> bool:
+        """Whether a path is runtime code: under a source prefix, with a code extension, and not a test."""
         return path.startswith(self.source_prefixes) and path.endswith(self.extensions) and not self.is_test(path)
 
     def is_deploy(self, path: str) -> bool:
+        """Whether a path is a deploy file (under a deploy prefix)."""
         return path.startswith(self.deploy_prefixes)
 
 
@@ -193,18 +199,22 @@ class Service:
 
     @property
     def prod(self) -> Environment:
+        """The prod environment."""
         return self.environments["prod"]
 
     @property
     def dev(self) -> Environment | None:
+        """The dev environment, or None when the service has none."""
         return self.environments.get("dev")
 
     @property
     def has_dev(self) -> bool:
+        """Whether the service has a dev environment."""
         return "dev" in self.environments
 
     @property
     def auto_rollback(self) -> bool:
+        """Whether a failed release rolls back by itself (the full and check_rollback tiers)."""
         return self.tier in ("full", "check_rollback")
 
     # Deploys pass the freeze and hold gate (release_gate.py); the light kinds have none.
@@ -217,14 +227,17 @@ class Service:
 
     @property
     def verify_build_tag(self) -> str:
+        """The tag of the release verify builds of this service."""
         return f"{self.name}-release-verify"
 
     @property
     def rollback_config(self) -> str:
+        """The repository path of the rollback build config of this service."""
         return f"release/services/{self.name}.rollback.yaml"
 
     @property
     def window_config(self) -> str:
+        """The repository path of the release verify build config of this service."""
         return f"release/services/{self.name}.release-verify.yaml"
 
     def kit_command(self, script: str, sub: str = "") -> str:
@@ -245,12 +258,14 @@ def kit_command(service: str, script: str, sub: str = "") -> str:
 
 
 def _require(data: dict, key: str, where: str) -> object:
+    """Return data[key]; raise ConfigError when the key is missing or empty."""
     if key not in data or data[key] in (None, ""):
         raise ConfigError(f"{where}: missing {key!r}")
     return data[key]
 
 
 def _names(value: object, where: str) -> tuple[str, ...]:
+    """A name or a non-empty list of names as a tuple; raise ConfigError on anything else."""
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
@@ -422,10 +437,12 @@ def parse_service(data: dict, path: Path | None = None) -> Service:
 
 
 def service_files() -> list[Path]:
+    """The service config files in SERVICES_DIR, sorted; empty when the directory is missing."""
     return sorted(SERVICES_DIR.glob("*.json")) if SERVICES_DIR.is_dir() else []
 
 
 def single_service() -> bool:
+    """Whether the repository has exactly one service config."""
     return len(service_files()) == 1
 
 

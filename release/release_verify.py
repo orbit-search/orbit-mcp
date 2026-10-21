@@ -99,6 +99,7 @@ class DatadogClient:
     """Scalar metric queries (POST /api/v2/query/scalar) and other reads of the Datadog API."""
 
     def __init__(self, api_key: str, app_key: str, site: str = "datadoghq.com") -> None:
+        """Keep the request headers with both keys and the API base URL of the Datadog site."""
         self._headers = {
             "DD-API-KEY": api_key,
             "DD-APPLICATION-KEY": app_key,
@@ -134,6 +135,7 @@ class DatadogClient:
 
 
 def parse_scalar(payload: dict) -> dict[str, float]:
+    """The values of a scalar query response per group (groups joined by "|", "*" without groups)."""
     columns = ((payload.get("data") or {}).get("attributes") or {}).get("columns") or []
     groups = [column for column in columns if column.get("type") == "group"]
     numbers = [column for column in columns if column.get("type") == "number"]
@@ -156,6 +158,7 @@ class MetricsUnavailable(Exception):
 
 
 def _secret_manager(clients: rr.Clients, secret: str) -> str:
+    """The latest version of a Secret Manager secret, or "" when it cannot be read."""
     try:
         return clients.runner(
             [
@@ -210,7 +213,10 @@ class Finding:
     unit: str = ""
 
     def line(self) -> str:
+        """One readable line: the metric and scope, baseline -> candidate, the samples and the limit."""
+
         def show(value: float | None) -> str:
+            """A value as a percentage for a rate, else in short form; n/a when there is none."""
             if value is None:
                 return "n/a"
             return f"{value:.2%}" if self.unit == "rate" else f"{value:,.3g}"
@@ -222,6 +228,7 @@ class Finding:
 
 
 def describe_limit(metric: rc.Metric) -> str:
+    """The limit of a metric in words (for rates, the absolute part in percentage points)."""
     if metric.unit == "rate":
         return f"> {metric.ratio:g}x baseline and > baseline + {metric.absolute * 100:g} pp"
     return f"> {metric.ratio:g}x baseline and > baseline + {metric.absolute:g} {metric.unit}"
@@ -245,10 +252,12 @@ def metric_values(
 
 
 def scope_of(metric: rc.Metric, group: str) -> str:
+    """The scope name of a metric group: the metric scope, and the group when it has one."""
     return metric.scope if group == "*" else f"{metric.scope} {group}"
 
 
 def judge(metric: rc.Metric, scope: str, base: tuple[float | None, float], cand: tuple[float | None, float]) -> Finding:
+    """Compare the window value with the baseline: exceeded, ok, or insufficient with too few samples."""
     (b_value, b_n), (c_value, c_n) = base, cand
     status = "insufficient"
     if b_value is not None and c_value is not None and b_n >= metric.min_samples and c_n >= metric.min_samples:
@@ -520,6 +529,7 @@ class KubeApi:
     """
 
     def __init__(self, clients: rr.Clients, token: Callable[[], str]) -> None:
+        """Read the cluster server and its CA from the kubectl config; keep the token source."""
         config = json.loads(
             clients.runner([*clients.kubectl_base(), "config", "view", "--raw", "--minify", "-o", "json"])
         )
@@ -534,6 +544,7 @@ class KubeApi:
         self.token = token
 
     def pod_get(self, namespace: str, pod: str, port: int, path: str) -> tuple[int, bytes]:
+        """GET a path on a pod port through the API server proxy; return (status, body)."""
         url = f"{self.server}/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy{path}"
         request = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {self.token()}", "User-Agent": USER_AGENT}
@@ -545,6 +556,7 @@ PodGet = Callable[[str, str, int, str], tuple[int, bytes]]
 
 
 def _expect_ok(status: int, body: bytes, check: dict) -> tuple[bool, str]:
+    """Judge a smoke response against the check: the status, the text it contains, and the JSON fields."""
     expected = check.get("expect_status") or [200, 204]
     expected = expected if isinstance(expected, list) else [expected]
     text = body.decode("utf-8", "replace")
@@ -565,6 +577,7 @@ def _expect_ok(status: int, body: bytes, check: dict) -> tuple[bool, str]:
 
 
 def _deployment(env: rc.Environment, name: str) -> rc.Deployment:
+    """The Deployment of the environment with this name; raise ConfigError when there is none."""
     for item in env.deployments:
         if item.name == name:
             return item
@@ -976,6 +989,7 @@ def apply_result(
     fresh: list[dict] = []
 
     def change(current: dict) -> None:
+        """Save the result, collect the fresh warnings and set the verdict (a failed verdict stays)."""
         current.setdefault("checks", {})[key] = result
         # Each warning goes to Slack once per release; one whose post failed is sent again at the next checkpoint.
         known = current.setdefault("warnings", {})
@@ -1024,6 +1038,7 @@ def post_warnings(
     names = {warning["name"] for warning in warnings}
 
     def mark(current: dict) -> None:
+        """Mark the posted warnings as posted."""
         for name, entry in (current.get("warnings") or {}).items():
             if name in names:
                 entry["posted"] = True
@@ -1049,12 +1064,14 @@ def warning_line(
 
 
 def inconclusive_parts(result: dict) -> str:
+    """A sentence that names the new-error checks that did not run; "" when all ran."""
     parts = ((result.get("new_errors") or {}).get("parts")) or {}
     names = [name for name, part in sorted(parts.items()) if part.get("status") == "inconclusive"]
     return f" New-error checks not run: {', '.join(names)}." if names else ""
 
 
 def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store) -> str:
+    """The Slack line for a check result: failed, passed, inconclusive, or the checks passed so far."""
     title = service.title
     where = store.location(rr.record_name(record["release_id"]))
     short = record["commit"][:9]
@@ -1084,6 +1101,7 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
 
 
 def print_result(result: dict) -> None:
+    """Print the result: the new errors, the checks and the metric findings."""
     print(f"== release-verify {result['phase']}: {result['result']}", flush=True)
     new_errors = result.get("new_errors") or {}
     if new_errors:
@@ -1115,10 +1133,12 @@ def print_result(result: dict) -> None:
 
 
 def _now(args: argparse.Namespace) -> datetime:
+    """The time to evaluate at: --now, else now."""
     return rr.parse_utc(args.now) if args.now else datetime.now(rr.UTC)
 
 
 def _datadog(service: rc.Service, clients: rr.Clients) -> tuple[DatadogClient | None, str | None]:
+    """A Datadog client when the service has Datadog checks; else (None, the reason when the keys are missing)."""
     signals = service.signals
     if not (service.metrics or signals.monitors or signals.error_tracking or signals.failure_series):
         return None, None
@@ -1130,6 +1150,7 @@ def _datadog(service: rc.Service, clients: rr.Clients) -> tuple[DatadogClient | 
 
 
 def _token(env: rc.Environment) -> str | None:
+    """The GitHub token of the environment, or None (with a warning) when there is none."""
     try:
         return rr.github_token(env)
     except GuardError as error:
@@ -1138,6 +1159,7 @@ def _token(env: rc.Environment) -> str | None:
 
 
 def _pod_get(clients: rr.Clients, env: rc.Environment) -> PodGet | None:
+    """The pod proxy GET when the environment has http_pod smoke checks; None when there are none or no client."""
     if not any(check.get("type") == "http_pod" for check in env.smoke):
         return None
     try:
@@ -1150,6 +1172,7 @@ def _pod_get(clients: rr.Clients, env: rc.Environment) -> PodGet | None:
 def cmd_check(
     args: argparse.Namespace, service: rc.Service, env: rc.Environment, store: rr.Store, clients: rr.Clients
 ) -> int:
+    """Run one phase of checks, save the result, and alert; return 1 when the verdict is failed."""
     record = rr.read_record(store, args.release_id)
     dd, metrics_error, logs = None, None, None
     token = _token(env)
@@ -1228,6 +1251,7 @@ def _point_verified(store: rr.Store, env: rc.Environment, record: dict, token: s
         return
 
     def change(current: dict | None) -> dict:
+        """Point at this commit unless the known commit is newer or the order is unknown."""
         known = (current or {}).get("commit")
         if known and known != commit:
             # A re-run of an older commit must never move the pointer back.
@@ -1304,6 +1328,7 @@ def finish_dev_verify(
     }
 
     def change(current: dict) -> None:
+        """Set the dev verify verdict."""
         current["verdict"] = verdict
 
     saved = rr.update_record(store, record["release_id"], change, "dev_verify", {"result": verdict["status"]})
@@ -1339,19 +1364,23 @@ def load_people(path: Path | None = None) -> dict:
 
 
 def _clip(text: str, limit: int) -> str:
+    """The text on one line, cut to limit characters with an ellipsis."""
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _slack_escape(text: str) -> str:
+    """Escape &, < and > for a Slack message."""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _pr_title(item: dict) -> str:
+    """The PR title without the (#123) PR number."""
     return rr.PR_IN_TITLE_RE.sub("", str(item.get("title", ""))).strip()
 
 
 def _mentions(people: dict, items: list[dict]) -> list[str]:
+    """Slack mentions of the authors of the items, once each; the fallback people when none is known."""
     ids: list[str] = []
     for item in items:
         slack_id = people["slack_ids"].get(item.get("author") or "")
@@ -1416,6 +1445,7 @@ def dev_verify_alert(
     reasons = "\n".join(f"• {_slack_escape(_clip(reason, 300))}" for reason in (verdict.get("reasons") or [])[:5])
 
     def change_line(item: dict) -> str:
+        """One Slack line for a change: the PR or commit link, the title and the author."""
         number = item.get("pr")
         link = f"<{repo_url}/pull/{number}|#{number}>" if number else f"`{str(item.get('sha', ''))[:9]}`"
         return f"• {link} {_slack_escape(_clip(_pr_title(item), 150))} ({item.get('author') or 'unknown'})"
@@ -1557,6 +1587,7 @@ def rollback_alert(
     automatic = build_url is not None
 
     def pr_line(item: dict) -> str:
+        """One Slack line for a PR: the link, the title and the author (a mention when known)."""
         number = item.get("pr")
         link = f"<{repo_url}/pull/{number}|#{number}>" if number else f"`{str(item.get('sha', ''))[:9]}`"
         author = item.get("author") or "unknown"
@@ -1609,6 +1640,9 @@ def rollback_alert(
                     "text": (
                         f"Record `{location}` • {service.release_branch} still has the change; automatic prod deploys "
                         f"hold after a rollback until a revert or a commit with `Fixes-release: {record['release_id']}` merges."
+                        if getattr(service, "has_gate", True)
+                        else f"Record `{location}` • {service.release_branch} still has the change; the next merge "
+                        "deploys as usual (no hold for this service)."
                     ),
                 }
             ],
@@ -1773,7 +1807,10 @@ def cmd_watch(
 
 
 def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error: str, *, final: bool) -> None:
+    """Record that a checkpoint could not run; the final one makes the verdict inconclusive."""
+
     def change(current: dict) -> None:
+        """On the final checkpoint, set the inconclusive verdict unless the record has failed already."""
         if final and (current.get("verdict") or {}).get("status") != "failed":
             current["verdict"] = {
                 "status": "inconclusive",
@@ -1805,6 +1842,8 @@ def on_failure(service: rc.Service, store: rr.Store, record: dict) -> None:
 AUTO_REQUESTER = "release-verify (automatic)"
 # How long to wait for the release's own prod build to end; the rollback build refuses while it runs.
 OWN_BUILD_WAIT_SECONDS = 1200
+# How long to wait for another build that holds the prod lock: it decides its gate, then deploys or skips.
+LOCK_HOLDER_WAIT_SECONDS = 2700
 # A claim still "starting" after this long belongs to a watcher that died before the trigger ran.
 STALE_CLAIM_SECONDS = 600
 
@@ -1842,6 +1881,7 @@ def _release_claim(store: rr.Store, release_id: str, claim_id: str) -> None:
     """Drop our claim after the trigger failed, so a later attempt (or a rerun) can start one."""
 
     def release(current: dict) -> None:
+        """Remove the rollback claim when it is still ours."""
         if (current.get("auto_rollback") or {}).get("claim") == claim_id:
             current.pop("auto_rollback")
 
@@ -1905,6 +1945,7 @@ def follow_rollback(
         return status
 
     def failed(current: dict) -> None:
+        """Mark our rollback claim as failed with the build status."""
         if (current.get("auto_rollback") or {}).get("claim") == claim_id:
             current["auto_rollback"] = {**current["auto_rollback"], "status": "failed", "result": status}
 
@@ -1952,6 +1993,7 @@ def start_rollback(
     try:
         own_build = (record.get("build") or {}).get("id")
         deadline = clock() + OWN_BUILD_WAIT_SECONDS
+        lock_deadline = clock() + LOCK_HOLDER_WAIT_SECONDS
         while True:
             current = rr.read_record(store, release_id)
             if claim_blocks(current, claim_id, datetime.now(rr.UTC)):
@@ -1963,9 +2005,15 @@ def start_rollback(
                 return None
             own_running, others = changing(service, own_build)
             lock = rr.lock_holder(store, rr.build_alive(service.prod))
-            if lock and lock.get("holder") != own_build:
-                # A deploy build past its gate: what it deploys replaces this release.
-                others = [*others, f"{lock.get('kind')} build {lock.get('holder')} (holds the prod lock)"]
+            if not others and lock and lock.get("holder") != own_build:
+                # A deploy build at or past its gate. It may still skip (freeze, hold, a newer commit),
+                # so wait for it to free the lock, then look at latest.json again.
+                if clock() > lock_deadline:
+                    others = [f"{lock.get('kind')} build {lock.get('holder')} (holds the prod lock)"]
+                else:
+                    print(f"Waiting: the {lock.get('kind')} build {lock.get('holder')} holds the prod lock", flush=True)
+                    sleep(30)
+                    continue
             if others:
                 rr.post_slack(
                     f":warning: {title} release-verify {short} failed, but {others[0]} changes prod now, so no "
@@ -1997,6 +2045,7 @@ def start_rollback(
         # Claim the rollback in the record before the trigger runs. The write is
         # conditional on the record's generation, so of two watchers only one wins.
         def claim(current: dict) -> None:
+            """Claim the automatic rollback; raise RollbackClaimed when another watcher holds it."""
             if claim_blocks(current, claim_id, datetime.now(rr.UTC)):
                 raise RollbackClaimed(release_id)
             current["auto_rollback"] = {"status": "starting", "claim": claim_id, "at": rr.utc_now()}
@@ -2026,6 +2075,7 @@ def start_rollback(
             raise
 
         def started(current: dict) -> None:
+            """Note that the rollback build started, with its build id."""
             current["auto_rollback"] = {
                 "status": "started",
                 "claim": claim_id,
@@ -2115,6 +2165,7 @@ def cmd_schedule_window(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run check, watch or schedule-window; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
 

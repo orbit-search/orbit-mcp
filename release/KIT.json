@@ -2,18 +2,18 @@
   "_doc": "Pinned copy of orbit-infrastructure/release-kit/release. Do not edit these files here; change the kit there and run release-kit/sync.py.",
   "files": {
     "README.md": "013adeed74e5a9eb147fdf2ae38c560e95e56536ad84e0fa83184133deda8175",
-    "promote_release_guard.py": "aa9326e60c96bca7f6a7facb1da98272e6ebd1f24f381bf3ebc63825868b37cd",
-    "release_config.py": "43436481a9b4cb019e5a8aff739efc75b28efb58956e4da3f809cd60abf0e09a",
-    "release_gate.py": "3e8184e689ef6947a28c00df0a09df19262af19ab704807f2b634ecb13a5aaef",
-    "release_kit.py": "8a930eeb3f1f329a499f93a01c190c2be5846e64dc64b519ac99aa2d6e52799a",
-    "release_light.py": "b319da6c14ea79a8aaed3d6763eb2eee9d62099707d7017f38b3de1cd6bf9158",
+    "promote_release_guard.py": "ce613fbce5a1cd696e384ccfe073c39e3a59bf8a613d9f018c0ae4e973d1e000",
+    "release_config.py": "0f1db9664af2d05748460e35c295b178be79b60e7027fcac9402ea763a69792e",
+    "release_gate.py": "52a8030114e04f9ea30aa376b628ddf901677d9effebafe45b31322f879017bb",
+    "release_kit.py": "58ca87785467a25766dbecebd2e9081d215b0bfc809210c898e9eecf0ad75654",
+    "release_light.py": "8292818bf0babd2897caa34c3e2f0e74a37ff251d73b792e0ffda6cd79d0112b",
     "release_people.json": "c9c693e85419c29a52c05e7a6611ac12f13efe5b5a0f119a5d65a9ce0c1bd855",
-    "release_record.py": "c35351cd42e44be10f5537fb3a6a6c43bf34ade4ed304667531ee29df2f48bb6",
-    "release_rollback.py": "057a9bef0f37437384858489bc67546d4d3b6ac891f9b02ad7bc7b8512283880",
-    "release_signals.py": "9554ac2b85ff7c8df83c664d0a9fea28a1251909e77b16f5098535442ead56d2",
-    "release_verify.py": "51def74e92857108b6a22bc7e1391044c759bd5a20f36b8aa3bed9c9cbf4671c",
-    "test_release_kit.py": "2486f78bac1d7c51575044db0117bf012fc084dd7214ba5be603c5c001ca46d3"
+    "release_record.py": "50174ded5d949361fb5fcff295267aca2a23865da35b8d4c49bdb3a99ce17207",
+    "release_rollback.py": "560057b89a3b79aa0b85d2e0ca7691dbb7fb846484a3817da5772d0af6241092",
+    "release_signals.py": "5436fa42713c611b4a7dfd2577bd6a24d2a826656a93e93d468eefc47947d2bc",
+    "release_verify.py": "1fa2df10dcc731ef0bfec8f214dfff1bf5969903ac83aa3a60a88fc8884dd14e",
+    "test_release_kit.py": "63e71dde891283b366fa40fbc1130f9f917b7206718d9f53fde34f3ccfd5b383"
   },
   "source": "orbit-search/orbit-infrastructure release-kit/release",
-  "version": "kit-a913e09e3c91"
+  "version": "kit-b560d4796929"
 }

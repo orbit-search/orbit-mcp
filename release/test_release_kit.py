@@ -843,6 +843,32 @@ class AutoRollbackTest(unittest.TestCase):
                 )
             self.assertEqual(len(commands), 1)
 
+    def test_waits_for_a_gate_that_skips(self) -> None:
+        """A deploy build holds the lock at its gate, then skips: the rollback still starts."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"RELEASE_AUTO_ROLLBACK": "1"}):
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed", "phase": "deploy"}, rollback_suggestion={"summary": "x"})
+            _save(store, record)
+            rr.acquire_lock(store, "deploy2", "deploy", lambda _: True, wait_seconds=60)
+
+            def sleep(_):
+                rr.release_lock(store, "deploy2")  # the gate said "frozen" and freed the lock
+
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True),
+                mock.patch.object(rr, "build_alive", return_value=lambda _: True),
+            ):
+                build = rv.start_rollback(
+                    SERVICE,
+                    store,
+                    record,
+                    runner=lambda _: "rb1\n",
+                    builds=lambda *_: (False, []),
+                    follow=False,
+                    sleep=sleep,
+                )
+            self.assertEqual(build, "rb1")
+
     def test_claim_blocks(self) -> None:
         now = datetime(2026, 10, 21, 12, tzinfo=rr.UTC)
         self.assertFalse(rv.claim_blocks({}, "me", now))
@@ -1527,6 +1553,92 @@ class LightTest(unittest.TestCase):
         line = rv.warning_line(service, _record(), [{"text": "x"}], rr.LocalStore(Path("/tmp")), "gcloud builds x")
         self.assertIn("roll back with gcloud builds x if", line)
         self.assertNotIn("release_rollback.py", line)
+
+    def test_cloud_run_rollback_restores_the_serving_split(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        before = {
+            # A human moved traffic back to a-1; a-2 is still the newest ready revision.
+            "cloud_run/demo-a": {"latest_ready": "a-2", "traffic": {"a-1": 100, "a-2": 0}},
+            "cloud_run/demo-b": {"latest_ready": "b-3", "traffic": {"b-2": 90, "b-3": 10}},
+        }
+        command = rl.rollback_command(service, {"previous_snapshot": before})
+        self.assertIn(
+            "update-traffic demo-a --region=us-central1 --project=orbit-search --to-revisions=a-1=100", command
+        )
+        self.assertIn("--to-revisions=b-2=90,b-3=10", command)
+
+    def test_failed_deploy_fails_the_check(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _save(store, _record(status="deploy_failed"))
+            args = mock.Mock(release_id=_record()["release_id"], wait=False, failed_marker="", force_fail=False)
+            passed = rv.Check("revisions", "passed", ["2 services checked"])
+            with (
+                mock.patch.object(rl, "deploy_checks", return_value=([passed], {})),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rl, "_fail", side_effect=lambda *a: a[2]) as failed,
+                mock.patch.object(rl, "alert"),
+            ):
+                self.assertEqual(rl.cmd_check(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+            self.assertEqual(failed.call_args[0][4][0]["name"], "deploy")
+
+    def test_first_light_release_is_a_target(self) -> None:
+        """The first recorded Cloud Run release has no previous commit, only its before-snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            first = _record(release_id="20261021T080000Z-ddddddddd", previous={}, previous_snapshot={"cloud_run/a": {}})
+            newer = _record(previous={"release_id": first["release_id"]})
+            _save(store, first, latest=False)
+            _save(store, newer)
+            problems = [{"clear": True, "suspects": [{"release_id": first["release_id"]}]}]
+            scope = {"releases": [newer["release_id"], first["release_id"]]}
+            target = rs.rollback_target(newer, store, problems, scope)
+            self.assertEqual(target["rollback_to"], f"previous-of:{first['release_id']}")
+
+    def test_a_build_during_the_checks_reruns_the_checkpoint(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(
+                times={"deploy_started": "2026-10-21T10:00:00Z", "deploy_finished": "2026-10-21T10:05:00Z"}
+            )
+            _save(store, record)
+            args = mock.Mock(release_id=record["release_id"], checkpoints="15")
+            clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", side_effect=["deploy build b2", None]),
+                mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                rl.cmd_watch(args, service, store, mock.Mock())
+            self.assertEqual(evaluate.call_count, 2)
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
+
+    def test_last_checkpoint_error_is_inconclusive(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(
+                times={"deploy_started": "2026-10-21T10:00:00Z", "deploy_finished": "2026-10-21T10:05:00Z"}
+            )
+            _save(store, record)
+            args = mock.Mock(release_id=record["release_id"], checkpoints="15")
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("logs down")),
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            ):
+                rl.cmd_watch(args, service, store, mock.Mock())
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "inconclusive")
+            self.assertIn("inconclusive", slack.call_args[0][0])
+
+    def test_light_alert_footer_has_no_hold(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        record = _record(verdict={"status": "failed", "phase": "deploy", "reasons": ["x"]}, rollback_suggestion=None)
+        _, blocks = rv.rollback_alert(service, record, None, "gs://x", command="gcloud run ...")
+        self.assertIn("no hold for this service", json.dumps(blocks))
 
 
 if __name__ == "__main__":

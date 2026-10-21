@@ -222,6 +222,7 @@ def load_config(path: Path) -> object:
 
 
 def digest(path: Path) -> str:
+    """The sha256 hex digest of a file's bytes."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -252,10 +253,12 @@ def rendered(service: object) -> dict[str, str]:
 
 
 def manifest_now() -> dict[str, str]:
+    """The digest of every kit file as it is now: file name -> sha256."""
     return {name: digest(KIT_DIR / name) for name in KIT_FILES}
 
 
 def cmd_check(_: argparse.Namespace) -> int:
+    """Check that the kit files match KIT.json, the configs load and the build files are rendered; 1 on a problem."""
     problems = []
     try:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -299,6 +302,7 @@ def cmd_check(_: argparse.Namespace) -> int:
 
 
 def cmd_render(_: argparse.Namespace) -> int:
+    """Write the generated build files of every service config."""
     root = KIT_DIR.parent
     for path in rc.service_files():
         service = load_config(path)
@@ -309,6 +313,7 @@ def cmd_render(_: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run check or render; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check", help="the copy is the shared kit, the configs load, the build files are rendered")

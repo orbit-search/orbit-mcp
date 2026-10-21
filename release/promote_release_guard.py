@@ -102,6 +102,7 @@ class Build:
 
     @classmethod
     def from_api(cls, payload: dict) -> Build:
+        """A Build from a Cloud Build API build object."""
         substitutions = payload.get("substitutions") or {}
         return cls(
             id=payload["id"],
@@ -157,9 +158,11 @@ class Build:
 
     @property
     def ongoing(self) -> bool:
+        """Whether the build is queued or still runs."""
         return self.status in ONGOING_STATUSES
 
     def describe(self) -> str:
+        """The build in one line: id, short commit, status and create time."""
         return f"{self.id} ({self.commit[:9] or 'no commit'}, {self.status}, created {self.create_time})"
 
 
@@ -230,6 +233,7 @@ def decide_dev(dev_builds: list[Build]) -> tuple[str, Build | None]:
 
 
 def _quote_filter_value(value: str) -> str:
+    """A value in double quotes for a Cloud Build filter; raise GuardError on a quote or backslash."""
     if '"' in value or "\\" in value:
         raise GuardError(f"refusing to build a Cloud Build filter from {value!r}")
     return f'"{value}"'
@@ -267,12 +271,14 @@ class GoogleApi:
     """Read-only calls to Cloud Build and Artifact Registry with the gcloud identity."""
 
     def __init__(self, project: str, region: str) -> None:
+        """Keep the project and region; the access token is fetched when first needed."""
         self.project = project
         self.region = region
         self._token = ""
         self._token_expires = 0.0
 
     def _access_token(self) -> str:
+        """The gcloud access token, fetched again after 5 minutes."""
         if not self._token or time.monotonic() >= self._token_expires:
             result = subprocess.run(
                 ["gcloud", "auth", "print-access-token"], check=True, capture_output=True, text=True, timeout=60
@@ -287,6 +293,7 @@ class GoogleApi:
         return self._access_token()
 
     def _get(self, url: str) -> dict:
+        """GET a Google API URL with the access token and decode the JSON."""
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._access_token()}"})
         return _http_json(request)
 
@@ -315,12 +322,15 @@ class GoogleApi:
         return token
 
     def _builds_url(self) -> str:
+        """The Cloud Build builds URL of the project and region."""
         return f"https://cloudbuild.googleapis.com/v1/projects/{self.project}/locations/{self.region}/builds"
 
     def get_build(self, build_id: str) -> Build:
+        """Read one build by id."""
         return Build.from_api(self._get(f"{self._builds_url()}/{urllib.parse.quote(build_id)}"))
 
     def list_builds(self, build_filter: str, max_pages: int = 5) -> list[Build]:
+        """The builds that match the filter, over at most max_pages pages; raise GuardError when there are more."""
         builds: list[Build] = []
         page_token = ""
         for _ in range(max_pages):
@@ -352,11 +362,13 @@ class GoogleApi:
         return [build for build in self.ongoing_tagged_builds(tag) if not build.rollback_dry_run]
 
     def commit_builds(self, trigger_names: tuple[str, ...], commit: str) -> list[Build]:
+        """The builds of these triggers for the commit."""
         return self.list_builds(
             f"{_trigger_names_filter(trigger_names)} AND substitutions.COMMIT_SHA={_quote_filter_value(commit)}"
         )
 
     def tag_digest(self, location: str, repository: str, package: str, tag: str) -> str:
+        """The digest that an Artifact Registry tag points at; raise GuardError when it cannot be read or is invalid."""
         url = (
             f"https://artifactregistry.googleapis.com/v1/projects/{self.project}/locations/{location}"
             f"/repositories/{repository}/packages/{urllib.parse.quote(package, safe='')}/tags/{tag}"
@@ -413,7 +425,10 @@ class Guard:
     promoting_trigger: str = ""
 
     def _can_supersede(self, own: Build) -> Callable[[Build], bool] | None:
+        """Which builds may replace this one: newer promoting builds of the merge trigger, else None (all)."""
+
         def promotes(build: Build) -> bool:
+            """Whether a build is a merge trigger build that promotes."""
             return build.trigger_name == self.promoting_trigger and build.auto_promote
 
         if not self.promoting_trigger or not promotes(own):
@@ -421,6 +436,7 @@ class Guard:
         return promotes
 
     def own_build(self) -> Build:
+        """Read this build; raise GuardError unless it has a trigger name and is for this commit."""
         own = self.api.get_build(self.build_id)
         if not own.trigger_name:
             raise GuardError(f"build {self.build_id} has no TRIGGER_NAME; run deploys only from the triggers")
@@ -446,6 +462,7 @@ class Guard:
         return related + rollbacks
 
     def wait_for_turn(self, own: Build, timeout_seconds: float) -> None:
+        """Wait until no older build or rollback runs; raise GuardError after the timeout."""
         deadline = self.clock() + timeout_seconds
         announced: set[str] = set()
         while older := self.check_superseded(own):
@@ -460,6 +477,7 @@ class Guard:
         print(f"Single flight: no newer {own.trigger_name} build and no older one running", flush=True)
 
     def check_on_branch(self, repo: str, branch: str, token: str) -> None:
+        """Raise GuardError unless the commit is reachable from the release branch."""
         if not token:
             raise GuardError(f"the GitHub read token is empty; the {branch} check cannot run")
         status = github_compare_status(repo, branch, self.commit, token)
@@ -471,6 +489,7 @@ class Guard:
         print(f"On {branch}: {self.commit} is reachable from {repo}@{branch} ({status})", flush=True)
 
     def wait_for_dev(self, own: Build, dev_triggers: tuple[str, ...], timeout_seconds: float, branch: str) -> Build:
+        """Wait for a successful dev build of the commit and return it; raise GuardError when it fails or times out."""
         dev_trigger = dev_triggers[0]
         deadline = self.clock() + timeout_seconds
         last_seen = ""
@@ -504,6 +523,7 @@ class Guard:
 
 
 def references(image: rc.Image, commit: str, digest: str) -> dict[str, str]:
+    """The image references to write: repo@digest, and repo:commit@digest for Kubernetes."""
     return {
         IMAGE_FILE: f"{image.repository}@{digest}",
         # Kubernetes ignores the tag when a digest is present; the tag keeps the commit visible.
@@ -525,12 +545,14 @@ def resolve_digest(api: GoogleApi, image: rc.Image, commit: str, dev_build: Buil
 
 
 def write_references(out_dir: Path, values: dict[str, str]) -> None:
+    """Write each image reference to its file in out_dir and print it."""
     for name, value in values.items():
         (out_dir / name).write_text(f"{value}\n", encoding="utf-8")
         print(f"{name}={value}", flush=True)
 
 
 def read_references(out_dir: Path) -> dict[str, str]:
+    """Read the image references that preflight wrote; raise GuardError when one is missing."""
     names = (IMAGE_FILE, K8S_IMAGE_FILE, DIGEST_SOURCE_FILE)
     try:
         return {name: (out_dir / name).read_text(encoding="utf-8").strip() for name in names}
@@ -541,6 +563,7 @@ def read_references(out_dir: Path) -> dict[str, str]:
 def _guard(
     args: argparse.Namespace, service: rc.Service, api: GoogleApi, env: rc.Environment, *, rollbacks: bool
 ) -> Guard:
+    """A Guard for this build and environment (rollbacks: also wait for rollback builds)."""
     return Guard(
         api=api,
         build_id=args.build_id,
@@ -553,6 +576,7 @@ def _guard(
 
 
 def run_preflight(args: argparse.Namespace, service: rc.Service, api: GoogleApi) -> None:
+    """Prod preflight: single flight, on branch, dev first, then resolve and write the image references."""
     if service.dev is None:
         raise GuardError(f"{service.name} has no dev stage; preflight is for full-tier prod builds")
     guard = _guard(args, service, api, service.prod, rollbacks=True)
@@ -567,6 +591,7 @@ def run_preflight(args: argparse.Namespace, service: rc.Service, api: GoogleApi)
 
 
 def run_still_current(args: argparse.Namespace, service: rc.Service, api: GoogleApi) -> None:
+    """Before apply: check that no older build runs and that the image references still hold."""
     guard = _guard(args, service, api, service.prod, rollbacks=True)
     own = guard.own_build()
     expected = read_references(args.out_dir)
@@ -607,11 +632,13 @@ def run_turn(args: argparse.Namespace, service: rc.Service, api: GoogleApi) -> N
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run the guard; return proceed, superseded or blocked."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--service", help="service config name (release/services/<name>.json)")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def common(sub: argparse.ArgumentParser) -> None:
+        """Add the options that every subcommand takes."""
         sub.add_argument("--build-id", required=True)
         sub.add_argument("--commit", required=True)
         sub.add_argument("--out-dir", type=Path, default=Path("/workspace"))

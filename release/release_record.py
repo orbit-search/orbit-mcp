@@ -74,6 +74,7 @@ UTC = timezone.utc  # noqa: UP017
 
 
 def utc_now() -> str:
+    """The time now in UTC as an RFC 3339 string with seconds (2026-10-21T12:00:00Z)."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -103,6 +104,7 @@ def commit_of(reference: str | None) -> str | None:
 
 
 def release_id_for(started_at: str, commit: str) -> str:
+    """The release id: the start time (YYYYMMDDTHHMMSSZ) and the first 9 characters of the commit."""
     return f"{parse_utc(started_at).strftime('%Y%m%dT%H%M%SZ')}-{commit[:9]}"
 
 
@@ -132,9 +134,11 @@ class Clients:
     kube_context: str | None = None
 
     def kubectl_base(self) -> list[str]:
+        """The kubectl command, with --context when a kube context is set."""
         return ["kubectl"] + (["--context", self.kube_context] if self.kube_context else [])
 
     def kubectl_json(self, *args: str, namespace: bool = True) -> dict:
+        """Run a kubectl get with JSON output (in the namespace unless namespace=False) and decode it."""
         command = self.kubectl_base()
         if namespace:
             command += ["-n", self.env.namespace]
@@ -167,6 +171,7 @@ def wait_rollouts(clients: Clients, names: list[str], timeout_seconds: int = 900
 
 
 def _container(spec: dict, name: str) -> dict | None:
+    """The container with this name in a pod spec, else None."""
     for container in spec.get("containers") or []:
         if container.get("name") == name:
             return container
@@ -174,6 +179,7 @@ def _container(spec: dict, name: str) -> dict | None:
 
 
 def owned_replica_sets(replica_sets: list[dict], deployment: str) -> list[dict]:
+    """The ReplicaSets that the Deployment owns."""
     return [
         rs
         for rs in replica_sets
@@ -206,6 +212,7 @@ def is_live(pod: dict) -> bool:
 
 
 def is_ready(pod: dict) -> bool:
+    """Whether a pod has the condition Ready=True."""
     return any(
         condition.get("type") == "Ready" and condition.get("status") == "True"
         for condition in pod.get("status", {}).get("conditions") or []
@@ -305,6 +312,7 @@ class GcsStore:
     """JSON objects under gs://bucket/prefix with generation preconditions."""
 
     def __init__(self, uri: str, token: Callable[[], str]) -> None:
+        """Parse a gs://bucket/prefix URI; raise RecordError when it is invalid."""
         match = re.match(r"^gs://([a-z0-9._-]+)(?:/(.*))?$", uri)
         if not match:
             raise RecordError(f"invalid store {uri!r}")
@@ -314,12 +322,15 @@ class GcsStore:
         self._token = token
 
     def _object(self, name: str) -> str:
+        """The full object name of a store name under the prefix."""
         return f"{self.prefix}/{name}" if self.prefix else name
 
     def location(self, name: str) -> str:
+        """The gs:// URI of a store object."""
         return f"gs://{self.bucket}/{self._object(name)}"
 
     def read(self, name: str) -> tuple[dict | None, int]:
+        """Return (data, generation) of an object; (None, 0) when it does not exist."""
         quoted = urllib.parse.quote(self._object(name), safe="")
         url = f"https://storage.googleapis.com/storage/v1/b/{self.bucket}/o/{quoted}?alt=json"
         headers = {"Authorization": f"Bearer {self._token()}"}
@@ -365,14 +376,17 @@ class LocalStore:
     """A directory store: tests, and dry runs that read a base store and write nowhere else."""
 
     def __init__(self, root: Path, base: GcsStore | LocalStore | None = None) -> None:
+        """A store in the root directory that reads from base what the directory does not hold."""
         self.root = root
         self.base = base
         self.uri = f"file://{root}"
 
     def location(self, name: str) -> str:
+        """The local path of a store object."""
         return str(self.root / name)
 
     def read(self, name: str) -> tuple[dict | None, int]:
+        """Return (data, generation) from the directory, else from the base store with generation 0."""
         path = self.root / name
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -383,6 +397,7 @@ class LocalStore:
         return None, 0
 
     def write(self, name: str, data: dict, if_generation: int) -> None:
+        """Write the object when its local generation is still if_generation; else raise ConcurrentWrite."""
         path = self.root / name
         current = json.loads(path.read_text(encoding="utf-8")).get("_local_generation", 1) if path.exists() else 0
         if current != if_generation:
@@ -430,6 +445,7 @@ def build_alive(env: Environment) -> Callable[[str], bool]:
     api = GoogleApi(env.project, env.region)
 
     def alive(build_id: str) -> bool:
+        """Whether the build is ongoing; True when it cannot be read."""
         try:
             return api.get_build(build_id).status in ONGOING_STATUSES
         except GuardError as error:
@@ -506,10 +522,12 @@ def release_lock(store: Store, holder: str | None) -> None:
 
 
 def record_name(release_id: str) -> str:
+    """The store object name of a release record."""
     return f"releases/{release_id}.json"
 
 
 def read_record(store: Store, release_id: str) -> dict:
+    """Read a release record by id ("latest": the one latest.json names); raise RecordError when it is missing."""
     if release_id == "latest":
         pointer, _ = store.read("latest.json")
         if not pointer:
@@ -522,6 +540,7 @@ def read_record(store: Store, release_id: str) -> dict:
 
 
 def _with_event(record: dict, event: str, details: dict | None) -> dict:
+    """Append a history event to the record and set updated_at."""
     record["history"] = [*(record.get("history") or []), {"at": utc_now(), "event": event, **(details or {})}]
     record["updated_at"] = utc_now()
     record.pop("_local_generation", None)
@@ -532,6 +551,7 @@ def create_record(store: Store, record: dict, event: str, *, replace: bool = Fal
     """Write a new record; refuse to overwrite one unless replace (backfill re-runs)."""
 
     def change(current: dict | None) -> dict:
+        """The new record with its first history event; raise RecordError when it exists and replace is off."""
         if current is not None and not replace:
             raise RecordError(f"release record {record['release_id']} already exists")
         return _with_event(json.loads(json.dumps(record)), event, None)
@@ -549,6 +569,7 @@ def update_record(
     """
 
     def change(current: dict | None) -> dict:
+        """A copy of the stored record with mutate applied and the event appended."""
         if current is None:
             raise RecordError(f"release record {release_id} does not exist")
         updated = json.loads(json.dumps(current))
@@ -559,6 +580,7 @@ def update_record(
 
 
 def point_latest(store: Store, record: dict) -> None:
+    """Point latest.json at the record."""
     update_object(
         store,
         "latest.json",
@@ -586,6 +608,7 @@ def github_token(env: Environment) -> str:
 
 
 def github_json(path: str, token: str) -> dict | list:
+    """GET a GitHub API path with the token and decode the JSON."""
     request = urllib.request.Request(
         f"https://api.github.com/{path.lstrip('/')}",
         headers={
@@ -690,6 +713,7 @@ def new_record(
     started_at: str,
     token: str | None,
 ) -> dict:
+    """A new deploying release record, with the commits since the previous release when a token is given."""
     commits, note = ([], "no GitHub token")
     if token:
         try:
@@ -719,10 +743,12 @@ def new_record(
 
 
 def build_url(env: Environment, build_id: str) -> str:
+    """The Cloud Console link of a build."""
     return f"https://console.cloud.google.com/cloud-build/builds;region={env.region}/{build_id}?project={env.project}"
 
 
 def build_info(env: Environment, build_id: str | None) -> dict:
+    """The id, link, trigger and create time of a build; an error field when the build cannot be read."""
     if not build_id:
         return {"id": None}
     info = {"id": build_id, "url": build_url(env, build_id)}
@@ -735,6 +761,7 @@ def build_info(env: Environment, build_id: str | None) -> dict:
 
 
 def _read_text(path: str | None) -> str | None:
+    """The stripped text of a file, or None when there is no path or the file is empty."""
     if not path:
         return None
     text = Path(path).read_text(encoding="utf-8").strip()
@@ -782,6 +809,7 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     after = snapshot_workloads(clients)
 
     def finish(record: dict) -> None:
+        """Write the snapshot, the status and the deploy finish time on the record."""
         record["workloads"] = after
         record["status"] = args.status
         record.setdefault("times", {})["deploy_finished"] = utc_now()
@@ -798,11 +826,13 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
 
 
 def cmd_show(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
+    """Print a release record as JSON."""
     print(json.dumps(read_record(store, args.release_id), indent=2, sort_keys=True))
     return 0
 
 
 def _revision(rs: dict) -> int:
+    """The deployment revision of a ReplicaSet; 0 when the annotation is missing or not a number."""
     try:
         return int((rs["metadata"].get("annotations") or {}).get(REVISION_ANNOTATION, "0"))
     except ValueError:
@@ -911,6 +941,7 @@ def cmd_backfill(args: argparse.Namespace, env: Environment, store: Store, clien
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Add the options that every subcommand takes."""
     parser.add_argument("--service", help="service config name (release/services/<name>.json)")
     parser.add_argument("--env", default="prod", choices=["prod", "dev"])
     parser.add_argument(
@@ -925,6 +956,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def open_from_args(args: argparse.Namespace) -> tuple[rc.Service, Environment, Store, Clients]:
+    """Load the service and open the environment, its record store and its clients from the options."""
     service = rc.load_service(getattr(args, "service", None))
     if args.env not in service.environments:
         raise rc.ConfigError(f"{service.name} has no {args.env} environment (tier {service.tier})")
@@ -935,6 +967,7 @@ def open_from_args(args: argparse.Namespace) -> tuple[rc.Service, Environment, S
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run the command; return the exit code."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
