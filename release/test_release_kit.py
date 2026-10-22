@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from datetime import datetime, timedelta
@@ -1703,6 +1704,9 @@ class RoundSixTest(unittest.TestCase):
             "quote in a comment": '/* " */ const label = "ok";\n',
             "regex-like comment end": "/* Pattern: /foo*/\n",
             "glob in a template": "const pattern = `\nassets/*\n`;\n",
+            "route in a comment": '/*\napi.get("/gone", handler);\n*/\n',
+            "route in a template": 'const example = `\napi.get("/gone", handler);\n`;\n',
+            "template expressions": "const a = `x${ {k: '}'}.k }y${g(`z${h({})}`)}`;\n",
         }
         for name, head in cases.items():
             source = head + "function after() {\n\treturn 1;\n}\n"
@@ -1711,6 +1715,10 @@ class RoundSixTest(unittest.TestCase):
             self.assertEqual(found, [("after", first, first + 2)], name)
         go = "var usage = `\nsrc/*\n`\n\nfunc after() int {\n\treturn 1\n}\n"
         self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", go)], [("after", 5, 7)])
+        windows = "var path = `C:\\`\n\nfunc after() int {\n\treturn 1\n}\n"
+        self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", windows)], [("after", 3, 5)])
+        called = "function show() {\n\treturn `${loadUser()} and ${`${formatName(x)}`}`;\n}\n"
+        self.assertTrue({"loadUser", "formatName"} <= rs.functions_of("src/t.ts", called)[0].calls)
         division = (
             'api.get("/v3/c", auth, async (ctx: MyContext) => {\n'
             "\tconst size = units.in / (scale / ratio);\n"
@@ -1718,6 +1726,15 @@ class RoundSixTest(unittest.TestCase):
             "});\n"
         )
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", division)], [(1, 4)])
+        postfix = division.replace("units.in", "index++")
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", postfix)], [(1, 4)])
+        regex = division.replace("units.in / (scale / ratio)", "++count && /[(]/.test(text)")
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", regex)], [(1, 4)])
+        # One pass: a 1 MB file takes well under a second (a copy per word made it quadratic).
+        big = "const value = item.size / 2; // note\n" * 28000
+        started = time.monotonic()
+        rs.blank_comments(big.splitlines())
+        self.assertLess(time.monotonic() - started, 2.0)
         route = functions["get_/v3/match"]
         self.assertEqual((route.start, route.end), (9, 12))
         self.assertIn("match", route.calls)

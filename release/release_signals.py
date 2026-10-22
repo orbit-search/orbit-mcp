@@ -1061,24 +1061,26 @@ REGEX_KEYWORDS = frozenset(
 )
 
 
-def _regex_allowed(last: str, word: str, after_dot: bool) -> bool:
+def _regex_allowed(last: str, word: str) -> bool:
     """Whether a "/" after the last token starts a regex literal (an expression can start there)."""
     if last == "word":
-        return word in REGEX_KEYWORDS and not after_dot
+        return word in REGEX_KEYWORDS
     return last not in (")", "]", "literal", "}")
 
 
-def blank_comments(lines: list[str]) -> list[str]:
+def blank_comments(lines: list[str], go: bool = False) -> list[str]:
     """The lines with comments blanked and string and regex contents filled, in one pass over the file.
 
     The pass knows whether it is in code, a // or /* */ comment, a string (also a template or Go raw
     string over several lines) or a regex literal, so quotes inside comments, `src/*` inside a
-    string and `/[/*]/` are read as what they are. Line numbers stay; the parse of function bodies
-    then never sees a brace in a comment or a string.
+    string and `/[/*]/` are read as what they are. The contents of a template's `${...}` stay code,
+    so their calls count. Line numbers stay; the parse of function bodies then never sees a brace in a
+    comment or a string. Go has no regex literals and no escapes in its raw strings.
     """
     text = "\n".join(lines)
     out = list(text)
     size = len(text)
+    templates: list[int] = []  # open "{" count inside each open `${` expression, innermost last
 
     def fill(begin: int, stop: int, char: str) -> None:
         """Replace text[begin:stop] with char, keeping line breaks."""
@@ -1086,7 +1088,27 @@ def blank_comments(lines: list[str]) -> list[str]:
             if out[position] != "\n":
                 out[position] = char
 
-    position, last, word, after_dot = 0, "", "", False
+    def template_text(begin: int) -> tuple[int, str]:
+        """Fill template text from begin; (where code resumes, the last token: a literal or `${`)."""
+        stop = begin
+        while stop < size:
+            if text[stop] == "\\":
+                stop += 2
+                continue
+            if text[stop] == "`":
+                fill(begin, stop, "_")
+                return stop + 1, "literal"
+            if text.startswith("${", stop):
+                fill(begin, stop, "_")
+                fill(stop, stop + 2, " ")  # blank delimiters: `VALUES ${rows}` is no one-line body
+                templates.append(0)
+                return stop + 2, "{"
+            stop += 1
+        fill(begin, size, "_")
+        return size, "literal"
+
+    # `last` is the last token: "word", "literal", or a punctuation character; `word` is the last word.
+    position, last, word = 0, "", ""
     while position < size:
         char = text[position]
         if char in " \t\r\n":
@@ -1105,10 +1127,13 @@ def blank_comments(lines: list[str]) -> list[str]:
             fill(position, stop, " ")
             position = stop
             continue
+        if char == "`" and not go:
+            position, last = template_text(position + 1)
+            continue
         if char in "\"'`":
             stop = position + 1
             while stop < size and text[stop] != char:
-                if text[stop] == "\\":
+                if text[stop] == "\\" and char != "`":
                     stop += 2
                     continue
                 if char != "`" and text[stop] == "\n":
@@ -1117,7 +1142,17 @@ def blank_comments(lines: list[str]) -> list[str]:
             fill(position + 1, stop, "_")
             position, last = min(stop + 1, size), "literal"
             continue
-        if char == "/" and _regex_allowed(last, word, after_dot):
+        if templates and char in "{}":
+            if char == "{":
+                templates[-1] += 1
+            elif templates[-1] == 0:
+                templates.pop()  # the "}" of `${`: the template text goes on
+                out[position] = " "
+                position, last = template_text(position + 1)
+                continue
+            else:
+                templates[-1] -= 1
+        if not go and char == "/" and _regex_allowed(last, word):
             stop, in_class = position + 1, False
             while stop < size and text[stop] != "\n":
                 if text[stop] == "\\":
@@ -1137,13 +1172,18 @@ def blank_comments(lines: list[str]) -> list[str]:
                     stop += 1
                 position, last = stop, "literal"
                 continue
+        if pair in ("++", "--"):
+            # Postfix (`index++`) ends an expression, so a "/" after it divides; prefix (`++index`) does not.
+            postfix = last in (")", "]", "literal") or (last == "word" and word not in REGEX_KEYWORDS)
+            position, last = position + 2, "literal" if postfix else char
+            continue
         if char.isalnum() or char in "_$":
             stop = position
             while stop < size and (text[stop].isalnum() or text[stop] in "_$"):
                 stop += 1
-            before = text[:position].rstrip()
-            word, after_dot, last = text[position:stop], before.endswith("."), "word"
-            position = stop
+            # A name after a dot (`units.in`) is a property, never a keyword.
+            word = "" if last == "." else text[position:stop]
+            position, last = stop, "word"
             continue
         last = char
         position += 1
@@ -1244,12 +1284,13 @@ def functions_of(path: str, text: str) -> list[Function]:
     python = path.endswith(".py")
     raw = text.splitlines()
     # Ranges and calls come from the blanked lines (same length); route paths from the original text.
-    lines = raw if python else blank_comments(raw)
+    lines = raw if python else blank_comments(raw, go=path.endswith(".go"))
     patterns = _patterns_for(path)
     out = []
     for index, line in enumerate(lines, start=1):
         route = None if python or path.endswith(".go") else ROUTE_RE.match(raw[index - 1])
-        if route:
+        # A registration inside a comment or a string is blanked: it is no route.
+        if route and line[: route.start(3)] == raw[index - 1][: route.start(3)]:
             end, inline = _route_end(lines, index)
             body = "\n".join(lines[index - 1 : end])
             names = set(CALL_RE.findall(body))
