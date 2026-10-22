@@ -192,7 +192,10 @@ def release_scope(store: rr.Store, record: dict, now: datetime) -> Scope:
         previous = _read(store, (chain[-1].get("previous") or {}).get("release_id"))
         if not previous or previous.get("kind") != "promote" or previous.get("status") != "deployed":
             break
-        if (previous.get("verdict") or {}).get("status") != "pending":
+        verdict = previous.get("verdict") or {}
+        # A release whose last checkpoint could not run is inconclusive but unchecked: the next
+        # watch judges it again, so its commits stay suspects.
+        if verdict.get("status") != "pending" and not verdict.get("unchecked"):
             break  # judged: its verdict stands
         if newest_start - _times(previous)[0] > BASELINE:
             break

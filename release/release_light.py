@@ -725,7 +725,13 @@ def finish_inconclusive(service: LightService, store: rr.Store, record: dict, ke
     def done(current: dict) -> None:
         """Set the inconclusive verdict, unless the record has failed already."""
         if (current.get("verdict") or {}).get("status") != "failed":
-            current["verdict"] = {"status": "inconclusive", "at": rr.utc_now(), "phase": key, "reasons": [why[:300]]}
+            current["verdict"] = {
+                "status": "inconclusive",
+                "unchecked": True,
+                "at": rr.utc_now(),
+                "phase": key,
+                "reasons": [why[:300]],
+            }
 
     try:
         rr.update_record(store, record["release_id"], done, "verify_final", {"status": "inconclusive"})

@@ -1631,8 +1631,18 @@ class LightTest(unittest.TestCase):
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
             ):
                 rl.cmd_watch(args, service, store, mock.Mock())
-            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "inconclusive")
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("inconclusive", True))
             self.assertIn("inconclusive", slack.call_args[0][0])
+            # The next release's watch judges the unchecked release with it.
+            newer = _record(
+                release_id="20261021T120000Z-ccccccccc",
+                times={"deploy_started": "2026-10-21T12:00:00Z", "deploy_finished": "2026-10-21T12:05:00Z"},
+                previous={"release_id": record["release_id"]},
+            )
+            _save(store, newer)
+            scope = rs.release_scope(store, newer, datetime(2026, 10, 21, 12, 30, tzinfo=rr.UTC))
+            self.assertEqual([r["release_id"] for r in scope.releases], [newer["release_id"], record["release_id"]])
 
     def test_light_alert_footer_has_no_hold(self) -> None:
         service = rl.parse_light(light_data("cloud_run"))
