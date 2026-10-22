@@ -1051,8 +1051,47 @@ SIGNATURE_LINES = 15
 
 
 def _code_only(line: str) -> str:
-    """A line without string literals and comments (// and /* */ on the line), for brace counting."""
-    return BLOCK_COMMENT_RE.sub(" ", LINE_COMMENT_RE.sub("", STRING_RE.sub('""', line)))
+    """A line without string literals, regex literals and comments, for brace counting."""
+    return BLOCK_COMMENT_RE.sub(" ", LINE_COMMENT_RE.sub("", _without_regex(STRING_RE.sub('""', line))))
+
+
+def _mask(line: str) -> str:
+    """The line with the contents of string and regex literals replaced, same length (for finding comments)."""
+    masked = STRING_RE.sub(lambda match: match.group(0)[0] + "_" * (len(match.group(0)) - 2) + match.group(0)[-1], line)
+
+    def regex(match: re.Match[str]) -> str:
+        """Keep what precedes the literal; fill the literal itself."""
+        head = match.group(1) + match.group(2)
+        return head + "/" + "_" * (len(match.group(0)) - len(head) - 1)
+
+    return REGEX_LITERAL_RE.sub(regex, masked)
+
+
+def blank_comments(lines: list[str]) -> list[str]:
+    """The lines with every // and /* */ comment blanked, also block comments that span lines.
+
+    Strings and regex literals are masked first, so `"a/*b"` and `/[/*]/` are no comments.
+    Line numbers stay; the parse of function bodies then never sees a brace in a comment.
+    """
+    out, in_block = [], False
+    for line in lines:
+        masked, chars, position = _mask(line), list(line), 0
+        while position < len(line):
+            if in_block:
+                end = masked.find("*/", position)
+                stop = len(line) if end == -1 else end + 2
+                chars[position:stop] = " " * (stop - position)
+                position, in_block = stop, end == -1
+                continue
+            line_comment, block = masked.find("//", position), masked.find("/*", position)
+            if line_comment != -1 and (block == -1 or line_comment < block):
+                chars[line_comment:] = " " * (len(line) - line_comment)
+                break
+            if block == -1:
+                break
+            position, in_block = block, True
+        out.append("".join(chars))
+    return out
 
 
 def _brace_end(lines: list[str], start: int) -> int:
@@ -1146,9 +1185,9 @@ def functions_of(path: str, text: str) -> list[Function]:
     bodies end where the indentation returns to the def's level. A declaration
     between two functions belongs to neither.
     """
-    lines = text.splitlines()
-    patterns = _patterns_for(path)
     python = path.endswith(".py")
+    lines = text.splitlines() if python else blank_comments(text.splitlines())
+    patterns = _patterns_for(path)
     out = []
     for index, line in enumerate(lines, start=1):
         route = None if python or path.endswith(".go") else ROUTE_RE.match(line)

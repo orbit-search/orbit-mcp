@@ -1682,6 +1682,22 @@ class RoundSixTest(unittest.TestCase):
         ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/more.ts", more)}
         self.assertEqual(ranges["get_/v3/a"], (1, 6))
         self.assertEqual(ranges["commented"], (7, 11))
+        tricky = (
+            'api.get("/v3/b", auth, async (ctx: MyContext) => {\n'  # 1
+            "\tconst ok = /[/*]/.test(ctx.query.q);\n"
+            '\tconst path = "a/*b";\n'
+            "\t/* example {\n"
+            "\t   still a comment } */\n"
+            "\treturn ok;\n"
+            "});\n"  # 7
+            "function after() {\n"  # 8
+            "\t/* opens {\n"
+            "\t} closes */\n"
+            "\treturn 1;\n"
+            "}\n"  # 12
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/tricky.ts", tricky)}
+        self.assertEqual((ranges["get_/v3/b"], ranges["after"]), ((1, 7), (8, 12)))
         route = functions["get_/v3/match"]
         self.assertEqual((route.start, route.end), (9, 12))
         self.assertIn("match", route.calls)
