@@ -198,7 +198,7 @@ Phone and address signals always disable candidate discovery, even if the caller
 
 `profile_depth` sets the lightest profile each result is built to: `quick`
 (level 1), `partial` (level 2) or `full` (level 3). A quick search with only a phone,
-email or address returns every owner of that signal as a level 1 profile.
+email or address returns up to `limit` owners of that signal as level 1 profiles.
 
 Quick profile from a phone number:
 
