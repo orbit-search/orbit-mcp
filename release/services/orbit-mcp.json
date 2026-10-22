@@ -1,0 +1,26 @@
+{
+  "_doc": "Release config of orbit-mcp for the shared release kit (release/README.md): the Cloud Run services, the deploy trigger, the smoke checks and the release check. A merge deploys; a failed release posts an alert with the rollback command. See docs/RELEASE_PIPELINE.md.",
+  "service": "orbit-mcp",
+  "title": "orbit-mcp",
+  "kind": "cloud_run",
+  "tier": "check_only",
+  "github_repo": "orbit-search/orbit-mcp",
+  "connected_repository": "orbit-search-orbit-mcp",
+  "release_branch": "main",
+  "docs": "docs/RELEASE_PIPELINE.md",
+  "cloud_run_services": ["orbit-mcp", "orbit-profile-mcp"],
+  "deploy_triggers": ["orbit-mcp-deploy"],
+  "smoke": [
+    {"type": "http_public", "name": "orbit-mcp health", "url": "https://orbit-mcp-k7iyipqilq-uc.a.run.app/health", "expect_status": [200], "expect_json": {"status": "ok"}},
+    {"type": "http_public", "name": "orbit-profile-mcp health", "url": "https://orbit-profile-mcp-k7iyipqilq-uc.a.run.app/health", "expect_status": [200], "expect_json": {"status": "ok"}}
+  ],
+  "verify": {
+    "checkpoints": [15, 60],
+    "log_filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=(\"orbit-mcp\" OR \"orbit-profile-mcp\") AND severity>=WARNING",
+    "log_min_spread": 1
+  },
+  "code": {
+    "source_prefixes": ["packages/mcp-server/src/", "packages/profile-server/src/"],
+    "extensions": [".ts", ".js"]
+  }
+}
