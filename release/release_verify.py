@@ -832,6 +832,9 @@ def evaluate(
     snapshot = rr.snapshot_workloads(clients)
     checks.insert(0, check_images(record, snapshot))
     if phase == "deploy":
+        if record.get("status") == "deploy_failed":
+            # The old pods can pass every check while the release never fully deployed.
+            checks.append(Check("deploy", "failed", ["the deploy step failed (status deploy_failed)"]))
         checks += smoke_checks(clients, snapshot, pod_get=pod_get, get=get)
         if force_fail:
             checks.append(Check("forced_failure", "failed", [f"forced failure (test run): {force_fail}"]))
@@ -994,10 +997,16 @@ def apply_result(
                 "images": previous.get("images"),
                 "rollback_to": f"previous-of:{chain[-1]}",
             }
+        # The commits of the releases this rollback removes: the hold must name only those PRs.
+        removed = chain[:1]
+        rollback_to = str((target or {}).get("rollback_to") or "")
+        if rollback_to.startswith("previous-of:"):
+            culprit = rollback_to.split(":", 1)[1]
+            removed = chain[: chain.index(culprit) + 1] if culprit in chain else chain
         commits = None
-        if len(chain) > 1:
+        if len(removed) > 1:
             commits = []
-            for release_id in reversed(chain):
+            for release_id in reversed(removed):
                 commits += (rs._read(store, release_id) or {}).get("commits") or []
         suggestion = rollback_suggestion(service, record, result["regressions"], key, token, target, commits=commits)
     fresh: list[dict] = []
@@ -1031,8 +1040,11 @@ def apply_result(
                 verdict = {"status": status, "at": result["at"], "phase": key, "judged": result["judged"]}
                 if reason:
                     verdict["reason"] = reason
-                if status == "inconclusive":
-                    # Unchecked: the next release's watch judges this release again (release_signals.release_scope).
+                parts = ((result.get("new_errors") or {}).get("parts")) or {}
+                unread = any(part.get("status") == "inconclusive" for part in parts.values())
+                if status == "inconclusive" or unread:
+                    # Unchecked: the next release's watch judges this release again (release_signals.release_scope),
+                    # also a passed one whose new-error source could not run.
                     verdict["unchecked"] = True
                 if current.get("warnings"):
                     verdict["warnings"] = len(current["warnings"])
@@ -1831,6 +1843,7 @@ def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error:
         if final and (current.get("verdict") or {}).get("status") != "failed":
             current["verdict"] = {
                 "status": "inconclusive",
+                "unchecked": True,
                 "at": rr.utc_now(),
                 "phase": f"window_{minutes}m",
                 "reason": f"check could not run: {error[:300]}",

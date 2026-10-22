@@ -64,6 +64,10 @@ The repo owns only `release/services/<service>.json` and the build files that
 
 - `triggers`: the first name of each list is the trigger; later names are retired
   triggers whose builds still count for single flight.
+- `deployments[].rollback_env`: env values a rollback sets together with the image,
+  in one patch. For a value that the deploy turns on only after its rollout
+  (orbit-chatgpt-app: `OAUTH_SESSION_ISSUANCE_ENABLED`), so a rollback after a
+  deploy that failed before that step does not leave it off.
 - Smoke check types: `http_pod` (a GET on every live pod through the Kubernetes API
   pod proxy: `port`, `path`, `expect_status`, `contains`, `expect_json`, `all_pods`),
   `http_public` (`url`, same expectations), `pods_ready` (`deployment`, `min_share`).

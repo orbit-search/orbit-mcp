@@ -42,6 +42,10 @@ class Deployment:
     name: str
     container: str
     selector: str
+    # Env values a rollback sets together with the image, in one patch (one rollout). For a value
+    # that the deploy turns on only after its rollout, e.g. orbit-chatgpt-app's
+    # OAUTH_SESSION_ISSUANCE_ENABLED: the release rolled back to ran with it on.
+    rollback_env: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -341,6 +345,9 @@ def parse_service(data: dict, path: Path | None = None) -> Service:
                 name=str(_require(item, "name", env_where)),
                 container=str(_require(item, "container", env_where)),
                 selector=str(_require(item, "selector", env_where)),
+                rollback_env=tuple(
+                    sorted((str(key), str(value)) for key, value in (item.get("rollback_env") or {}).items())
+                ),
             )
             for item in env_data.get("deployments") or []
         )

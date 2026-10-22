@@ -898,6 +898,11 @@ KEYWORDS = frozenset(
     "with yield import export from super this self print len make append panic range select case go defer "
     "require console log error warn info debug assert throw raise".split()
 )
+# An arrow function whose parameters continue on the next lines; it counts only when "=>" follows
+# the parameters (`const data = (` that opens a parenthesized expression is no function).
+MULTILINE_ARROW_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\([^)]*$"
+)
 FUNCTION_PATTERNS = {
     ".go": [re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*[\[(]")],
     ".py": [re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")],
@@ -917,8 +922,7 @@ FUNCTION_PATTERNS = {
             r"^\s+(?:(?:public|private|protected|static|async|readonly|override)\s+)+"
             r"([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\([^)]*$"
         ),
-        # An arrow function whose parameters continue on the next lines.
-        re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\([^)]*$"),
+        MULTILINE_ARROW_RE,
     ],
 }
 # An Express or koa-router route registration with an inline handler:
@@ -933,13 +937,45 @@ def route_name(method: str, path: str) -> str:
     return f"{'delete' if method == 'del' else method.lower()}_{path.lower()}"
 
 
-def _route_end(lines: list[str], start: int) -> int:
-    """The last line (1-based) of an inline route handler: the brace after the arrow, to its close."""
+# A route registration with an inline handler can be long; it ends at its closing parenthesis.
+ROUTE_LINES = 3000
+IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+
+
+def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
+    """(the last line (1-based) of a route registration, whether it holds an inline handler).
+
+    The registration ends where the parenthesis of `x.get(` closes; a named handler
+    (`api.get("/a", handlers.a);`) ends on its own line and takes in no later route.
+    """
+    nesting, inline = 0, False
+    for index in range(start - 1, min(len(lines), start - 1 + ROUTE_LINES)):
+        code = _code_only(lines[index])
+        inline = inline or "=>" in code or re.search(r"\bfunction\b", code) is not None
+        for char in code:
+            if char in "([":
+                nesting += 1
+            elif char in ")]":
+                nesting -= 1
+                if nesting == 0:
+                    return index + 1, inline
+    return start, inline
+
+
+def _arrow_follows(lines: list[str], start: int) -> bool:
+    """Whether "=>" follows the parameters that open on line `start` (a multi-line arrow function)."""
+    nesting = 0
     for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
-        code = _code_only(lines[index]).rstrip()
-        if code.endswith("{"):
-            return _close_of(lines, index, code.rindex("{"))
-    return start
+        code = _code_only(lines[index])
+        for column, char in enumerate(code):
+            if char == "(":
+                nesting += 1
+            elif char == ")":
+                nesting -= 1
+                if nesting == 0:
+                    rest = code[column + 1 :] + " " + (_code_only(lines[index + 1]) if index + 1 < len(lines) else "")
+                    return "=>" in rest
+    return False
 
 
 CALL_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
@@ -984,16 +1020,48 @@ def _brace_end(lines: list[str], start: int) -> int:
     (`func f() int { return 1 }`) or ends a statement (`const f = (x) => x;`) ends there.
     """
     nesting = 0
-    for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
+    index = start - 1
+    while index < min(len(lines), start - 1 + SIGNATURE_LINES):
         code = _code_only(lines[index]).rstrip()
         nesting += sum(code.count(char) for char in "([") - sum(code.count(char) for char in ")]")
         if nesting > 0:
+            index += 1
+            continue
+        if TYPE_OPEN_RE.search(code):
+            # `): {` opens an object return type, not the body: the body follows that type.
+            line, column = _close_at(lines, index, code.rindex("{"))
+            rest = _code_only(lines[line])[column + 1 :].rstrip()
+            if rest.endswith("{"):
+                return _close_of(lines, line, column + 1 + rest.rindex("{"))
+            if rest.endswith(";"):
+                return line + 1
+            index = line + 1
             continue
         if code.endswith("{"):
             return _close_of(lines, index, code.rindex("{"))
         if code.endswith(";") or (code.endswith("}") and code.count("{") and code.count("{") == code.count("}")):
             return index + 1
+        index += 1
     return start
+
+
+# The end of a signature line that opens an object return type: `): {`, `): Promise<{`.
+TYPE_OPEN_RE = re.compile(r"\)\s*:\s*(?:[\w.]+<)?\{$")
+
+
+def _close_at(lines: list[str], index: int, column: int) -> tuple[int, int]:
+    """(line index, column) of the "}" that closes the "{" at lines[index][column] (code only)."""
+    depth = 0
+    for number in range(index, len(lines)):
+        code = _code_only(lines[number])
+        for position in range(column if number == index else 0, len(code)):
+            if code[position] == "{":
+                depth += 1
+            elif code[position] == "}":
+                depth -= 1
+                if depth == 0:
+                    return number, position
+    return len(lines) - 1, 0
 
 
 def _close_of(lines: list[str], index: int, column: int) -> int:
@@ -1039,13 +1107,19 @@ def functions_of(path: str, text: str) -> list[Function]:
     for index, line in enumerate(lines, start=1):
         route = None if python or path.endswith(".go") else ROUTE_RE.match(line)
         if route:
-            end = _route_end(lines, index)
+            end, inline = _route_end(lines, index)
             body = "\n".join(lines[index - 1 : end])
-            calls = frozenset(name for name in CALL_RE.findall(body) if name not in KEYWORDS and len(name) >= 4)
+            names = set(CALL_RE.findall(body))
+            if not inline:
+                # A named handler: the names it passes (`handlers.getWatcher`) are what it calls.
+                names |= set(IDENTIFIER_RE.findall(_code_only(body[route.end() :])))
+            calls = frozenset(name for name in names if name not in KEYWORDS and len(name) >= 4)
             out.append(Function(path, route_name(route.group(1), route.group(3)), index, end, calls))
             continue
         for pattern in patterns:
             match = pattern.match(line)
+            if match and pattern is MULTILINE_ARROW_RE and not _arrow_follows(lines, index):
+                continue
             if match and match.group(1) not in KEYWORDS:
                 end = _indent_end(lines, index) if python else _brace_end(lines, index)
                 body = "\n".join(lines[index - 1 : end])

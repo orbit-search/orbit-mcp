@@ -251,14 +251,35 @@ def rolled_back_images(env: rc.Environment, latest: dict, live: dict[str, dict])
     return workloads, {rr.IMAGE_ROLE: image}
 
 
+def rollback_env(env: rc.Environment, name: str) -> tuple[tuple[str, str], ...]:
+    """The env values a rollback sets on this Deployment with its image (the service config's rollback_env)."""
+    return next((item.rollback_env for item in env.deployments if item.name == name), ())
+
+
 def apply_plan(plan: Plan, clients: rr.Clients) -> list[str]:
-    """Set every target image, then wait for the rollouts; return the failures."""
+    """Set every target image (with the Deployment's rollback_env in the same patch), then wait for the rollouts.
+
+    A Deployment with rollback_env is patched on every attempt, also when its image is already
+    the target (a retry after a patch that set the image but not the env); returns the failures.
+    """
     failures: list[str] = []
-    for step in plan.changes():
-        command = [*clients.kubectl_base(), "-n", clients.env.namespace, "set", "image"]
+    changing = {step.name for step in plan.changes()}
+    for step in plan.steps:
+        values = rollback_env(clients.env, step.name)
+        if not step.target or (step.name not in changing and not values):
+            continue
+        base = [*clients.kubectl_base(), "-n", clients.env.namespace]
         try:
-            clients.runner([*command, f"deployment/{step.name}", f"{step.container}={step.target}"])
-            print(f"set deployment/{step.name} {step.container}={step.target}", flush=True)
+            if values:
+                container = {"name": step.container, "image": step.target}
+                container["env"] = [{"name": key, "value": value} for key, value in values]
+                patch = json.dumps({"spec": {"template": {"spec": {"containers": [container]}}}})
+                clients.runner([*base, "patch", f"deployment/{step.name}", "--type=strategic", "-p", patch])
+                shown = ", ".join(f"{key}={value}" for key, value in values)
+                print(f"patched deployment/{step.name} {step.container}={step.target} ({shown})", flush=True)
+            else:
+                clients.runner([*base, "set", "image", f"deployment/{step.name}", f"{step.container}={step.target}"])
+                print(f"set deployment/{step.name} {step.container}={step.target}", flush=True)
         except rr.RecordError as error:
             failures.append(f"deployment/{step.name}: {error}")
     # Every targeted Deployment, also one this attempt did not change (a retry).

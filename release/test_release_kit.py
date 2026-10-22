@@ -1502,6 +1502,155 @@ class RouteTraceTest(unittest.TestCase):
             self.assertEqual((quiet["verdict"]["status"], quiet["verdict"]["unchecked"]), ("inconclusive", True))
 
 
+NAMED_ROUTES = """\
+export function registerRoutes(api: Router) {
+\tapi.get("/v3/result/:id", auth, answerClayResult);
+\tapi.get("/v3/contacts", auth, async (ctx: MyContext) => {
+\t\tctx.body = await DeveloperClayPersonService.getContacts(ctx);
+\t});
+}
+"""
+SHAPES = """\
+export class Builder {
+\tprivate build(
+\t\tinput: Input,
+\t): {
+\t\tid: string;
+\t\tvalue: number;
+\t} {
+\t\treturn compute(input);
+\t}
+}
+export const fetchRows = async (
+\tid: string,
+): Promise<{ rows: Row[] }> => {
+\treturn load(id);
+};
+export async function fetchSenditProfile(id: string, options = {}) {
+\tconst data = (
+\t\tawait request(id)
+\t).body;
+\treturn data;
+}
+"""
+
+
+class RoundSixTest(unittest.TestCase):
+    """Greptile round 6: route ends, return types, expressions, the hold, unchecked, deploy_failed, rollback_env."""
+
+    def test_a_named_handler_route_ends_on_its_line(self) -> None:
+        functions = {f.name: f for f in rs.functions_of("src/routes.ts", NAMED_ROUTES)}
+        result = functions["get_/v3/result/:id"]
+        self.assertEqual((result.start, result.end), (2, 2))
+        self.assertIn("answerClayResult", result.calls)
+        self.assertNotIn("getContacts", result.calls)
+        self.assertEqual((functions["get_/v3/contacts"].start, functions["get_/v3/contacts"].end), (3, 5))
+
+    def test_object_return_types_and_expressions(self) -> None:
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/shapes.ts", SHAPES)}
+        self.assertEqual(ranges["build"], (2, 9))
+        self.assertEqual(ranges["fetchRows"], (11, 15))
+        self.assertEqual(ranges["fetchSenditProfile"], (16, 21))
+        self.assertNotIn("data", ranges)
+
+    def test_the_hold_names_only_the_releases_the_rollback_removes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            older = _record(
+                release_id="20261021T080000Z-ddddddddd",
+                commit="d" * 40,
+                previous={"commit": "e" * 40},
+                commits=[{"sha": "d" * 40, "title": "Old change (#3)", "pr": 3, "author": "a"}],
+            )
+            newer = _record(previous={"release_id": older["release_id"], "commit": "d" * 40})
+            _save(store, older, latest=False)
+            _save(store, newer)
+            suspect = {
+                "sha": COMMIT,
+                "pr": 12,
+                "title": "Change the parser (#12)",
+                "score": 6,
+                "reason": "x",
+                "release_id": newer["release_id"],
+            }
+            result = VerdictTest._result(
+                None,
+                result="failed",
+                regressions=[{"kind": "new_error", "name": "log:x", "text": "x", "suspects": [suspect]}],
+                new_errors={
+                    "problems": [{"clear": True, "suspects": [suspect]}],
+                    "scope": {"releases": [newer["release_id"], older["release_id"]]},
+                },
+                chain=[newer["release_id"], older["release_id"]],
+            )
+            with mock.patch.object(rr, "github_json", lambda path, token: {"files": [{"filename": "src/a.ts"}]}):
+                saved = rv.apply_result(SERVICE, store, newer, result, final=False, token="t")
+            prs = {item.get("pr") for item in saved["rollback_suggestion"]["suspected_prs"]}
+            self.assertEqual(prs, {12})  # the older release stays deployed: its PR is not held
+
+    def test_unchecked_when_a_source_could_not_run_or_a_checkpoint_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            result = VerdictTest._result(
+                None, new_errors={"parts": {"logs": {"status": "inconclusive"}}, "problems": []}
+            )
+            saved = rv.apply_result(SERVICE, store, record, result, final=True, token=None)
+            self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("passed", True))
+            other = _record(release_id="20261021T120000Z-fffffffff")
+            _save(store, other)
+            rv._record_checkpoint_error(store, other, 60, "boom", final=True)
+            self.assertTrue(rr.read_record(store, other["release_id"])["verdict"]["unchecked"])
+
+    def test_a_failed_deploy_fails_the_deploy_checks(self) -> None:
+        record = _record(status="deploy_failed")
+        clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+        with mock.patch.object(rv, "smoke_checks", return_value=[]):
+            result = rv.evaluate(SERVICE, record, phase="deploy", clients=clients, dd=None, now=WINDOW[1])
+        self.assertEqual(result["result"], "failed")
+        self.assertIn("deploy", [item["name"] for item in result["regressions"]])
+
+    def test_rollback_env_is_patched_with_the_image(self) -> None:
+        data = service_data()
+        data["environments"]["prod"]["deployments"][0]["rollback_env"] = {"OAUTH_SESSION_ISSUANCE_ENABLED": "true"}
+        service = rc.parse_service(data)
+
+        class PatchingCluster(FakeCluster):
+            def __call__(self, command: list[str]) -> str:
+                if "patch" in command:
+                    self.commands.append(command)
+                    body = json.loads(command[command.index("-p") + 1])
+                    container = body["spec"]["template"]["spec"]["containers"][0]
+                    name = command[command.index("patch") + 1].split("/", 1)[1]
+                    self.deployments[name]["spec"]["template"]["spec"]["containers"][0]["image"] = container["image"]
+                    for pod in self.pods:
+                        if pod["metadata"]["name"].startswith(f"{name}-"):
+                            pod["status"]["containerStatuses"][0]["imageID"] = (
+                                f"{REPO}@{rr.digest_of(container['image'])}"
+                            )
+                    return ""
+                return super().__call__(command)
+
+        cluster = PatchingCluster(env=service.prod, digest=NEW)
+        clients = rr.Clients(env=service.prod, runner=cluster)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _save(store, _record())
+            latest, target = rb.resolve_target(store, "previous")
+            plan = rb.build_plan(service, latest, target, rr.snapshot_workloads(clients), None)
+            with mock.patch.object(rr, "wait_rollouts", return_value=[]):
+                self.assertEqual(rb.apply_plan(plan, clients), [])
+        patches = [c for c in cluster.commands if "patch" in c]
+        self.assertEqual(len(patches), 1)
+        body = json.loads(patches[0][patches[0].index("-p") + 1])["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(body["env"], [{"name": "OAUTH_SESSION_ISSUANCE_ENABLED", "value": "true"}])
+        self.assertTrue(body["image"].endswith(OLD))
+        self.assertTrue(
+            any(c[c.index("-n") + 2 : c.index("-n") + 4] == ["set", "image"] for c in cluster.commands if "-n" in c)
+        )
+
+
 class LightTest(unittest.TestCase):
     def test_parse(self) -> None:
         run = rl.parse_light(light_data("cloud_run"))
