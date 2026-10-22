@@ -944,7 +944,7 @@ IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
 # A JavaScript regex literal where an expression starts: after a punctuator, `=>`, or a keyword such
 # as `return` (`values.filter((v) => /\(/.test(v))`, `return /\(/.test(q);`).
 REGEX_LITERAL_RE = re.compile(
-    r"(^|[=(,:\[!&|?{};]|=>|\b(?:return|typeof|case|void|throw|yield|await|in|of|delete)\b)"
+    r"(^|[=(,:\[!&|?{};]|=>|(?<![.\w$])(?:return|typeof|case|void|throw|yield|await|in|of|delete)\b)"
     r"(\s*)/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+/[a-z]*"
 )
 
@@ -1055,43 +1055,99 @@ def _code_only(line: str) -> str:
     return BLOCK_COMMENT_RE.sub(" ", LINE_COMMENT_RE.sub("", _without_regex(STRING_RE.sub('""', line))))
 
 
-def _mask(line: str) -> str:
-    """The line with the contents of string and regex literals replaced, same length (for finding comments)."""
-    masked = STRING_RE.sub(lambda match: match.group(0)[0] + "_" * (len(match.group(0)) - 2) + match.group(0)[-1], line)
+# Words after which a "/" starts a regex literal, not a division.
+REGEX_KEYWORDS = frozenset(
+    {"return", "typeof", "case", "void", "throw", "yield", "await", "in", "of", "delete", "instanceof", "new", "else"}
+)
 
-    def regex(match: re.Match[str]) -> str:
-        """Keep what precedes the literal; fill the literal itself."""
-        head = match.group(1) + match.group(2)
-        return head + "/" + "_" * (len(match.group(0)) - len(head) - 1)
 
-    return REGEX_LITERAL_RE.sub(regex, masked)
+def _regex_allowed(last: str, word: str, after_dot: bool) -> bool:
+    """Whether a "/" after the last token starts a regex literal (an expression can start there)."""
+    if last == "word":
+        return word in REGEX_KEYWORDS and not after_dot
+    return last not in (")", "]", "literal", "}")
 
 
 def blank_comments(lines: list[str]) -> list[str]:
-    """The lines with every // and /* */ comment blanked, also block comments that span lines.
+    """The lines with comments blanked and string and regex contents filled, in one pass over the file.
 
-    Strings and regex literals are masked first, so `"a/*b"` and `/[/*]/` are no comments.
-    Line numbers stay; the parse of function bodies then never sees a brace in a comment.
+    The pass knows whether it is in code, a // or /* */ comment, a string (also a template or Go raw
+    string over several lines) or a regex literal, so quotes inside comments, `src/*` inside a
+    string and `/[/*]/` are read as what they are. Line numbers stay; the parse of function bodies
+    then never sees a brace in a comment or a string.
     """
-    out, in_block = [], False
-    for line in lines:
-        masked, chars, position = _mask(line), list(line), 0
-        while position < len(line):
-            if in_block:
-                end = masked.find("*/", position)
-                stop = len(line) if end == -1 else end + 2
-                chars[position:stop] = " " * (stop - position)
-                position, in_block = stop, end == -1
+    text = "\n".join(lines)
+    out = list(text)
+    size = len(text)
+
+    def fill(begin: int, stop: int, char: str) -> None:
+        """Replace text[begin:stop] with char, keeping line breaks."""
+        for position in range(begin, min(stop, size)):
+            if out[position] != "\n":
+                out[position] = char
+
+    position, last, word, after_dot = 0, "", "", False
+    while position < size:
+        char = text[position]
+        if char in " \t\r\n":
+            position += 1
+            continue
+        pair = text[position : position + 2]
+        if pair == "//":
+            stop = text.find("\n", position)
+            stop = size if stop == -1 else stop
+            fill(position, stop, " ")
+            position = stop
+            continue
+        if pair == "/*":
+            stop = text.find("*/", position + 2)
+            stop = size if stop == -1 else stop + 2
+            fill(position, stop, " ")
+            position = stop
+            continue
+        if char in "\"'`":
+            stop = position + 1
+            while stop < size and text[stop] != char:
+                if text[stop] == "\\":
+                    stop += 2
+                    continue
+                if char != "`" and text[stop] == "\n":
+                    break  # an unterminated one-line string ends at the line
+                stop += 1
+            fill(position + 1, stop, "_")
+            position, last = min(stop + 1, size), "literal"
+            continue
+        if char == "/" and _regex_allowed(last, word, after_dot):
+            stop, in_class = position + 1, False
+            while stop < size and text[stop] != "\n":
+                if text[stop] == "\\":
+                    stop += 2
+                    continue
+                if text[stop] == "[":
+                    in_class = True
+                elif text[stop] == "]":
+                    in_class = False
+                elif text[stop] == "/" and not in_class:
+                    break
+                stop += 1
+            if stop < size and text[stop] == "/":
+                fill(position + 1, stop, "_")
+                stop += 1
+                while stop < size and text[stop].isalpha():
+                    stop += 1
+                position, last = stop, "literal"
                 continue
-            line_comment, block = masked.find("//", position), masked.find("/*", position)
-            if line_comment != -1 and (block == -1 or line_comment < block):
-                chars[line_comment:] = " " * (len(line) - line_comment)
-                break
-            if block == -1:
-                break
-            position, in_block = block, True
-        out.append("".join(chars))
-    return out
+        if char.isalnum() or char in "_$":
+            stop = position
+            while stop < size and (text[stop].isalnum() or text[stop] in "_$"):
+                stop += 1
+            before = text[:position].rstrip()
+            word, after_dot, last = text[position:stop], before.endswith("."), "word"
+            position = stop
+            continue
+        last = char
+        position += 1
+    return "".join(out).split("\n")
 
 
 def _brace_end(lines: list[str], start: int) -> int:
@@ -1186,11 +1242,13 @@ def functions_of(path: str, text: str) -> list[Function]:
     between two functions belongs to neither.
     """
     python = path.endswith(".py")
-    lines = text.splitlines() if python else blank_comments(text.splitlines())
+    raw = text.splitlines()
+    # Ranges and calls come from the blanked lines (same length); route paths from the original text.
+    lines = raw if python else blank_comments(raw)
     patterns = _patterns_for(path)
     out = []
     for index, line in enumerate(lines, start=1):
-        route = None if python or path.endswith(".go") else ROUTE_RE.match(line)
+        route = None if python or path.endswith(".go") else ROUTE_RE.match(raw[index - 1])
         if route:
             end, inline = _route_end(lines, index)
             body = "\n".join(lines[index - 1 : end])

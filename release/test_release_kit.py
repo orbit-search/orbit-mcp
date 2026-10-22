@@ -1698,6 +1698,26 @@ class RoundSixTest(unittest.TestCase):
         )
         ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/tricky.ts", tricky)}
         self.assertEqual((ranges["get_/v3/b"], ranges["after"]), ((1, 7), (8, 12)))
+        cases = {
+            "apostrophe in a comment": "/*\n * It's ready. */ const label = 'ready';\n",
+            "quote in a comment": '/* " */ const label = "ok";\n',
+            "regex-like comment end": "/* Pattern: /foo*/\n",
+            "glob in a template": "const pattern = `\nassets/*\n`;\n",
+        }
+        for name, head in cases.items():
+            source = head + "function after() {\n\treturn 1;\n}\n"
+            first = head.count("\n") + 1
+            found = [(f.name, f.start, f.end) for f in rs.functions_of("src/case.ts", source)]
+            self.assertEqual(found, [("after", first, first + 2)], name)
+        go = "var usage = `\nsrc/*\n`\n\nfunc after() int {\n\treturn 1\n}\n"
+        self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", go)], [("after", 5, 7)])
+        division = (
+            'api.get("/v3/c", auth, async (ctx: MyContext) => {\n'
+            "\tconst size = units.in / (scale / ratio);\n"
+            "\tctx.body = size;\n"
+            "});\n"
+        )
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", division)], [(1, 4)])
         route = functions["get_/v3/match"]
         self.assertEqual((route.start, route.end), (9, 12))
         self.assertIn("match", route.calls)
