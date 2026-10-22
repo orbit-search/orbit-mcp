@@ -37,3 +37,23 @@ test("search_people marks completed_with_errors as an MCP error", async () => {
     await Promise.all([client.close(), server.close()]);
   }
 });
+
+// Exercise SDK validation before a large collection reaches any backend tool handler.
+test("bounds tool argument collections before downstream work", async () => {
+  const server = createOrbitServer("sk_orb_test");
+  const client = new Client({ name: "bounded-input-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const originalFetch = globalThis.fetch;
+  let backendCalls = 0;
+  globalThis.fetch = async () => { backendCalls++; throw new Error("must not call backend"); };
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: "search_people", arguments: { query: "Ada Lovelace", oversized: Array(10_001).fill(true) } });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /maximum of 10000 elements/);
+    assert.equal(backendCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await Promise.all([client.close(), server.close()]);
+  }
+});
