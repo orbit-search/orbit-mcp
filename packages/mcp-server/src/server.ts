@@ -50,7 +50,7 @@ export function createOrbitServer(apiKey: string): McpServer {
     icons: [
       { src: "https://developer.orbitsearch.com/orbit-icon-512.png", mimeType: "image/png", sizes: ["512x512"] },
     ],
-  });
+  }, { maxToolInputElements: 10_000 });
 
   server.registerTool(
     "get_credit_usage",

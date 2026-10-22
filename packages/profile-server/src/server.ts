@@ -19,7 +19,7 @@ function toolError(error: unknown) {
 
 export function createProfileServer(apiKey: string): McpServer {
   const client = new ProfileOrbitClient({ apiKey });
-  const server = new McpServer({ name: "orbit-profile-mcp", version: "2.0.0" });
+  const server = new McpServer({ name: "orbit-profile-mcp", version: "2.0.0" }, { maxToolInputElements: 10_000 });
 
   server.registerTool("get_credit_usage", {
     description: "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. No purchase or billable work is started.",

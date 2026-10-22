@@ -9,7 +9,7 @@ import { createProfileServer } from "./server.js";
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const sessionApiKeys = new Map<string, string>();
@@ -64,6 +64,7 @@ app.post("/mcp", async (req, res) => {
   if (!sessionId && isInitializeRequest(req.body)) {
     const apiKey = extractApiKey(req) ?? "";
     const transport = new StreamableHTTPServerTransport({
+      maxRequestBodySize: 100 * 1024,
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid) => {
         transports.set(sid, transport);

@@ -73,6 +73,7 @@ export function createHttpApp(verifyDelegation: typeof verifyDirectoryDelegation
     if (!sessionId && isInitializeRequest(req.body)) {
       const apiKey = extractApiKey(req.headers.authorization)!;
       const transport = new StreamableHTTPServerTransport({
+        maxRequestBodySize: 4 * 1024 * 1024,
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           transports.set(sid, transport);
