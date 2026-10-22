@@ -1061,6 +1061,9 @@ REGEX_KEYWORDS = frozenset(
 )
 
 
+CONDITION_KEYWORDS = frozenset({"if", "while", "for", "with"})
+
+
 def _regex_allowed(last: str, word: str) -> bool:
     """Whether a "/" after the last token starts a regex literal (an expression can start there)."""
     if last == "word":
@@ -1081,6 +1084,7 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
     out = list(text)
     size = len(text)
     templates: list[int] = []  # open "{" count inside each open `${` expression, innermost last
+    conditions: list[bool] = []  # for each open "(": whether it holds the condition of if, while, for or with
 
     def fill(begin: int, stop: int, char: str) -> None:
         """Replace text[begin:stop] with char, keeping line breaks."""
@@ -1097,6 +1101,7 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
                 continue
             if text[stop] == "`":
                 fill(begin, stop, "_")
+                out[stop] = " "
                 return stop + 1, "literal"
             if text.startswith("${", stop):
                 fill(begin, stop, "_")
@@ -1128,6 +1133,9 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
             position = stop
             continue
         if char == "`" and not go:
+            # Template backticks become spaces: a later per-line string pass must not pair the
+            # backticks of a template and of one nested in its `${...}`.
+            out[position] = " "
             position, last = template_text(position + 1)
             continue
         if char in "\"'`":
@@ -1184,6 +1192,12 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
             # A name after a dot (`units.in`) is a property, never a keyword.
             word = "" if last == "." else text[position:stop]
             position, last = stop, "word"
+            continue
+        if char == "(":
+            # `if (x) /re/.test(y)`: after the condition of if, while, for or with a statement starts.
+            conditions.append(last == "word" and word in CONDITION_KEYWORDS)
+        elif char == ")" and conditions and conditions.pop():
+            last, position = ";", position + 1
             continue
         last = char
         position += 1
@@ -1290,7 +1304,7 @@ def functions_of(path: str, text: str) -> list[Function]:
     for index, line in enumerate(lines, start=1):
         route = None if python or path.endswith(".go") else ROUTE_RE.match(raw[index - 1])
         # A registration inside a comment or a string is blanked: it is no route.
-        if route and line[: route.start(3)] == raw[index - 1][: route.start(3)]:
+        if route and line[: route.start(2)] == raw[index - 1][: route.start(2)]:
             end, inline = _route_end(lines, index)
             body = "\n".join(lines[index - 1 : end])
             names = set(CALL_RE.findall(body))

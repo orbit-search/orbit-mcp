@@ -1706,6 +1706,7 @@ class RoundSixTest(unittest.TestCase):
             "glob in a template": "const pattern = `\nassets/*\n`;\n",
             "route in a comment": '/*\napi.get("/gone", handler);\n*/\n',
             "route in a template": 'const example = `\napi.get("/gone", handler);\n`;\n',
+            "regex after a condition": "if (ready) /[/*]/.test(input) && onMatch();\n",
             "template expressions": "const a = `x${ {k: '}'}.k }y${g(`z${h({})}`)}`;\n",
         }
         for name, head in cases.items():
@@ -1719,6 +1720,14 @@ class RoundSixTest(unittest.TestCase):
         self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", windows)], [("after", 3, 5)])
         called = "function show() {\n\treturn `${loadUser()} and ${`${formatName(x)}`}`;\n}\n"
         self.assertTrue({"loadUser", "formatName"} <= rs.functions_of("src/t.ts", called)[0].calls)
+        nested = "function show() {\n\tconst result = `${items.map(item => { return `x\ny`;\n\t})}`;\n\treturn finish(result);\n}\n"
+        [show] = rs.functions_of("src/n.ts", nested)
+        self.assertEqual((show.start, show.end), (1, 6))
+        self.assertIn("finish", show.calls)
+        template_route = "api.get(`/v3/t`, auth, async (ctx) => {\n\tctx.body = 1;\n});\n"
+        self.assertEqual(
+            [(f.name, f.start, f.end) for f in rs.functions_of("src/r.ts", template_route)], [("get_/v3/t", 1, 3)]
+        )
         division = (
             'api.get("/v3/c", auth, async (ctx: MyContext) => {\n'
             "\tconst size = units.in / (scale / ratio);\n"
