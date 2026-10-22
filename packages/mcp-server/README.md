@@ -15,12 +15,12 @@ release is required; this README alone does not establish production availabilit
 
 | Tool | Purpose | Orbit API |
 |---|---|---|
-| `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
+| `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build quick, partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
 | `quote_population_search` | Price a search for everyone at a company or everyone who attended a school, as one number in credits | `POST /v3/search/populations/quote` |
-| `search_population` | Start a search for everyone in one population at partial or full depth; returns the first snapshot at once | `POST /v3/search/populations` |
+| `search_population` | Start a search for everyone in one population at quick, partial or full depth; returns the first snapshot at once | `POST /v3/search/populations` |
 | `get_search_status` | Read the latest snapshot of any v3 search, to follow a population search to its end | `GET /v3/search/{search_id}` |
 | `get_profile` | Read an existing profile as JSON or a Markdown file package; stale data may schedule a refresh | `GET /v3/enrich/{profile_id}` |
-| `enrich_profile` | Ensure a known profile is partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
+| `enrich_profile` | Ensure a known profile is quick/partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
 | `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
 
 `search_people` and `enrich_profile` poll to a terminal state. `search_population` returns at once because a population can take a long time to fill; follow it with `get_search_status`, spacing polls out. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
@@ -195,6 +195,22 @@ Identity resolution:
 ```
 
 Phone and address signals always disable candidate discovery, even if the caller requests it.
+
+`profile_depth` sets the lightest profile each result is built to: `quick`
+(level 1), `partial` (level 2) or `full` (level 3). A quick search with only a phone,
+email or address returns every owner of that signal as a level 1 profile.
+
+Quick profile from a phone number:
+
+```json
+{
+  "signals": {
+    "phone": "+14155550123"
+  },
+  "profile_depth": "quick",
+  "limit": 5
+}
+```
 
 Profile enrichment:
 

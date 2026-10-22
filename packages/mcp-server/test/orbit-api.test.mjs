@@ -167,6 +167,16 @@ test("a population start without a request id makes one, and a size left out is 
   assert.equal(body.profile_depth, "partial");
 });
 
+test("a quick search sends profile_depth quick", async () => {
+  const calls = [];
+  const client = clientWithResponses(
+    [jsonResponse({ search_id: "search-quick", request_id: "quick-1", status: "completed", profile_depth: "quick", results: [] })],
+    calls,
+  );
+  await client.searchAndWait({ signals: { phone: "+14155550123" }, profile_depth: "quick", request_id: "quick-1" });
+  assert.equal(JSON.parse(calls[0].init.body).profile_depth, "quick");
+});
+
 test("phone and address signals always disable candidate discovery", async () => {
   const calls = [];
   const client = clientWithResponses(

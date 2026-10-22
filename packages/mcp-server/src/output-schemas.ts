@@ -30,7 +30,7 @@ const profile = z.object({}).passthrough().describe(
   "Public Orbit person context, including available profile sections and source evidence. Fields vary by generation level; returned fields are preserved.",
 );
 const generationLevel = z.number().int().nullable().describe(
-  "Stored profile generation level: 1 identity, 2 partial, 3 full; null when no level is available.",
+  "Stored profile generation level: 1 quick, 2 partial, 3 full; null when no level is available.",
 );
 const failure = z.object({
   code: z.string().describe("Machine-readable failure code."),
@@ -52,7 +52,7 @@ export const searchOutputSchema = z.object({
   status: z.enum(["completed", "completed_with_errors", "failed"]).describe("Terminal search state after polling."),
   candidate_discovery: z.boolean().describe("Whether candidate discovery was enabled."),
   candidate_discovery_completed: z.boolean().optional().describe("Whether discovery can add any more results."),
-  profile_depth: z.enum(["partial", "full"]).describe("Requested minimum profile depth."),
+  profile_depth: z.enum(["quick", "partial", "full"]).describe("Requested minimum profile depth."),
   include_profile: z.boolean().describe("Whether results include available profile objects."),
   profile_upgrades_completed: z.boolean().optional().describe("Whether all results reached the requested depth or failed."),
   results: z.array(z.object({
@@ -81,7 +81,7 @@ const populationSubject = z.object({
 export const populationQuoteOutputSchema = z.object({
   population: populationSubject,
   size: z.number().int().nullable().describe("The population's size as given, or null."),
-  profile_depth: z.enum(["partial", "full"]).describe("The depth the quote priced."),
+  profile_depth: z.enum(["quick", "partial", "full"]).describe("The depth the quote priced."),
   credits: z.number().finite().describe("The whole cost of the search, as one number. Reserved when the search starts."),
   max_people: z.number().int().describe("The most people one population search covers."),
   pricing_version: z.string().describe("The pricing catalog version the quote used."),
@@ -92,7 +92,7 @@ export const populationSchema = z.object({
   id: z.string(),
   name: z.string(),
   size: z.number().int().nullable().describe("The population's size as given, or null."),
-  profile_depth: z.enum(["partial", "full"]).describe("The depth every person is built to."),
+  profile_depth: z.enum(["quick", "partial", "full"]).describe("The depth every person is built to."),
   credits_quoted: z.number().finite().describe("The credits reserved when the search started."),
   status: z.enum(["running", "completed", "completed_with_errors", "failed", "cancelled"]).describe("Where the population search is."),
 }).passthrough().describe("Present on a population search: the subject, the depth, the reserved credits and the status.");
@@ -150,7 +150,7 @@ export const enrichOutputSchema = z.object({
   request_id: z.string().describe("Idempotency key for this enrichment; reuse for retries."),
   profile_id: z.string().describe("Canonical Orbit profile identifier."),
   status: z.enum(["completed", "failed"]).describe("Terminal enrichment state after polling."),
-  operation: z.enum(["partial", "full", "regenerate"]).describe("Requested enrichment operation."),
+  operation: z.enum(["quick", "partial", "full", "regenerate"]).describe("Requested enrichment operation."),
   include_profile: z.boolean().describe("Whether available person context is embedded."),
   generation_level: generationLevel.optional(),
   profile: profile.optional(),
