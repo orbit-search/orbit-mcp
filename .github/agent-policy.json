@@ -3,9 +3,10 @@
   "about": "Agent review policy read by .github/scripts/agent_policy_check.py from the base branch. Agents merge their own PRs; humans approve only the gates below, in words. See AGENTS.md 'Agent review and release policy'.",
   "owners": [
     "NicholasDominici",
-    "Vitor-Bukovitz"
+    "Vitor-Bukovitz",
+    "jonnybcw"
   ],
-  "ownersRule": "The top 3 committers to the default branch in the last 6 months who are current orbit-search members (bots excluded), plus NicholasDominici for backend and orbit repos. Refresh when people join or leave.",
+  "ownersRule": "The top 3 committers to the default branch in the last 6 months who are current orbit-search members (bots excluded), plus NicholasDominici for backend and orbit repos. Refresh when people join or leave. Plus jonnybcw on every repo (Nicholas, 2026-10-22).",
   "agentLogins": [
     "orbit-harness[bot]"
   ],
