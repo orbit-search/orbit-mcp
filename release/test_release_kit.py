@@ -1666,6 +1666,22 @@ class RoundSixTest(unittest.TestCase):
         )
         functions = {f.name: f for f in rs.functions_of("src/rows.ts", source)}
         self.assertEqual((functions["loadRows"].start, functions["loadRows"].end), (1, 7))
+        more = (
+            'api.get("/v3/a", auth, async (ctx: MyContext) => {\n'  # 1
+            "\tconst ok = ids.filter((id) => /\\(/.test(id));\n"
+            "\tif (!ok.length) {\n"
+            "\t\treturn /\\(/.test(ctx.query.q);\n"
+            "\t}\n"
+            "});\n"  # 6
+            "const commented = (\n"  # 7
+            "\tid: string,\n"
+            ") /* the row */ => {\n"
+            "\treturn id;\n"
+            "};\n"  # 11
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/more.ts", more)}
+        self.assertEqual(ranges["get_/v3/a"], (1, 6))
+        self.assertEqual(ranges["commented"], (7, 11))
         route = functions["get_/v3/match"]
         self.assertEqual((route.start, route.end), (9, 12))
         self.assertIn("match", route.calls)
@@ -1776,7 +1792,7 @@ class RoundSixTest(unittest.TestCase):
         patches = [c for c in cluster.commands if "patch" in c]
         self.assertEqual(len(patches), 1)
         body = json.loads(patches[0][patches[0].index("-p") + 1])["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual(body["env"], [{"name": "OAUTH_SESSION_ISSUANCE_ENABLED", "value": "true"}])
+        self.assertEqual(body["env"], [{"name": "OAUTH_SESSION_ISSUANCE_ENABLED", "value": "true", "valueFrom": None}])
         self.assertTrue(body["image"].endswith(OLD))
         self.assertTrue(
             any(c[c.index("-n") + 2 : c.index("-n") + 4] == ["set", "image"] for c in cluster.commands if "-n" in c)
@@ -1813,6 +1829,9 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(failing.status, "failed")
         silent = rv.check_http_pod(clients, check, lambda *a: (503, unreachable), sleep=lambda _: None)
         self.assertEqual(silent.status, "failed")
+        spaced = json.dumps({"kind": "Status", "message": "error trying to reach service: dial tcp"}).encode()
+        self.assertTrue(rv._proxy_unreachable(503, spaced))
+        self.assertFalse(rv._proxy_unreachable(503, b"Service Unavailable"))
 
     def test_a_hung_pod_fails(self) -> None:
         """A Ready pod whose request keeps timing out fails the check, with the error kept."""

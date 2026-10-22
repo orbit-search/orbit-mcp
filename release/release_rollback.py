@@ -272,7 +272,8 @@ def apply_plan(plan: Plan, clients: rr.Clients) -> list[str]:
         try:
             if values:
                 container = {"name": step.container, "image": step.target}
-                container["env"] = [{"name": key, "value": value} for key, value in values]
+                # "valueFrom": None removes a secret or field source, which Kubernetes refuses beside "value".
+                container["env"] = [{"name": key, "value": value, "valueFrom": None} for key, value in values]
                 patch = json.dumps({"spec": {"template": {"spec": {"containers": [container]}}}})
                 clients.runner([*base, "patch", f"deployment/{step.name}", "--type=strategic", "-p", patch])
                 shown = ", ".join(f"{key}={value}" for key, value in values)

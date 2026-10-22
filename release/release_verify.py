@@ -593,10 +593,14 @@ PROXY_RETRY_SECONDS = 10
 
 def _proxy_unreachable(status: int, body: bytes) -> bool:
     """Whether a pod-proxy answer comes from the API server (it could not reach the pod), not from the app."""
+    if status != 503:
+        return False
+    try:
+        answer = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return False
     return (
-        status == 503
-        and PROXY_UNREACHABLE in body.decode("utf-8", "replace")
-        and '"kind":"Status"' in body.decode("utf-8", "replace")
+        isinstance(answer, dict) and answer.get("kind") == "Status" and PROXY_UNREACHABLE in str(answer.get("message"))
     )
 
 

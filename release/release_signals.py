@@ -941,7 +941,17 @@ def route_name(method: str, path: str) -> str:
 ROUTE_LINES = 3000
 IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
 # A JavaScript regex literal where an expression starts (after `=`, `(`, `,`, `:` ...).
-REGEX_LITERAL_RE = re.compile(r"(?:(?<=[=(,:\[!&|?{};])|^)\s*/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+/[a-z]*")
+# A JavaScript regex literal where an expression starts: after a punctuator, `=>`, or a keyword such
+# as `return` (`values.filter((v) => /\(/.test(v))`, `return /\(/.test(q);`).
+REGEX_LITERAL_RE = re.compile(
+    r"(^|[=(,:\[!&|?{};]|=>|\b(?:return|typeof|case|void|throw|yield|await|in|of|delete)\b)"
+    r"(\s*)/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+/[a-z]*"
+)
+
+
+def _without_regex(code: str) -> str:
+    """The line with its regex literals replaced by `/./` (their parentheses are no code)."""
+    return REGEX_LITERAL_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}/./", code)
 
 
 def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
@@ -953,7 +963,7 @@ def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
     nesting, inline = 0, False
     for index in range(start - 1, min(len(lines), start - 1 + ROUTE_LINES)):
         # Regex literals (`/\(/`) hold parentheses that are no code.
-        code = REGEX_LITERAL_RE.sub("/./", _code_only(lines[index]))
+        code = _without_regex(_code_only(lines[index]))
         inline = inline or "=>" in code or re.search(r"\bfunction\b", code) is not None
         for char in code:
             if char in "([":
@@ -1034,13 +1044,15 @@ def _patterns_for(path: str) -> list[re.Pattern[str]]:
 
 STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`')
 LINE_COMMENT_RE = re.compile(r"//.*$")
+# A block comment on one line, or the start of one that continues on the next lines.
+BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/|/\*.*$")
 # How many lines a function signature may span before its body opens.
 SIGNATURE_LINES = 15
 
 
 def _code_only(line: str) -> str:
-    """A line without string literals and // comments, for brace counting."""
-    return LINE_COMMENT_RE.sub("", STRING_RE.sub('""', line))
+    """A line without string literals and comments (// and /* */ on the line), for brace counting."""
+    return BLOCK_COMMENT_RE.sub(" ", LINE_COMMENT_RE.sub("", STRING_RE.sub('""', line)))
 
 
 def _brace_end(lines: list[str], start: int) -> int:
