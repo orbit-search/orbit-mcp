@@ -911,8 +911,37 @@ FUNCTION_PATTERNS = {
             r"^\s+(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+)*"
             r"([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^={;]+)?\{\s*$"
         ),
+        # A method whose parameters continue on the next lines (at least one modifier, so a call
+        # statement that spans lines is no method): `private static async startWithFunding(`.
+        re.compile(
+            r"^\s+(?:(?:public|private|protected|static|async|readonly|override)\s+)+"
+            r"([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\([^)]*$"
+        ),
+        # An arrow function whose parameters continue on the next lines.
+        re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?\([^)]*$"),
     ],
 }
+# An Express or koa-router route registration with an inline handler:
+# `api.patch("/v2/x/:id", auth, async (ctx) => {`. Its name is the Datadog resource of the route
+# (`patch_/v2/x/:id`, lowercase), so a failing route or a monitor grouped by resource_name finds
+# the handler that serves it.
+ROUTE_RE = re.compile(r"""^\s*[A-Za-z_$][\w$]*\.(get|post|put|patch|delete|del|all)\(\s*(["'`])(/[^"'`]*)\2""")
+
+
+def route_name(method: str, path: str) -> str:
+    """The Datadog resource name of a route: `<method>_<path>`, lowercase."""
+    return f"{'delete' if method == 'del' else method.lower()}_{path.lower()}"
+
+
+def _route_end(lines: list[str], start: int) -> int:
+    """The last line (1-based) of an inline route handler: the brace after the arrow, to its close."""
+    for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
+        code = _code_only(lines[index]).rstrip()
+        if code.endswith("{"):
+            return _close_of(lines, index, code.rindex("{"))
+    return start
+
+
 CALL_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
 
 
@@ -1008,6 +1037,13 @@ def functions_of(path: str, text: str) -> list[Function]:
     python = path.endswith(".py")
     out = []
     for index, line in enumerate(lines, start=1):
+        route = None if python or path.endswith(".go") else ROUTE_RE.match(line)
+        if route:
+            end = _route_end(lines, index)
+            body = "\n".join(lines[index - 1 : end])
+            calls = frozenset(name for name in CALL_RE.findall(body) if name not in KEYWORDS and len(name) >= 4)
+            out.append(Function(path, route_name(route.group(1), route.group(3)), index, end, calls))
+            continue
         for pattern in patterns:
             match = pattern.match(line)
             if match and match.group(1) not in KEYWORDS:
@@ -1079,6 +1115,10 @@ class SourceTree:
                 for name in function.calls:
                     self._callers[name] = self._callers.get(name, 0) + 1
 
+    def named(self, name: str) -> list[Function]:
+        """Every function with this name in the source tree (route handlers by their resource name)."""
+        return [function for path in sorted(self.texts()) for function in self.functions(path) if function.name == name]
+
     def enclosing(self, path: str, line: int) -> Function | None:
         """The innermost function of a file that contains the line, or None."""
         return enclosing(self.functions(path), line)
@@ -1130,6 +1170,11 @@ def origins(problem: Problem, tree: SourceTree) -> list[Function]:
         for function in tree.functions(path):
             if function.name == name:
                 add(function)
+    # A failing route, or a monitor grouped by route: the handler that serves it.
+    resource = str((problem.fields or {}).get("resource_name") or "").lower()
+    if resource:
+        for function in tree.named(resource):
+            add(function)
     return list(found.values())
 
 
@@ -1265,10 +1310,14 @@ def score_commit(
     return score, reasons or ["no link to the error"], linked, adds_line
 
 
+# How many commits (the newest) the suspect search reads.
+MAX_SUSPECT_COMMITS = 40
+
+
 def commit_changes(commits: list[dict], token: str | None, repo: str, code: rc.Code) -> dict[str, Change | None]:
-    """What each of the first 40 commits changes; None when the commit cannot be read."""
+    """What each of the newest MAX_SUSPECT_COMMITS commits changes; None when the commit cannot be read."""
     out: dict[str, Change | None] = {}
-    for commit in commits[:40]:
+    for commit in commits[-MAX_SUSPECT_COMMITS:]:
         if not token:
             out[commit["sha"]] = None
             continue
@@ -1318,14 +1367,17 @@ def trace_suspects(
     if not problems:
         return
     tree = tree if tree is not None and tree.available else None
-    changes = commit_changes(scope.commits, token, repo, code)
-    prs = {commit["sha"]: pull_request_of(commit, token, repo) for commit in scope.commits[:40]}
+    # The newest commits (scope.commits is oldest first); the ones left out are named in the problem.
+    considered = scope.commits[-MAX_SUSPECT_COMMITS:]
+    left_out = len(scope.commits) - len(considered)
+    changes = commit_changes(considered, token, repo, code)
+    prs = {commit["sha"]: pull_request_of(commit, token, repo) for commit in considered}
     releases = scope.commit_release
     for problem in problems:
         found = origins(problem, tree) if tree is not None else []
         problem.origins = [f"{f.path}:{f.name}" for f in found]
         groups: dict[str, dict] = {}
-        for commit in scope.commits[:40]:
+        for commit in considered:
             score, reasons, linked, adds_line = score_commit(problem, commit, changes.get(commit["sha"]), found, tree)
             pr = prs.get(commit["sha"])
             key = f"pr:{pr}" if pr else f"sha:{commit['sha']}"
@@ -1347,6 +1399,8 @@ def trace_suspects(
         top = ranked[0]["score"] if ranked else 0
         second = ranked[1]["score"] if len(ranked) > 1 else 0
         problem.clear = top >= CLEAR_MIN and top - second >= CLEAR_MARGIN
+        if left_out:
+            problem.text += f"; {left_out} older commit(s) of the judged releases were not searched"
         if problem.clear and ranked[0]["adds_line"]:
             # New logging cannot tell a new failure from an old one that was silent: ask a human.
             problem.clear = False

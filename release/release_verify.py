@@ -694,7 +694,7 @@ def suspected_prs(service: rc.Service, record: dict, regressions: list[dict], to
         scope = str(item.get("scope", ""))
         words.update(part.lower() for part in re.split(r"[:_,|\s/.-]+", scope) if len(part) > 3)
     ranked = []
-    for commit in (record.get("commits") or [])[:40]:
+    for commit in (record.get("commits") or [])[-rs.MAX_SUSPECT_COMMITS :]:
         files: list[str] = []
         if token:
             try:
@@ -730,9 +730,18 @@ def rollback_suggestion(
     phase: str,
     token: str | None,
     target: dict | None = None,
+    commits: list[dict] | None = None,
 ) -> dict:
-    """target: an earlier release than record["previous"] (a new error traced to an older unjudged release)."""
+    """What to roll back to and why.
+
+    target: an earlier release than record["previous"] (a new error traced to an older unjudged
+    release). commits: the commits of every judged release (default: this release's); the
+    suspected PRs rank them, so the hold after the rollback names the PRs that caused the
+    failure, also when they came in an earlier release.
+    """
     previous = target or record.get("previous") or {}
+    if commits is not None:
+        record = {**record, "commits": commits}
     return {
         "created_at": rr.utc_now(),
         "phase": phase,
@@ -985,7 +994,12 @@ def apply_result(
                 "images": previous.get("images"),
                 "rollback_to": f"previous-of:{chain[-1]}",
             }
-        suggestion = rollback_suggestion(service, record, result["regressions"], key, token, target)
+        commits = None
+        if len(chain) > 1:
+            commits = []
+            for release_id in reversed(chain):
+                commits += (rs._read(store, release_id) or {}).get("commits") or []
+        suggestion = rollback_suggestion(service, record, result["regressions"], key, token, target, commits=commits)
     fresh: list[dict] = []
 
     def change(current: dict) -> None:
@@ -1017,6 +1031,9 @@ def apply_result(
                 verdict = {"status": status, "at": result["at"], "phase": key, "judged": result["judged"]}
                 if reason:
                     verdict["reason"] = reason
+                if status == "inconclusive":
+                    # Unchecked: the next release's watch judges this release again (release_signals.release_scope).
+                    verdict["unchecked"] = True
                 if current.get("warnings"):
                     verdict["warnings"] = len(current["warnings"])
         current["verdict"] = verdict

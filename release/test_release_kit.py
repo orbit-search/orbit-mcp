@@ -1389,6 +1389,119 @@ def light_data(kind: str) -> dict:
     return data
 
 
+ROUTES = """\
+export function registerWatcherRoutes(api: Router) {
+\tapi.patch("/v2/organizations/:organizationId/watchers/:watcherId", auth, async (ctx: MyContext) => {
+\t\tconst body = parse(ctx.request.body);
+\t\tctx.body = await updateWatcher(ctx.params.watcherId, body);
+\t});
+
+\tapi.get("/v3/watchers/:watcherId", auth, async (ctx: MyContext) => {
+\t\tctx.body = await readWatcher(ctx.params.watcherId);
+\t});
+}
+"""
+MULTILINE = """\
+export class SearchService {
+\tprivate static async startWithFunding(
+\t\tparams: StartParams,
+\t\tsource: FundingSource,
+\t): Promise<{ snapshot: Snapshot }> {
+\t\tconst funded = await fund(params, source);
+\t\treturn { snapshot: funded };
+\t}
+}
+export const buildRows = async (
+\trows: Row[],
+): Promise<Row[]> => {
+\treturn rows;
+};
+"""
+
+
+class RouteTraceTest(unittest.TestCase):
+    """Greptile on orbit-api #1538: route handlers, multi-line signatures, the newest suspects."""
+
+    def test_route_handlers_and_multiline_signatures(self) -> None:
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/endpoints/watchers.ts", ROUTES)}
+        self.assertEqual(ranges["patch_/v2/organizations/:organizationid/watchers/:watcherid"], (2, 5))
+        self.assertEqual(ranges["get_/v3/watchers/:watcherid"], (7, 9))
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/services/search.ts", MULTILINE)}
+        self.assertEqual((ranges["startWithFunding"], ranges["buildRows"]), ((2, 8), (10, 14)))
+
+    def test_a_failing_route_traces_to_its_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "watchers.ts").write_text(ROUTES)
+            tree = rs.SourceTree(root, SERVICE.code)
+            route = "get_/v3/watchers/:watcherid"
+            problem = rs.judge_failures({}, {route: 25.0}, {route: 40000.0}, {route: 200.0}, fields=["resource_name"])[
+                0
+            ]
+            self.assertEqual([f.name for f in rs.origins(problem, tree)], [route])
+            change = rs.parse_change(
+                "c1",
+                [
+                    {
+                        "filename": "src/watchers.ts",
+                        "patch": "@@ -8,1 +8,1 @@\n-\t\tctx.body = await readWatcher(ctx.params.watcherId);"
+                        "\n+\t\tctx.body = await readWatcher(ctx.params.id);",
+                    }
+                ],
+                {"src/watchers.ts": ROUTES},
+            )
+            docs = rs.parse_change("c2", [{"filename": "docs/a.md", "patch": "+x"}], {})
+            scope = rs.Scope(
+                [_record()],
+                [{"sha": "c1", "title": "Watcher reads (#5)", "pr": 5}, {"sha": "c2", "title": "Docs (#6)", "pr": 6}],
+                [BASELINE],
+                WINDOW,
+                BASELINE[1],
+            )
+            with mock.patch.object(rs, "commit_changes", return_value={"c1": change, "c2": docs}):
+                rs.trace_suspects([problem], scope, token="t", repo="r", tree=tree, code=SERVICE.code)
+            self.assertTrue(problem.clear)
+            self.assertEqual(problem.suspects[0]["pr"], 5)
+
+    def test_the_newest_commits_are_searched(self) -> None:
+        commits = [{"sha": f"s{index:03d}", "title": f"Change {index} (#{index})", "pr": index} for index in range(45)]
+        scope = rs.Scope([_record()], commits, [BASELINE], WINDOW, BASELINE[1])
+        problem = rs.Problem(kind="log", key="log:x", text="new log line", literals=["Failed to load profile"])
+        seen: list = []
+        with mock.patch.object(rs, "commit_changes", lambda c, *a: seen.extend(c) or {}):
+            rs.trace_suspects([problem], scope, token=None, repo="r", tree=None, code=SERVICE.code)
+        self.assertEqual((seen[0]["sha"], seen[-1]["sha"], len(seen)), ("s005", "s044", 40))
+        self.assertIn("5 older commit(s)", problem.text)
+
+    def test_chain_commits_rank_and_final_inconclusive_is_unchecked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            older = _record(
+                release_id="20261021T080000Z-ddddddddd",
+                commit="d" * 40,
+                previous={"commit": "e" * 40},
+                commits=[{"sha": "d" * 40, "title": "Slow the parser (#3)", "pr": 3, "author": "a"}],
+            )
+            newer = _record(previous={"release_id": older["release_id"], "commit": "d" * 40})
+            _save(store, older, latest=False)
+            _save(store, newer)
+            result = VerdictTest._result(
+                None,
+                result="failed",
+                regressions=[{"kind": "metric", "text": "p95 route x: 0.1 -> 2"}],
+                chain=[newer["release_id"], older["release_id"]],
+            )
+            with mock.patch.object(rr, "github_json", lambda path, token: {"files": [{"filename": "src/a.ts"}]}):
+                saved = rv.apply_result(SERVICE, store, newer, result, final=False, token="t")
+            prs = {item.get("pr") for item in saved["rollback_suggestion"]["suspected_prs"]}
+            self.assertEqual(prs, {3, 12})
+            other = _record(release_id="20261021T120000Z-fffffffff")
+            _save(store, other)
+            quiet = rv.apply_result(SERVICE, store, other, VerdictTest._result(None, judged=0), final=True, token=None)
+            self.assertEqual((quiet["verdict"]["status"], quiet["verdict"]["unchecked"]), ("inconclusive", True))
+
+
 class LightTest(unittest.TestCase):
     def test_parse(self) -> None:
         run = rl.parse_light(light_data("cloud_run"))
