@@ -10,10 +10,10 @@
     "release_people.json": "c9c693e85419c29a52c05e7a6611ac12f13efe5b5a0f119a5d65a9ce0c1bd855",
     "release_record.py": "50174ded5d949361fb5fcff295267aca2a23865da35b8d4c49bdb3a99ce17207",
     "release_rollback.py": "80a55005296e99a955faeaa3279a0b5499d5915da550ad2579e6f59d301e2254",
-    "release_signals.py": "9f1bbb201a0025f0975b4a53ed418c38840d2db4d45dd91468d22754b5de6f9b",
-    "release_verify.py": "68247621f8949ed7669488d4ee0742f6cb26ae50cf7c6b708c21c0e0c9f71712",
-    "test_release_kit.py": "0dd600f3b1e30169ae8a6b13032340a502957be59ba97d999fcfd746751a5a56"
+    "release_signals.py": "965730240e91641cbaf21fac6c72b93233d5dca968d3efdd5a720bd34f391f23",
+    "release_verify.py": "584961e28df245a3e1e6ea45471e8da41c2577927a25a3a4ada35f3490d24ff2",
+    "test_release_kit.py": "443fe008fa09db67e34fb265e0f2803cced650f7d94ebb7c549a1fa8b705bf60"
   },
   "source": "orbit-search/orbit-infrastructure release-kit/release",
-  "version": "kit-0495ac332252"
+  "version": "kit-5e859ac025f4"
 }

@@ -940,6 +940,8 @@ def route_name(method: str, path: str) -> str:
 # A route registration with an inline handler can be long; it ends at its closing parenthesis.
 ROUTE_LINES = 3000
 IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+# A JavaScript regex literal where an expression starts (after `=`, `(`, `,`, `:` ...).
+REGEX_LITERAL_RE = re.compile(r"(?:(?<=[=(,:\[!&|?{};])|^)\s*/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+/[a-z]*")
 
 
 def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
@@ -950,7 +952,8 @@ def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
     """
     nesting, inline = 0, False
     for index in range(start - 1, min(len(lines), start - 1 + ROUTE_LINES)):
-        code = _code_only(lines[index])
+        # Regex literals (`/\(/`) hold parentheses that are no code.
+        code = REGEX_LITERAL_RE.sub("/./", _code_only(lines[index]))
         inline = inline or "=>" in code or re.search(r"\bfunction\b", code) is not None
         for char in code:
             if char in "([":
@@ -963,9 +966,14 @@ def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
 
 
 def _arrow_follows(lines: list[str], start: int) -> bool:
-    """Whether "=>" follows the parameters that open on line `start` (a multi-line arrow function)."""
+    """Whether "=>" follows the parameters that open on line `start` (a multi-line arrow function).
+
+    Right after the closing parenthesis comes "=>", or a return type (":") that may span
+    lines and ends in "=>"; anything else (`).body;`, `).map(`) is an expression.
+    """
     nesting = 0
-    for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
+    last = min(len(lines), start - 1 + SIGNATURE_LINES)
+    for index in range(start - 1, last):
         code = _code_only(lines[index])
         for column, char in enumerate(code):
             if char == "(":
@@ -973,8 +981,34 @@ def _arrow_follows(lines: list[str], start: int) -> bool:
             elif char == ")":
                 nesting -= 1
                 if nesting == 0:
-                    rest = code[column + 1 :] + " " + (_code_only(lines[index + 1]) if index + 1 < len(lines) else "")
-                    return "=>" in rest
+                    rest = " ".join([code[column + 1 :], *(_code_only(line) for line in lines[index + 1 : last])])
+                    rest = rest.strip()
+                    if rest.startswith("=>"):
+                        return True
+                    return rest.startswith(":") and _arrow_after_type(rest)
+    return False
+
+
+def _arrow_after_type(text: str) -> bool:
+    """Whether a return type (`: Promise<{ a: string; b: number }>`) ends in "=>" before the statement ends.
+
+    Semicolons inside the type's brackets belong to the type; only one outside them ends the statement.
+    """
+    depth, position = 0, 0
+    while position < len(text):
+        if text.startswith("=>", position):
+            if depth == 0:
+                return True
+            position += 2
+            continue
+        char = text[position]
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            return False
+        position += 1
     return False
 
 

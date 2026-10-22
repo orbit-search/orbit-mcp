@@ -584,40 +584,115 @@ def _deployment(env: rc.Environment, name: str) -> rc.Deployment:
     raise rc.ConfigError(f"smoke check names deployment {name!r}, which {env.service} {env.name} does not deploy")
 
 
-def check_http_pod(clients: rr.Clients, check: dict, pod_get: PodGet) -> Check:
-    """A GET on every live pod of a Deployment (or one pod), through the Kubernetes API pod proxy."""
+# The API server's own answer when its proxy cannot reach a pod (a node or pod that is still
+# starting, an unready network path): no answer of the app, so it is tried again.
+PROXY_UNREACHABLE = "error trying to reach service"
+PROXY_ATTEMPTS = 3
+PROXY_RETRY_SECONDS = 10
+
+
+def _proxy_unreachable(status: int, body: bytes) -> bool:
+    """Whether a pod-proxy answer comes from the API server (it could not reach the pod), not from the app."""
+    return (
+        status == 503
+        and PROXY_UNREACHABLE in body.decode("utf-8", "replace")
+        and '"kind":"Status"' in body.decode("utf-8", "replace")
+    )
+
+
+def check_http_pod(
+    clients: rr.Clients, check: dict, pod_get: PodGet, sleep: Callable[[float], None] = time.sleep
+) -> Check:
+    """A GET on every Ready pod of a Deployment (or one pod), through the Kubernetes API pod proxy.
+
+    A pod that is not Ready yet (an autoscaler's new pod) is not called. A Ready pod that the
+    API server proxy cannot reach (its own 503 Status answer) is tried again; one that stays
+    unreachable is named but fails nothing while another pod answers. A request that keeps
+    failing otherwise (a timeout: the pod may hang) fails. At least one pod must answer.
+    """
     name = str(check.get("name") or f"http {check['path']}")
     deployment = _deployment(clients.env, check["deployment"])
-    pods = rr.live_pods(clients, deployment)
+    live = rr.live_pods(clients, deployment)
+    pods = [pod for pod in live if rr.is_ready(pod)]
     if not pods:
-        return Check(name, "failed", [f"no running {deployment.name} pod"])
+        return Check(name, "failed", [f"no Ready {deployment.name} pod ({len(live)} live)"])
     if not check.get("all_pods", True):
         pods = pods[:1]
-    details, failed = [], False
+    details, failed, answered, unreachable = [], False, 0, []
     for pod in pods:
         pod_name = pod["metadata"]["name"]
-        try:
-            status, body = pod_get(clients.env.namespace, pod_name, int(check["port"]), str(check["path"]))
-            ok, line = _expect_ok(status, body, check)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
-            ok, line = False, f"error: {error}"
+        for attempt in range(PROXY_ATTEMPTS):
+            try:
+                status, body = pod_get(clients.env.namespace, pod_name, int(check["port"]), str(check["path"]))
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+                status, body, problem = 0, b"", f"error: {error}"
+            else:
+                problem = ""
+            if not problem and not _proxy_unreachable(status, body):
+                break
+            if attempt < PROXY_ATTEMPTS - 1:
+                sleep(PROXY_RETRY_SECONDS)
+        if problem:
+            # A request that keeps failing (a timeout, a connection error) can be a hung pod: it fails.
+            failed = True
+            details.append(f"{pod_name}: GET {check['path']}: {problem} (after {PROXY_ATTEMPTS} tries)")
+            continue
+        if _proxy_unreachable(status, body):
+            unreachable.append(pod_name)
+            details.append(
+                f"{pod_name}: not reachable through the API server proxy after {PROXY_ATTEMPTS} tries (not judged)"
+            )
+            continue
+        ok, line = _expect_ok(status, body, check)
+        answered += 1
         failed = failed or not ok
         details.append(f"{pod_name}: GET {check['path']}: {line}")
-    return Check(name, "failed" if failed else "passed", [f"{len(pods)} {deployment.name} pods", *details])
+    if not answered:
+        failed = True
+    waiting = len(live) - len([pod for pod in live if rr.is_ready(pod)])
+    head = f"{len(pods)} Ready {deployment.name} pods" + (f" ({waiting} not Ready yet, not called)" if waiting else "")
+    return Check(name, "failed" if failed else "passed", [head, *details])
 
 
-def check_http_public(check: dict, get: HttpGet = http_get) -> Check:
-    """A GET on a public URL of the service (through Cloudflare and the load balancer)."""
+# Right after a rollout the load balancer can take a minute to reach the new pods' nodes, so the
+# edge answers with an origin error (Cloudflare 520-526) or a gateway error. Those are tried again
+# for PUBLIC_RETRY_SECONDS before the check fails (orbit-mobile-api 20261022: HTTP 521 for a minute).
+PUBLIC_RETRY_STATUSES = frozenset({502, 503, 504, 520, 521, 522, 523, 524, 525, 526})
+PUBLIC_RETRY_SECONDS = 120
+PUBLIC_RETRY_WAIT = 20
+
+
+def check_http_public(
+    check: dict,
+    get: HttpGet = http_get,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Check:
+    """A GET on a public URL of the service (through Cloudflare and the load balancer).
+
+    An edge or gateway error, or no connection, is tried again for PUBLIC_RETRY_SECONDS; any
+    other answer is judged at once.
+    """
     name = str(check.get("name") or f"public {check['url']}")
     headers = {"Accept": "*/*", "User-Agent": USER_AGENT}
-    started = time.monotonic()
-    try:
-        status, body = get(urllib.request.Request(str(check["url"]), headers=headers))
-        ok, line = _expect_ok(status, body, check)
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
-        ok, line = False, f"error: {error}"
-    elapsed_ms = (time.monotonic() - started) * 1000
-    return Check(name, "passed" if ok else "failed", [f"GET {check['url']}: {line}, {elapsed_ms:.0f} ms"])
+    deadline = clock() + PUBLIC_RETRY_SECONDS
+    tries = 0
+    while True:
+        tries += 1
+        started = clock()
+        retry = False
+        try:
+            status, body = get(urllib.request.Request(str(check["url"]), headers=headers))
+            ok, line = _expect_ok(status, body, check)
+            retry = not ok and status in PUBLIC_RETRY_STATUSES
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
+            ok, line, retry = False, f"error: {error}", True
+        elapsed_ms = (clock() - started) * 1000
+        if not retry or clock() >= deadline:
+            break
+        sleep(PUBLIC_RETRY_WAIT)
+    after = f" (after {tries} tries)" if tries > 1 else ""
+    return Check(name, "passed" if ok else "failed", [f"GET {check['url']}: {line}, {elapsed_ms:.0f} ms{after}"])
 
 
 def check_pods_ready(clients: rr.Clients, check: dict, snapshot: dict[str, dict]) -> Check:
