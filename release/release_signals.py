@@ -1101,7 +1101,7 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
                 continue
             if text[stop] == "`":
                 fill(begin, stop, "_")
-                out[stop] = " "
+                out[stop] = "_"  # a literal stays: "`` / 2" divides
                 return stop + 1, "literal"
             if text.startswith("${", stop):
                 fill(begin, stop, "_")
@@ -1133,8 +1133,8 @@ def blank_comments(lines: list[str], go: bool = False) -> list[str]:
             position = stop
             continue
         if char == "`" and not go:
-            # Template backticks become spaces: a later per-line string pass must not pair the
-            # backticks of a template and of one nested in its `${...}`.
+            # Template backticks become a space and a "_": a later per-line string pass must not
+            # pair the backticks of a template and of one nested in its `${...}`.
             out[position] = " "
             position, last = template_text(position + 1)
             continue

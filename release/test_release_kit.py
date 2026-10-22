@@ -1736,6 +1736,8 @@ class RoundSixTest(unittest.TestCase):
         )
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", division)], [(1, 4)])
         postfix = division.replace("units.in", "index++")
+        empty = division.replace("units.in", "``")
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", empty)], [(1, 4)])
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", postfix)], [(1, 4)])
         regex = division.replace("units.in / (scale / ratio)", "++count && /[(]/.test(text)")
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", regex)], [(1, 4)])
