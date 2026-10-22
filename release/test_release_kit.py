@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from datetime import datetime, timedelta
@@ -38,6 +39,7 @@ PREVIOUS = "b" * 40
 
 
 def service_data(**overrides) -> dict:
+    """A full-tier service config."""
     data = {
         "service": "demo",
         "title": "demo",
@@ -108,6 +110,7 @@ PROD = SERVICE.prod
 
 
 def _deployment(name: str, container: str, image: str, replicas: int = 2) -> dict:
+    """A Deployment as kubectl returns it."""
     return {
         "metadata": {"name": name, "generation": 3},
         "spec": {"replicas": replicas, "template": {"spec": {"containers": [{"name": container, "image": image}]}}},
@@ -116,6 +119,7 @@ def _deployment(name: str, container: str, image: str, replicas: int = 2) -> dic
 
 
 def _pod(name: str, rs_name: str, container: str, digest: str, **extra) -> dict:
+    """A pod as kubectl returns it."""
     status = {"name": container, "imageID": f"{REPO}@{digest}", "restartCount": 0}
     if extra.get("waiting"):
         status["state"] = {"waiting": {"reason": extra["waiting"]}}
@@ -133,6 +137,7 @@ class FakeCluster:
     """Answers the kubectl reads of snapshot_workloads; records every command."""
 
     def __init__(self, env: rc.Environment = PROD, digest: str = NEW, **pod_extra) -> None:
+        """Keep the fake's state."""
         self.env = env
         self.commands: list[list[str]] = []
         self.deployments = {
@@ -156,10 +161,12 @@ class FakeCluster:
         ]
 
     def _selected(self, items: list[dict], selector: str) -> list[dict]:
+        """The items of the Deployment that the selector names."""
         name = next(item.name for item in self.env.deployments if item.selector == selector)
         return [item for item in items if item["metadata"]["name"].startswith(f"{name}-")]
 
     def __call__(self, command: list[str]) -> str:
+        """Answer one recorded command."""
         self.commands.append(command)
         args = [part for part in command[1:] if not part.startswith("--request-timeout")]
         args = args[args.index("-n") + 2 :] if "-n" in args else args
@@ -182,6 +189,7 @@ class FakeCluster:
 
 
 def _record(**overrides) -> dict:
+    """A deployed prod release record."""
     record = {
         "schema_version": 1,
         "service": "demo",
@@ -213,10 +221,12 @@ def _record(**overrides) -> dict:
 
 
 def _store(tmp: str) -> rr.LocalStore:
+    """A local record store in a temporary directory."""
     return rr.LocalStore(Path(tmp))
 
 
 def _save(store: rr.LocalStore, record: dict, latest: bool = True) -> None:
+    """Write a record, and point latest.json at it."""
     rr.create_record(store, record, "test")
     if latest:
         rr.point_latest(store, record)
@@ -227,6 +237,7 @@ def _save(store: rr.LocalStore, record: dict, latest: bool = True) -> None:
 
 class ConfigTest(unittest.TestCase):
     def test_parse(self) -> None:
+        """Parse."""
         self.assertEqual(SERVICE.prod.deploy_triggers, ("demo-prod",))
         self.assertEqual(SERVICE.dev.deploy_trigger, "demo-dev")
         self.assertEqual(SERVICE.rollback_build_tag, "demo-rollback")
@@ -235,6 +246,7 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(SERVICE.auto_rollback)
 
     def test_tiers_and_dev(self) -> None:
+        """Tiers and dev."""
         with self.assertRaises(rc.ConfigError):
             rc.parse_service(service_data(tier="check_only"))  # has a dev environment
         data = service_data(tier="check_only")
@@ -248,6 +260,7 @@ class ConfigTest(unittest.TestCase):
             rc.parse_service(data)
 
     def test_code_paths(self) -> None:
+        """Code paths."""
         code = SERVICE.code
         self.assertTrue(code.is_source("src/parser.ts"))
         self.assertFalse(code.is_source("src/parser.test.ts"))
@@ -257,6 +270,7 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(code.is_deploy("k8/prod/deployment.yaml"))
 
     def test_bad_metric(self) -> None:
+        """Bad metric."""
         data = service_data()
         data["verify"]["metrics"] = [{"name": "x", "kind": "rate", "ratio": 2, "absolute": 1, "min_samples": 1}]
         with self.assertRaises(rc.ConfigError):
@@ -267,6 +281,7 @@ class ConfigTest(unittest.TestCase):
 
 
 def _build(build_id: str, created: str, status: str = "SUCCESS", **extra) -> guard.Build:
+    """A Cloud Build build as the API returns it."""
     return guard.Build(
         id=build_id,
         status=status,
@@ -281,6 +296,7 @@ def _build(build_id: str, created: str, status: str = "SUCCESS", **extra) -> gua
 
 class GuardTest(unittest.TestCase):
     def test_turn(self) -> None:
+        """Turn."""
         own = _build("b", "2026-10-21T10:00:00Z", "WORKING")
         older = _build("a", "2026-10-21T09:00:00Z", "WORKING")
         newer = _build("c", "2026-10-21T11:00:00Z", "QUEUED")
@@ -293,6 +309,7 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(guard.decide_turn(merge, [merge, manual], g._can_supersede(merge))[0], "proceed")
 
     def test_prod_turn_checks_branch(self) -> None:
+        """Prod turn checks branch."""
         data = service_data(tier="check_rollback")
         del data["environments"]["dev"]
         data["triggers"] = {"prod": ["demo-prod"]}
@@ -310,6 +327,7 @@ class GuardTest(unittest.TestCase):
         api.ongoing_rollbacks.assert_called_with("demo-rollback")
 
     def test_dev(self) -> None:
+        """Dev."""
         ok = _build("a", "2026-10-21T10:00:00Z", start="2026-10-21T10:00:01Z", finish="2026-10-21T10:09:00Z")
         self.assertEqual(guard.decide_dev([ok])[0], "ok")
         self.assertEqual(guard.decide_dev([])[0], "wait")
@@ -318,6 +336,7 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(guard.decide_dev([ok, older])[0], "overlap")
 
     def test_recorded_digest(self) -> None:
+        """Recorded digest."""
         import base64
 
         output = base64.b64encode(json.dumps({"image_digest": NEW}).encode()).decode()
@@ -334,6 +353,7 @@ class GuardTest(unittest.TestCase):
 
 class RecordTest(unittest.TestCase):
     def test_snapshot_and_previous(self) -> None:
+        """Snapshot and previous."""
         cluster = FakeCluster(digest=OLD)
         clients = rr.Clients(env=PROD, runner=cluster)
         snapshot = rr.snapshot_workloads(clients)
@@ -350,6 +370,7 @@ class RecordTest(unittest.TestCase):
             self.assertEqual(previous["release_id"], record["release_id"])
 
     def test_update_keeps_other_writes(self) -> None:
+        """Update keeps other writes."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             _save(store, _record())
@@ -365,10 +386,12 @@ class RecordTest(unittest.TestCase):
 
 
 def _stores(tmp: str) -> rg.Stores:
+    """Local prod and dev record stores."""
     return rg.Stores(service=SERVICE, prod=rr.LocalStore(Path(tmp) / "prod"), dev=rr.LocalStore(Path(tmp) / "dev"))
 
 
 def _verified(stores: rg.Stores, commit: str = COMMIT, digest: str = NEW) -> None:
+    """Write a dev verify index that marks the commit passed."""
     stores.dev.write(
         rg.dev_commit_index(commit),
         {"commit": commit, "verdict": {"status": "passed"}, "images": {"app": f"{REPO}@{digest}"}},
@@ -378,16 +401,19 @@ def _verified(stores: rg.Stores, commit: str = COMMIT, digest: str = NEW) -> Non
 
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
+        """Prepare the fakes and the temporary store."""
         self.tmp = tempfile.TemporaryDirectory()
         self.stores = _stores(self.tmp.name)
         self.compare = mock.patch.object(rg, "github_compare_status", return_value="ahead")
         self.compare.start()
 
     def tearDown(self) -> None:
+        """Remove what the test created."""
         self.compare.stop()
         self.tmp.cleanup()
 
     def test_unverified_then_go(self) -> None:
+        """Unverified then go."""
         self.assertEqual(rg.decide(self.stores, COMMIT, "t").status, "unverified")
         _verified(self.stores)
         self.assertTrue(rg.decide(self.stores, COMMIT, "t").go)
@@ -395,6 +421,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(moved.status, "unverified")
 
     def test_freeze(self) -> None:
+        """Freeze."""
         _verified(self.stores)
         self.stores.prod.write(rg.FREEZE_OBJECT, {"frozen": True, "by": "n", "reason": "incident"}, 0)
         decision = rg.decide(self.stores, COMMIT, "t")
@@ -403,6 +430,7 @@ class GateTest(unittest.TestCase):
         self.assertEqual(rg.decide_direct(self.stores, COMMIT, "t").status, "frozen")
 
     def test_hold_and_trailer(self) -> None:
+        """Hold and trailer."""
         _verified(self.stores)
         bad = _record(commit=PREVIOUS, release_id="20261021T090000Z-bbbbbbbbb")
         rollback = _record(
@@ -435,6 +463,7 @@ class GateTest(unittest.TestCase):
             self.assertTrue(rg.decide(self.stores, COMMIT, "t").go)
 
     def test_request_promote_dry_run(self) -> None:
+        """Request promote dry run."""
         _verified(self.stores)
         args = mock.Mock(commit=COMMIT, build_id="b1", trigger_name="demo-dev", auto_promote="true", dry_run=True)
         with mock.patch.object(rr, "github_token", return_value="t"), mock.patch.object(rr, "post_slack") as slack:
@@ -444,6 +473,7 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("promote", index)
 
     def test_stale(self) -> None:
+        """Stale."""
         _verified(self.stores)
         _save(self.stores.prod, _record(commit="d" * 40))
         with mock.patch.object(rg, "contains", return_value=True):
@@ -455,6 +485,7 @@ class GateTest(unittest.TestCase):
 
 class RollbackTest(unittest.TestCase):
     def test_plan_and_apply(self) -> None:
+        """Plan and apply."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record()
@@ -473,6 +504,7 @@ class RollbackTest(unittest.TestCase):
             self.assertEqual(rv.check_images(record, after, targets=targets).status, "passed")
 
     def test_expect_latest_refuses(self) -> None:
+        """Expect latest refuses."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             _save(store, _record())
@@ -494,6 +526,7 @@ class LockTest(unittest.TestCase):
     """One build at a time changes prod: deploys from the gate to `finish`, rollbacks during apply."""
 
     def test_acquire_wait_take_over_release(self) -> None:
+        """Acquire wait take over release."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             running = {"deploy1"}
@@ -520,12 +553,14 @@ class LockTest(unittest.TestCase):
             self.assertIsNone(rr.lock_holder(store, alive))
 
     def test_only_one_of_two_racing_builds_wins(self) -> None:
+        """Only one of two racing builds wins."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             real_write = store.write
 
             def racing_write(name, data, generation):
                 # Another build writes first, at the same generation this one read.
+                """Let another build write first, at the same generation."""
                 if data.get("holder") == "b":
                     real_write(name, {"holder": "a", "kind": "deploy", "at": "x"}, generation)
                 return real_write(name, data, generation)
@@ -544,6 +579,7 @@ class LockTest(unittest.TestCase):
             self.assertEqual(store.read(rr.LOCK_OBJECT)[0]["holder"], "a")
 
     def test_gate_keeps_the_lock_only_on_go(self) -> None:
+        """Gate keeps the lock only on go."""
         with tempfile.TemporaryDirectory() as tmp:
             stores = _stores(tmp)
             api = mock.Mock()
@@ -557,6 +593,7 @@ class LockTest(unittest.TestCase):
             self.assertEqual(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"], "deploy2")
 
     def test_deploy_gives_the_lock_to_a_new_rollback(self) -> None:
+        """Deploy gives the lock to a new rollback."""
         with tempfile.TemporaryDirectory() as tmp:
             stores = _stores(tmp)
             api = mock.Mock()
@@ -567,6 +604,7 @@ class LockTest(unittest.TestCase):
             real_release = rr.release_lock
 
             def release(store, holder):
+                """Note the lock holder, then free the lock."""
                 holders.append(store.read(rr.LOCK_OBJECT)[0]["holder"])
                 real_release(store, holder)
 
@@ -576,6 +614,7 @@ class LockTest(unittest.TestCase):
             self.assertEqual(stores.prod.read(rr.LOCK_OBJECT)[0]["holder"], "deploy1")
 
     def test_rollback_apply_holds_the_lock(self) -> None:
+        """Rollback apply holds the lock."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             _save(store, _record())
@@ -585,6 +624,7 @@ class LockTest(unittest.TestCase):
             seen: list = []
 
             def apply(*_args):
+                """Note the lock holder while the apply runs."""
                 seen.append(store.read(rr.LOCK_OBJECT)[0]["holder"])
                 return 0
 
@@ -597,6 +637,7 @@ class LockTest(unittest.TestCase):
                 rb.cmd_apply(args, SERVICE, store, clients, alive=lambda _: True)
 
     def test_finish_frees_the_deploy_lock(self) -> None:
+        """Finish frees the deploy lock."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(status="deploying", build={"id": "deploy1"})
@@ -608,6 +649,7 @@ class LockTest(unittest.TestCase):
             self.assertFalse(store.read(rr.LOCK_OBJECT)[0]["holder"])
 
     def test_watch_waits_for_a_lock_holder(self) -> None:
+        """Watch waits for a lock holder."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(build={"id": "own"})
@@ -630,6 +672,7 @@ class LockTest(unittest.TestCase):
 
 class SmokeTest(unittest.TestCase):
     def test_images(self) -> None:
+        """Images."""
         snapshot = rr.snapshot_workloads(rr.Clients(env=PROD, runner=FakeCluster(digest=NEW)))
         self.assertEqual(rv.check_images(_record(), snapshot).status, "passed")
         snapshot = rr.snapshot_workloads(rr.Clients(env=PROD, runner=FakeCluster(digest=OLD)))
@@ -638,11 +681,13 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("CrashLoopBackOff", " ".join(rv.check_images(_record(), bad).details))
 
     def test_service_smoke(self) -> None:
+        """Service smoke."""
         clients = rr.Clients(env=PROD, runner=FakeCluster())
         snapshot = rr.snapshot_workloads(clients)
         calls = []
 
         def pod_get(namespace: str, pod: str, port: int, path: str) -> tuple[int, bytes]:
+            """Answer as the pod proxy does."""
             calls.append((namespace, pod, port, path))
             return (200, b"ok") if pod.endswith("-0") else (503, b"down")
 
@@ -653,12 +698,16 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(checks[1].status, "passed")
 
     def test_expect(self) -> None:
+        """Expect."""
         self.assertTrue(rv._expect_ok(204, b"", {})[0])
         self.assertFalse(rv._expect_ok(200, b'{"status":"down"}', {"expect_json": {"status": "ok"}})[0])
         self.assertFalse(rv._expect_ok(200, b"<html>", {"contains": "Orbit"})[0])
 
     def test_public(self) -> None:
+        """Public."""
+
         def get(request: urllib.request.Request) -> tuple[int, bytes]:
+            """Answer with the next canned response."""
             return 200, b"<title>Orbit</title>"
 
         check = rv.check_http_public({"url": "https://example.test/", "contains": "Orbit"}, get)
@@ -669,9 +718,11 @@ class FakeDatadog:
     """Scalar answers by query and window: baseline (before 10:00) or candidate."""
 
     def __init__(self, base: dict[str, dict[str, float]], cand: dict[str, dict[str, float]], hourly=None) -> None:
+        """Keep the fake's state."""
         self.base, self.cand, self.hourly = base, cand, hourly or {}
 
     def scalar(self, query: str, aggregator: str, start: datetime, end: datetime) -> dict[str, float]:
+        """The canned value of a query."""
         release = datetime(2026, 10, 21, 10, tzinfo=rr.UTC)
         if end <= release and (end - start) <= timedelta(hours=1) and query in self.hourly:
             return self.hourly[query]
@@ -687,6 +738,7 @@ WINDOW = (datetime(2026, 10, 21, 10, 5, tzinfo=rr.UTC), datetime(2026, 10, 21, 1
 
 class MetricsTest(unittest.TestCase):
     def test_per_group_rate(self) -> None:
+        """Per group rate."""
         dd = FakeDatadog(
             {ERRORS: {"GET /a": 1, "GET /b": 1}, HITS: {"GET /a": 1000, "GET /b": 1000}},
             {ERRORS: {"GET /a": 1, "GET /b": 300}, HITS: {"GET /a": 1000, "GET /b": 1000}},
@@ -697,6 +749,7 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(rates, {"demo GET /a": "ok", "demo GET /b": "exceeded"})
 
     def test_spread_and_runtime(self) -> None:
+        """Spread and runtime."""
         dd = FakeDatadog({P95: {"*": 1.0}, P95_N: {"*": 1000}}, {P95: {"*": 3.0}, P95_N: {"*": 1000}})
         dd.hourly = {P95: {"*": 2.5}, P95_N: {"*": 100}}
         with mock.patch.object(rv, "runtime_change", return_value=(True, "src")):
@@ -708,6 +761,7 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual([f.status for f in findings if f.metric == "http_p95_seconds"], ["no_runtime_change"])
 
     def test_runtime_files(self) -> None:
+        """Runtime files."""
         files = [
             {"filename": "release/release_verify.py", "patch": "+x"},
             {"filename": "src/a.test.ts", "patch": "+x"},
@@ -724,6 +778,7 @@ class MetricsTest(unittest.TestCase):
 
 class VerdictTest(unittest.TestCase):
     def _result(self, **overrides) -> dict:
+        """A check result, with defaults for what the test leaves out."""
         result = {
             "phase": "window",
             "at": "2026-10-21T11:05:00Z",
@@ -739,6 +794,7 @@ class VerdictTest(unittest.TestCase):
         return result
 
     def test_final(self) -> None:
+        """Final."""
         self.assertEqual(rv.final_verdict(SERVICE, self._result())[0], "passed")
         self.assertEqual(rv.final_verdict(SERVICE, self._result(judged=10))[0], "inconclusive")
         data = service_data()
@@ -748,6 +804,7 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(rv.final_verdict(quiet, self._result(signals_checked=[]))[0], "inconclusive")
 
     def test_apply_failed_and_warnings(self) -> None:
+        """Apply failed and warnings."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             _save(store, _record())
@@ -794,6 +851,7 @@ class VerdictTest(unittest.TestCase):
 
 class AlertTest(unittest.TestCase):
     def test_rollback_alert_pings_author(self) -> None:
+        """Rollback alert pings author."""
         record = _record(
             verdict={"status": "failed", "phase": "window_15m", "reasons": ["new log line"]},
             rollback_suggestion={
@@ -810,6 +868,7 @@ class AlertTest(unittest.TestCase):
         self.assertIn("failed release-verify", text)
 
     def test_dev_alert_test_run(self) -> None:
+        """Dev alert test run."""
         record = _record(verdict={"status": "failed", "reasons": ["forced"]})
         text, blocks = rv.dev_verify_alert(SERVICE, record, "https://build", "gs://x", test_run=True)
         self.assertTrue(text.startswith(rv.TEST_RUN_LINE))
@@ -818,6 +877,7 @@ class AlertTest(unittest.TestCase):
 
 class AutoRollbackTest(unittest.TestCase):
     def test_claim_and_trigger(self) -> None:
+        """Claim and trigger."""
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"RELEASE_AUTO_ROLLBACK": "1"}):
             store = _store(tmp)
             record = _record(verdict={"status": "failed", "phase": "deploy"}, rollback_suggestion={"summary": "x"})
@@ -825,6 +885,7 @@ class AutoRollbackTest(unittest.TestCase):
             commands = []
 
             def runner(command: list[str]) -> str:
+                """Record the command and answer with a build id."""
                 commands.append(command)
                 return "rollback-build-1\n"
 
@@ -852,6 +913,7 @@ class AutoRollbackTest(unittest.TestCase):
             rr.acquire_lock(store, "deploy2", "deploy", lambda _: True, wait_seconds=60)
 
             def sleep(_):
+                """Move the clock instead of sleeping."""
                 rr.release_lock(store, "deploy2")  # the gate said "frozen" and freed the lock
 
             with (
@@ -870,6 +932,7 @@ class AutoRollbackTest(unittest.TestCase):
             self.assertEqual(build, "rb1")
 
     def test_claim_blocks(self) -> None:
+        """Claim blocks."""
         now = datetime(2026, 10, 21, 12, tzinfo=rr.UTC)
         self.assertFalse(rv.claim_blocks({}, "me", now))
         self.assertTrue(rv.claim_blocks({"rolled_back_by": "x"}, "me", now))
@@ -879,6 +942,7 @@ class AutoRollbackTest(unittest.TestCase):
         self.assertFalse(rv.claim_blocks(starting, "me", now))
 
     def test_off_for_test_runs(self) -> None:
+        """Off for test runs."""
         with mock.patch.dict(os.environ, {"RELEASE_AUTO_ROLLBACK": ""}):
             self.assertIsNone(rv.start_rollback(SERVICE, None, _record()))  # type: ignore[arg-type]
 
@@ -888,6 +952,7 @@ class AutoRollbackTest(unittest.TestCase):
 
 class LogTest(unittest.TestCase):
     def test_pattern_and_site(self) -> None:
+        """Pattern and site."""
         pattern = rs.log_pattern(
             "Failed to load profile 8f1e2d3c-1111-2222-3333-444455556666 after 3 tries", "ERROR", "app"
         )
@@ -900,10 +965,12 @@ class LogTest(unittest.TestCase):
         self.assertTrue(rs.is_error("WARNING:app:request failed"))
 
     def test_entry_text(self) -> None:
+        """Entry text."""
         self.assertEqual(rs.entry_text({"jsonPayload": {"msg": "x failed"}}), "x failed")
         self.assertEqual(rs.entry_text({"jsonPayload": {"error": {"message": "y"}}}), "y")
 
     def test_count_sites(self) -> None:
+        """Count sites."""
         lines = [
             ("2026-10-21T10:30:00Z", f"pod-{index % 3}", "app", "ERROR", f"Failed to load profile {index}")
             for index in range(12)
@@ -915,6 +982,7 @@ class LogTest(unittest.TestCase):
 
 class FailureSeriesTest(unittest.TestCase):
     def test_new_series_and_rate(self) -> None:
+        """New series and rate."""
         base_fail = {"GET /a|timeout": 1}
         cand_fail = {"GET /b|http_500": 20, "GET /a|timeout": 40, "GET /c|cancelled": 50}
         base_all = {"GET /a": 1000}
@@ -961,12 +1029,14 @@ func helper() int {
 
 class SourceTest(unittest.TestCase):
     def test_functions(self) -> None:
+        """Functions."""
         names = [f.name for f in rs.functions_of("src/profile.ts", TS_SOURCE)]
         self.assertEqual(names, ["loadProfile", "unrelated"])
         go = rs.functions_of("src/server/search.go", GO_SOURCE)
         self.assertEqual([(f.name, f.start, f.end) for f in go], [("handleSearch", 3, 7), ("helper", 9, 11)])
 
     def test_trace_clear_suspect(self) -> None:
+        """Trace clear suspect."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
@@ -1007,6 +1077,7 @@ class SourceTest(unittest.TestCase):
             self.assertEqual(problem.suspects[0]["pr"], 5)
 
     def test_adds_line_is_not_clear(self) -> None:
+        """Adds line is not clear."""
         change = rs.parse_change(
             "c1",
             [
@@ -1027,6 +1098,7 @@ class SourceTest(unittest.TestCase):
 
 class ScopeTest(unittest.TestCase):
     def test_chain_and_holes(self) -> None:
+        """Chain and holes."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             older = _record(
@@ -1047,6 +1119,7 @@ class ScopeTest(unittest.TestCase):
 
 class KitTest(unittest.TestCase):
     def test_rendered(self) -> None:
+        """Rendered."""
         files = kit.rendered(SERVICE)
         rollback = files["release/services/demo.rollback.yaml"]
         self.assertIn('tags: ["demo-rollback"]', rollback)
@@ -1058,6 +1131,7 @@ class KitTest(unittest.TestCase):
         self.assertNotIn("{", window.replace("${", "").replace("$${", "").replace("{{", ""))
 
     def test_kit_files_exist(self) -> None:
+        """Kit files exist."""
         for name in kit.KIT_FILES:
             self.assertTrue((HERE / name).exists(), name)
 
@@ -1067,6 +1141,7 @@ class KitTest(unittest.TestCase):
 
 class ReviewFixTest(unittest.TestCase):
     def test_overlap_ignored_with_recorded_digest(self) -> None:
+        """Overlap ignored with recorded digest."""
         import base64
 
         output = base64.b64encode(json.dumps({"image_digest": NEW}).encode()).decode()
@@ -1084,7 +1159,10 @@ class ReviewFixTest(unittest.TestCase):
         self.assertEqual(guard.decide_dev([newest, older])[0], "ok")
 
     def test_changing_cluster(self) -> None:
+        """Changing cluster."""
+
         def build(status: str | None) -> guard.Build:
+            """Answer as the build API does."""
             steps = [{"id": "build-image", "status": "SUCCESS"}]
             if status is not None:
                 steps.append({"id": "release-record-begin", "status": status})
@@ -1095,6 +1173,7 @@ class ReviewFixTest(unittest.TestCase):
         self.assertTrue(build(None).changing_cluster)  # no marker step: it may change prod
 
     def test_smoke_validation(self) -> None:
+        """Smoke validation."""
         for bad in (
             {"type": "http_pod", "deployment": "prod-demo", "path": "/x"},
             {"type": "http_pod", "deployment": "other", "port": 80, "path": "/x"},
@@ -1108,6 +1187,7 @@ class ReviewFixTest(unittest.TestCase):
                 rc.parse_service(data)
 
     def test_backfill_skips_current_revision(self) -> None:
+        """Backfill skips current revision."""
         cluster = FakeCluster(digest=NEW)
         current = cluster.replica_sets[0]
         older = json.loads(json.dumps(current))
@@ -1120,6 +1200,7 @@ class ReviewFixTest(unittest.TestCase):
         self.assertEqual(rr.digest_before(clients, PROD.deployments[0], NEW), OLD)
 
     def test_go_declarations_between_functions(self) -> None:
+        """Go declarations between functions."""
         source = "package x\n\nfunc a() {\n\tif ok {\n\t\tb()\n\t}\n}\n\nvar limit = 3\n\nfunc c() { return }\n"
         functions = rs.functions_of("internal/x.go", source)
         self.assertEqual([(f.name, f.start, f.end) for f in functions], [("a", 3, 7), ("c", 11, 11)])
@@ -1131,6 +1212,7 @@ class ReviewFixTest(unittest.TestCase):
         self.assertEqual(change.functions, set())
 
     def test_ts_ranges(self) -> None:
+        """Ts ranges."""
         source = (
             'export function a(x: string) {\n  const s = "{";\n  return s;\n}\n'
             "export const b = (y: number) => y + 1;\n"
@@ -1189,15 +1271,18 @@ class ReviewFixTest(unittest.TestCase):
         self.assertEqual(ranges, {"objectList": (1, 6), "small": (7, 7), "object": (8, 13)})
 
     def test_python_ranges(self) -> None:
+        """Python ranges."""
         source = "def a():\n    x = 1\n\n    return x\n\nLIMIT = 3\n"
         self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/a.py", source)], [(1, 4)])
 
     def test_message_match_covers_entry_fields(self) -> None:
+        """Message match covers entry fields."""
         match = rs.message_match("boom")
         for field in ("textPayload", "jsonPayload.msg", "jsonPayload.error", "jsonPayload.err.message"):
             self.assertIn(f'{field}:"boom"', match)
 
     def test_rollback_target_without_recorded_predecessor(self) -> None:
+        """Rollback target without recorded predecessor."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             first = _record(
@@ -1225,12 +1310,16 @@ class ReviewFixTest(unittest.TestCase):
             self.assertEqual(resolved["workloads"]["deployment/prod-demo"]["digest"], OLD)
 
     def test_no_spread_is_a_warning(self) -> None:
+        """No spread is a warning."""
         finding = rv.Finding("m", "s", 1.0, 3.0, 1000, 1000, "limit", "exceeded")
         rv.apply_spread([finding], {"m": {"s": [1.0, 1.1]}})
         self.assertEqual(finding.status, "no_spread")
 
     def test_prod_state(self) -> None:
+        """Prod state."""
+
         def build(build_id: str, marker: str) -> guard.Build:
+            """Answer as the build API does."""
             return guard.Build.from_api(
                 {
                     "id": build_id,
@@ -1254,6 +1343,7 @@ class ReviewFixTest(unittest.TestCase):
                 self.assertIn("rollback build", rv.prod_state(SERVICE, store, _record())[0])
 
     def test_assert_alone_ignores_waiting_builds(self) -> None:
+        """Assert alone ignores waiting builds."""
         waiting = guard.Build.from_api(
             {
                 "id": "w",
@@ -1269,6 +1359,7 @@ class ReviewFixTest(unittest.TestCase):
             rb.assert_alone(SERVICE, "own")
 
     def test_failed_rollback_frees_the_claim(self) -> None:
+        """Failed rollback frees the claim."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(
@@ -1294,12 +1385,14 @@ class ReviewFixTest(unittest.TestCase):
             self.assertIn("Roll back by hand", slack.call_args[0][0])
 
     def test_single_pod_spread(self) -> None:
+        """Single pod spread."""
         data = service_data()
         data["verify"]["signals"] = {"log_containers": ["app"], "log_min_spread": 1}
         self.assertEqual(rc.parse_service(data).signals.log_min_spread, 1)
         self.assertEqual(SERVICE.signals.log_min_spread, 2)
 
     def test_alert_command_names_the_target(self) -> None:
+        """Alert command names the target."""
         record = _record(
             verdict={"status": "failed", "phase": "window_15m", "reasons": ["x"]},
             rollback_suggestion={
@@ -1326,6 +1419,7 @@ class ReviewFixTest(unittest.TestCase):
         parse = argparse.ArgumentParser.parse_args
 
         def capture(self, argv=None, namespace=None):
+            """Keep the parsed arguments, then stop the command."""
             seen.append(parse(self, argv, namespace))
             raise KeyError("stop")
 
@@ -1350,6 +1444,7 @@ class ReviewFixTest(unittest.TestCase):
                 self.assertEqual(seen[-1].to, "previous-of:x", command)
 
     def test_default_retry_after_a_rollback_refuses(self) -> None:
+        """Default retry after a rollback refuses."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             _save(store, _record(kind="rollback", rollback={"rolled_back_release": "bad"}))
@@ -1357,6 +1452,7 @@ class ReviewFixTest(unittest.TestCase):
                 rb.resolve_target(store, "previous")
 
     def test_gate_waits_for_rollbacks(self) -> None:
+        """Gate waits for rollbacks."""
         running = [guard.Build.from_api({"id": "rb", "status": "WORKING", "createTime": "2026-10-21T10:00:00Z"})]
         api = mock.Mock()
         api.ongoing_rollbacks.side_effect = [running, running, []]
@@ -1371,6 +1467,7 @@ import release_light as rl  # noqa: E402
 
 
 def light_data(kind: str) -> dict:
+    """A light service config of the given kind."""
     data = {
         "service": f"demo-{kind.replace('_', '-')}",
         "kind": kind,
@@ -1423,6 +1520,7 @@ class RouteTraceTest(unittest.TestCase):
     """Greptile on orbit-api #1538: route handlers, multi-line signatures, the newest suspects."""
 
     def test_route_handlers_and_multiline_signatures(self) -> None:
+        """Route handlers and multiline signatures."""
         ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/endpoints/watchers.ts", ROUTES)}
         self.assertEqual(ranges["patch_/v2/organizations/:organizationid/watchers/:watcherid"], (2, 5))
         self.assertEqual(ranges["get_/v3/watchers/:watcherid"], (7, 9))
@@ -1430,6 +1528,7 @@ class RouteTraceTest(unittest.TestCase):
         self.assertEqual((ranges["startWithFunding"], ranges["buildRows"]), ((2, 8), (10, 14)))
 
     def test_a_failing_route_traces_to_its_handler(self) -> None:
+        """A failing route traces to its handler."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "src").mkdir()
@@ -1465,6 +1564,7 @@ class RouteTraceTest(unittest.TestCase):
             self.assertEqual(problem.suspects[0]["pr"], 5)
 
     def test_the_newest_commits_are_searched(self) -> None:
+        """The newest commits are searched."""
         commits = [{"sha": f"s{index:03d}", "title": f"Change {index} (#{index})", "pr": index} for index in range(45)]
         scope = rs.Scope([_record()], commits, [BASELINE], WINDOW, BASELINE[1])
         problem = rs.Problem(kind="log", key="log:x", text="new log line", literals=["Failed to load profile"])
@@ -1475,6 +1575,7 @@ class RouteTraceTest(unittest.TestCase):
         self.assertIn("5 older commit(s)", problem.text)
 
     def test_chain_commits_rank_and_final_inconclusive_is_unchecked(self) -> None:
+        """Chain commits rank and final inconclusive is unchecked."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             older = _record(
@@ -1539,6 +1640,7 @@ class RoundSixTest(unittest.TestCase):
     """Greptile round 6: route ends, return types, expressions, the hold, unchecked, deploy_failed, rollback_env."""
 
     def test_a_named_handler_route_ends_on_its_line(self) -> None:
+        """A route with a named handler ends on its line and calls the handler by name."""
         functions = {f.name: f for f in rs.functions_of("src/routes.ts", NAMED_ROUTES)}
         result = functions["get_/v3/result/:id"]
         self.assertEqual((result.start, result.end), (2, 2))
@@ -1546,14 +1648,120 @@ class RoundSixTest(unittest.TestCase):
         self.assertNotIn("getContacts", result.calls)
         self.assertEqual((functions["get_/v3/contacts"].start, functions["get_/v3/contacts"].end), (3, 5))
 
+    def test_multiline_return_type_arrows_and_regex_in_routes(self) -> None:
+        """A return type that spans lines before "=>", and a regex literal inside a route handler."""
+        source = (
+            "export const loadRows = (\n"  # 1
+            "\tid: string,\n"
+            "): Promise<\n"
+            "\tRow[]\n"
+            "> => {\n"
+            "\treturn rows(id);\n"
+            "};\n"  # 7
+            "export function register(api: Router) {\n"  # 8
+            '\tapi.get("/v3/match", auth, async (ctx: MyContext) => {\n'  # 9
+            "\t\tconst pattern = /\\(/;\n"
+            "\t\tctx.body = match(pattern, ctx.query.q);\n"
+            "\t});\n"  # 12
+            "}\n"
+        )
+        functions = {f.name: f for f in rs.functions_of("src/rows.ts", source)}
+        self.assertEqual((functions["loadRows"].start, functions["loadRows"].end), (1, 7))
+        more = (
+            'api.get("/v3/a", auth, async (ctx: MyContext) => {\n'  # 1
+            "\tconst ok = ids.filter((id) => /\\(/.test(id));\n"
+            "\tif (!ok.length) {\n"
+            "\t\treturn /\\(/.test(ctx.query.q);\n"
+            "\t}\n"
+            "});\n"  # 6
+            "const commented = (\n"  # 7
+            "\tid: string,\n"
+            ") /* the row */ => {\n"
+            "\treturn id;\n"
+            "};\n"  # 11
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/more.ts", more)}
+        self.assertEqual(ranges["get_/v3/a"], (1, 6))
+        self.assertEqual(ranges["commented"], (7, 11))
+        tricky = (
+            'api.get("/v3/b", auth, async (ctx: MyContext) => {\n'  # 1
+            "\tconst ok = /[/*]/.test(ctx.query.q);\n"
+            '\tconst path = "a/*b";\n'
+            "\t/* example {\n"
+            "\t   still a comment } */\n"
+            "\treturn ok;\n"
+            "});\n"  # 7
+            "function after() {\n"  # 8
+            "\t/* opens {\n"
+            "\t} closes */\n"
+            "\treturn 1;\n"
+            "}\n"  # 12
+        )
+        ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/tricky.ts", tricky)}
+        self.assertEqual((ranges["get_/v3/b"], ranges["after"]), ((1, 7), (8, 12)))
+        cases = {
+            "apostrophe in a comment": "/*\n * It's ready. */ const label = 'ready';\n",
+            "quote in a comment": '/* " */ const label = "ok";\n',
+            "regex-like comment end": "/* Pattern: /foo*/\n",
+            "glob in a template": "const pattern = `\nassets/*\n`;\n",
+            "route in a comment": '/*\napi.get("/gone", handler);\n*/\n',
+            "route in a template": 'const example = `\napi.get("/gone", handler);\n`;\n',
+            "regex after a condition": "if (ready) /[/*]/.test(input) && onMatch();\n",
+            "template expressions": "const a = `x${ {k: '}'}.k }y${g(`z${h({})}`)}`;\n",
+        }
+        for name, head in cases.items():
+            source = head + "function after() {\n\treturn 1;\n}\n"
+            first = head.count("\n") + 1
+            found = [(f.name, f.start, f.end) for f in rs.functions_of("src/case.ts", source)]
+            self.assertEqual(found, [("after", first, first + 2)], name)
+        go = "var usage = `\nsrc/*\n`\n\nfunc after() int {\n\treturn 1\n}\n"
+        self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", go)], [("after", 5, 7)])
+        windows = "var path = `C:\\`\n\nfunc after() int {\n\treturn 1\n}\n"
+        self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("x.go", windows)], [("after", 3, 5)])
+        called = "function show() {\n\treturn `${loadUser()} and ${`${formatName(x)}`}`;\n}\n"
+        self.assertTrue({"loadUser", "formatName"} <= rs.functions_of("src/t.ts", called)[0].calls)
+        nested = "function show() {\n\tconst result = `${items.map(item => { return `x\ny`;\n\t})}`;\n\treturn finish(result);\n}\n"
+        [show] = rs.functions_of("src/n.ts", nested)
+        self.assertEqual((show.start, show.end), (1, 6))
+        self.assertIn("finish", show.calls)
+        template_route = "api.get(`/v3/t`, auth, async (ctx) => {\n\tctx.body = 1;\n});\n"
+        self.assertEqual(
+            [(f.name, f.start, f.end) for f in rs.functions_of("src/r.ts", template_route)], [("get_/v3/t", 1, 3)]
+        )
+        division = (
+            'api.get("/v3/c", auth, async (ctx: MyContext) => {\n'
+            "\tconst size = units.in / (scale / ratio);\n"
+            "\tctx.body = size;\n"
+            "});\n"
+        )
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", division)], [(1, 4)])
+        postfix = division.replace("units.in", "index++")
+        empty = division.replace("units.in", "``")
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", empty)], [(1, 4)])
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", postfix)], [(1, 4)])
+        regex = division.replace("units.in / (scale / ratio)", "++count && /[(]/.test(text)")
+        self.assertEqual([(f.start, f.end) for f in rs.functions_of("src/d.ts", regex)], [(1, 4)])
+        # One pass: a 1 MB file takes well under a second (a copy per word made it quadratic).
+        big = "const value = item.size / 2; // note\n" * 28000
+        started = time.monotonic()
+        rs.blank_comments(big.splitlines())
+        self.assertLess(time.monotonic() - started, 2.0)
+        route = functions["get_/v3/match"]
+        self.assertEqual((route.start, route.end), (9, 12))
+        self.assertIn("match", route.calls)
+
     def test_object_return_types_and_expressions(self) -> None:
+        """Object return types are skipped before the body; `const data = (` is no function."""
         ranges = {f.name: (f.start, f.end) for f in rs.functions_of("src/shapes.ts", SHAPES)}
         self.assertEqual(ranges["build"], (2, 9))
+        typed = "const load = (\n\tid: string,\n): Promise<{ ledgerId: string; balanceAfter: number }> => {\n\treturn x;\n};\n"
+        self.assertEqual([(f.name, f.start, f.end) for f in rs.functions_of("src/typed.ts", typed)], [("load", 1, 5)])
         self.assertEqual(ranges["fetchRows"], (11, 15))
         self.assertEqual(ranges["fetchSenditProfile"], (16, 21))
         self.assertNotIn("data", ranges)
 
     def test_the_hold_names_only_the_releases_the_rollback_removes(self) -> None:
+        """A rollback to "previous" holds only the newest release's PRs."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             older = _record(
@@ -1589,6 +1797,7 @@ class RoundSixTest(unittest.TestCase):
             self.assertEqual(prs, {12})  # the older release stays deployed: its PR is not held
 
     def test_unchecked_when_a_source_could_not_run_or_a_checkpoint_failed(self) -> None:
+        """A passed verdict with an unread source, and a checkpoint error, are unchecked."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record()
@@ -1604,6 +1813,7 @@ class RoundSixTest(unittest.TestCase):
             self.assertTrue(rr.read_record(store, other["release_id"])["verdict"]["unchecked"])
 
     def test_a_failed_deploy_fails_the_deploy_checks(self) -> None:
+        """A record with status deploy_failed fails its deploy checks."""
         record = _record(status="deploy_failed")
         clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
         with mock.patch.object(rv, "smoke_checks", return_value=[]):
@@ -1612,12 +1822,14 @@ class RoundSixTest(unittest.TestCase):
         self.assertIn("deploy", [item["name"] for item in result["regressions"]])
 
     def test_rollback_env_is_patched_with_the_image(self) -> None:
+        """A Deployment with rollback_env gets its image and env in one patch."""
         data = service_data()
         data["environments"]["prod"]["deployments"][0]["rollback_env"] = {"OAUTH_SESSION_ISSUANCE_ENABLED": "true"}
         service = rc.parse_service(data)
 
         class PatchingCluster(FakeCluster):
             def __call__(self, command: list[str]) -> str:
+                """Apply a strategic patch's image to the fake Deployment and its pods."""
                 if "patch" in command:
                     self.commands.append(command)
                     body = json.loads(command[command.index("-p") + 1])
@@ -1644,15 +1856,94 @@ class RoundSixTest(unittest.TestCase):
         patches = [c for c in cluster.commands if "patch" in c]
         self.assertEqual(len(patches), 1)
         body = json.loads(patches[0][patches[0].index("-p") + 1])["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual(body["env"], [{"name": "OAUTH_SESSION_ISSUANCE_ENABLED", "value": "true"}])
+        self.assertEqual(body["env"], [{"name": "OAUTH_SESSION_ISSUANCE_ENABLED", "value": "true", "valueFrom": None}])
         self.assertTrue(body["image"].endswith(OLD))
         self.assertTrue(
             any(c[c.index("-n") + 2 : c.index("-n") + 4] == ["set", "image"] for c in cluster.commands if "-n" in c)
         )
 
 
+class ProxyTest(unittest.TestCase):
+    """embeddings-api 20261022T053511Z: two pods of an HPA scale-up made the smoke check fail and rolled back a good release."""
+
+    def test_starting_and_unreachable_pods_do_not_fail_the_release(self) -> None:
+        """A pod still starting is not called; one the proxy cannot reach is named, not failed."""
+        cluster = FakeCluster(digest=NEW)
+        cluster.pods.append(_pod("prod-demo-new", "prod-demo-rs", "app", NEW, not_ready=True))
+        clients = rr.Clients(env=PROD, runner=cluster)
+        unreachable = json.dumps(
+            {"kind": "Status", "status": "Failure", "message": "error trying to reach service: dial tcp 10.0.0.1:3000"},
+            separators=(",", ":"),
+        ).encode()
+        calls: list[str] = []
+
+        def pod_get(namespace, pod, port, path):
+            """prod-demo-1 stays unreachable through the proxy; the other pods answer."""
+            calls.append(pod)
+            return (503, unreachable) if pod == "prod-demo-1" else (200, b"ok")
+
+        check = {"type": "http_pod", "name": "health", "deployment": "prod-demo", "port": 3000, "path": "/healthz"}
+        result = rv.check_http_pod(clients, check, pod_get, sleep=lambda _: None)
+        self.assertEqual(result.status, "passed")
+        self.assertNotIn("prod-demo-new", calls)  # not Ready yet: not called
+        self.assertEqual(calls.count("prod-demo-1"), rv.PROXY_ATTEMPTS)
+        self.assertIn("1 not Ready yet", result.details[0])
+        # An app error still fails, and so does no pod answering at all.
+        failing = rv.check_http_pod(clients, check, lambda *a: (500, b"boom"), sleep=lambda _: None)
+        self.assertEqual(failing.status, "failed")
+        silent = rv.check_http_pod(clients, check, lambda *a: (503, unreachable), sleep=lambda _: None)
+        self.assertEqual(silent.status, "failed")
+        spaced = json.dumps({"kind": "Status", "message": "error trying to reach service: dial tcp"}).encode()
+        self.assertTrue(rv._proxy_unreachable(503, spaced))
+        self.assertFalse(rv._proxy_unreachable(503, b"Service Unavailable"))
+
+    def test_a_hung_pod_fails(self) -> None:
+        """A Ready pod whose request keeps timing out fails the check, with the error kept."""
+        clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+        check = {"type": "http_pod", "name": "health", "deployment": "prod-demo", "port": 3000, "path": "/healthz"}
+
+        def pod_get(namespace, pod, port, path):
+            """prod-demo-1 hangs; the other pods answer."""
+            if pod == "prod-demo-1":
+                raise TimeoutError("timed out")
+            return 200, b"ok"
+
+        result = rv.check_http_pod(clients, check, pod_get, sleep=lambda _: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("timed out", " ".join(result.details))
+
+
+class PublicRetryTest(unittest.TestCase):
+    """orbit-mobile-api 20261022T053857Z: Cloudflare answered 521 for a minute after the rollout and rolled back a good release."""
+
+    def test_an_edge_error_is_tried_again_and_an_app_error_is_not(self) -> None:
+        """521 is tried again until it answers; 500 is judged at once; 521 for 2 minutes fails."""
+        answers = iter([(521, b"origin down"), (521, b"origin down"), (200, b"ok")])
+        now = [0.0]
+        check = {"type": "http_public", "url": "https://demo.test/health", "expect_status": [200]}
+        result = rv.check_http_public(
+            check,
+            get=lambda request: next(answers),
+            sleep=lambda s: now.__setitem__(0, now[0] + s),
+            clock=lambda: now[0],
+        )
+        self.assertEqual(result.status, "passed")
+        self.assertIn("after 3 tries", result.details[0])
+        calls: list = []
+        failing = rv.check_http_public(
+            check, get=lambda request: calls.append(1) or (500, b"boom"), sleep=lambda s: None
+        )
+        self.assertEqual((failing.status, len(calls)), ("failed", 1))
+        now[0] = 0.0
+        down = rv.check_http_public(
+            check, get=lambda request: (521, b"x"), sleep=lambda s: now.__setitem__(0, now[0] + s), clock=lambda: now[0]
+        )
+        self.assertEqual(down.status, "failed")
+
+
 class LightTest(unittest.TestCase):
     def test_parse(self) -> None:
+        """Parse."""
         run = rl.parse_light(light_data("cloud_run"))
         self.assertEqual(run.services, ("demo-a", "demo-b"))
         self.assertFalse(run.has_gate)
@@ -1668,6 +1959,7 @@ class LightTest(unittest.TestCase):
             rl.parse_light({**light_data("cloud_run"), "smoke": [{"type": "pods_ready", "deployment": "x"}]})
 
     def test_cloud_run_checks_and_rollback(self) -> None:
+        """Cloud run checks and rollback."""
         service = rl.parse_light(light_data("cloud_run"))
         before = {
             "cloud_run/demo-a": {"latest_created": "a-1", "latest_ready": "a-1", "traffic": {"a-1": 100}},
@@ -1689,6 +1981,7 @@ class LightTest(unittest.TestCase):
         self.assertIn("--to-revisions=b-1=100", command)
 
     def test_composer_import_errors_and_rollback(self) -> None:
+        """Composer import errors and rollback."""
         service = rl.parse_light(light_data("composer"))
         record = {
             "previous": {"commit": PREVIOUS},
@@ -1708,6 +2001,7 @@ class LightTest(unittest.TestCase):
         )
 
     def test_import_check_skips_without_api(self) -> None:
+        """Import check skips without api."""
         service = rl.parse_light(light_data("composer"))
         record = {"previous_snapshot": {"composer/import_errors": {"errors": None, "error": "HTTP 403"}}}
         check = rl.check_import_errors(
@@ -1716,6 +2010,7 @@ class LightTest(unittest.TestCase):
         self.assertEqual((check.status, check.details), ("skipped", ["HTTP 403"]))
 
     def test_dag_file_is_the_origin(self) -> None:
+        """Dag file is the origin."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "dags").mkdir()
@@ -1732,17 +2027,20 @@ class LightTest(unittest.TestCase):
             self.assertGreaterEqual(score, rs.ORIGIN)
 
     def test_light_window_render(self) -> None:
+        """Light window render."""
         service = rl.parse_light(light_data("composer"))
         text = kit.rendered(service)["release/services/demo-composer.release-verify.yaml"]
         self.assertIn('--service "${_SERVICE}" watch \\', text)
         self.assertIn('tags: ["demo-composer-release-verify"]', text)
 
     def test_airflow_lists_read_every_page(self) -> None:
+        """Airflow lists read every page."""
         service = rl.parse_light(light_data("composer"))
         airflow = rl.Airflow.__new__(rl.Airflow)
         runs = [{"dag_id": f"d{index % 3}"} for index in range(250)]
 
         def get(path):
+            """Answer with the next canned response."""
             offset = int(path.rsplit("offset=", 1)[1])
             return {"dag_runs": runs[offset : offset + rl.AIRFLOW_PAGE_SIZE], "total_entries": len(runs)}
 
@@ -1756,6 +2054,7 @@ class LightTest(unittest.TestCase):
         self.assertEqual(service.kind, "composer")
 
     def test_failed_import_check_stays_red_when_the_record_write_fails(self) -> None:
+        """Failed import check stays red when the record write fails."""
         service = rl.parse_light(light_data("composer"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1775,6 +2074,7 @@ class LightTest(unittest.TestCase):
             self.assertTrue(marker.exists())
 
     def test_alert_once_and_older_target(self) -> None:
+        """Alert once and older target."""
         service = rl.parse_light(light_data("composer"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1799,6 +2099,7 @@ class LightTest(unittest.TestCase):
             self.assertIn(f"--sha={'e' * 40}", json.dumps(slack.call_args[0][1]))
 
     def test_watch_waits_for_a_running_sync(self) -> None:
+        """Watch waits for a running sync."""
         service = rl.parse_light(light_data("composer"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1811,12 +2112,14 @@ class LightTest(unittest.TestCase):
                 self.assertEqual(rl.replaced_by(service, store, record), "deploy build sync3")
 
     def test_light_warning_names_its_own_rollback(self) -> None:
+        """Light warning names its own rollback."""
         service = rl.parse_light(light_data("composer"))
         line = rv.warning_line(service, _record(), [{"text": "x"}], rr.LocalStore(Path("/tmp")), "gcloud builds x")
         self.assertIn("roll back with gcloud builds x if", line)
         self.assertNotIn("release_rollback.py", line)
 
     def test_cloud_run_rollback_restores_the_serving_split(self) -> None:
+        """Cloud run rollback restores the serving split."""
         service = rl.parse_light(light_data("cloud_run"))
         before = {
             # A human moved traffic back to a-1; a-2 is still the newest ready revision.
@@ -1830,6 +2133,7 @@ class LightTest(unittest.TestCase):
         self.assertIn("--to-revisions=b-2=90,b-3=10", command)
 
     def test_failed_deploy_fails_the_check(self) -> None:
+        """Failed deploy fails the check."""
         service = rl.parse_light(light_data("cloud_run"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1859,6 +2163,7 @@ class LightTest(unittest.TestCase):
             self.assertEqual(target["rollback_to"], f"previous-of:{first['release_id']}")
 
     def test_a_build_during_the_checks_reruns_the_checkpoint(self) -> None:
+        """A build during the checks reruns the checkpoint."""
         service = rl.parse_light(light_data("cloud_run"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1879,6 +2184,7 @@ class LightTest(unittest.TestCase):
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
 
     def test_last_checkpoint_error_is_inconclusive(self) -> None:
+        """Last checkpoint error is inconclusive."""
         service = rl.parse_light(light_data("cloud_run"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -1907,6 +2213,7 @@ class LightTest(unittest.TestCase):
             self.assertEqual([r["release_id"] for r in scope.releases], [newer["release_id"], record["release_id"]])
 
     def test_light_alert_footer_has_no_hold(self) -> None:
+        """Light alert footer has no hold."""
         service = rl.parse_light(light_data("cloud_run"))
         record = _record(verdict={"status": "failed", "phase": "deploy", "reasons": ["x"]}, rollback_suggestion=None)
         _, blocks = rv.rollback_alert(service, record, None, "gs://x", command="gcloud run ...")

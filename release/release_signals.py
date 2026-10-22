@@ -940,6 +940,18 @@ def route_name(method: str, path: str) -> str:
 # A route registration with an inline handler can be long; it ends at its closing parenthesis.
 ROUTE_LINES = 3000
 IDENTIFIER_RE = re.compile(r"[A-Za-z_$][\w$]*")
+# A JavaScript regex literal where an expression starts (after `=`, `(`, `,`, `:` ...).
+# A JavaScript regex literal where an expression starts: after a punctuator, `=>`, or a keyword such
+# as `return` (`values.filter((v) => /\(/.test(v))`, `return /\(/.test(q);`).
+REGEX_LITERAL_RE = re.compile(
+    r"(^|[=(,:\[!&|?{};]|=>|(?<![.\w$])(?:return|typeof|case|void|throw|yield|await|in|of|delete)\b)"
+    r"(\s*)/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+/[a-z]*"
+)
+
+
+def _without_regex(code: str) -> str:
+    """The line with its regex literals replaced by `/./` (their parentheses are no code)."""
+    return REGEX_LITERAL_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}/./", code)
 
 
 def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
@@ -950,7 +962,8 @@ def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
     """
     nesting, inline = 0, False
     for index in range(start - 1, min(len(lines), start - 1 + ROUTE_LINES)):
-        code = _code_only(lines[index])
+        # Regex literals (`/\(/`) hold parentheses that are no code.
+        code = _without_regex(_code_only(lines[index]))
         inline = inline or "=>" in code or re.search(r"\bfunction\b", code) is not None
         for char in code:
             if char in "([":
@@ -963,9 +976,14 @@ def _route_end(lines: list[str], start: int) -> tuple[int, bool]:
 
 
 def _arrow_follows(lines: list[str], start: int) -> bool:
-    """Whether "=>" follows the parameters that open on line `start` (a multi-line arrow function)."""
+    """Whether "=>" follows the parameters that open on line `start` (a multi-line arrow function).
+
+    Right after the closing parenthesis comes "=>", or a return type (":") that may span
+    lines and ends in "=>"; anything else (`).body;`, `).map(`) is an expression.
+    """
     nesting = 0
-    for index in range(start - 1, min(len(lines), start - 1 + SIGNATURE_LINES)):
+    last = min(len(lines), start - 1 + SIGNATURE_LINES)
+    for index in range(start - 1, last):
         code = _code_only(lines[index])
         for column, char in enumerate(code):
             if char == "(":
@@ -973,8 +991,34 @@ def _arrow_follows(lines: list[str], start: int) -> bool:
             elif char == ")":
                 nesting -= 1
                 if nesting == 0:
-                    rest = code[column + 1 :] + " " + (_code_only(lines[index + 1]) if index + 1 < len(lines) else "")
-                    return "=>" in rest
+                    rest = " ".join([code[column + 1 :], *(_code_only(line) for line in lines[index + 1 : last])])
+                    rest = rest.strip()
+                    if rest.startswith("=>"):
+                        return True
+                    return rest.startswith(":") and _arrow_after_type(rest)
+    return False
+
+
+def _arrow_after_type(text: str) -> bool:
+    """Whether a return type (`: Promise<{ a: string; b: number }>`) ends in "=>" before the statement ends.
+
+    Semicolons inside the type's brackets belong to the type; only one outside them ends the statement.
+    """
+    depth, position = 0, 0
+    while position < len(text):
+        if text.startswith("=>", position):
+            if depth == 0:
+                return True
+            position += 2
+            continue
+        char = text[position]
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            return False
+        position += 1
     return False
 
 
@@ -1000,13 +1044,164 @@ def _patterns_for(path: str) -> list[re.Pattern[str]]:
 
 STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`')
 LINE_COMMENT_RE = re.compile(r"//.*$")
+# A block comment on one line, or the start of one that continues on the next lines.
+BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/|/\*.*$")
 # How many lines a function signature may span before its body opens.
 SIGNATURE_LINES = 15
 
 
 def _code_only(line: str) -> str:
-    """A line without string literals and // comments, for brace counting."""
-    return LINE_COMMENT_RE.sub("", STRING_RE.sub('""', line))
+    """A line without string literals, regex literals and comments, for brace counting."""
+    return BLOCK_COMMENT_RE.sub(" ", LINE_COMMENT_RE.sub("", _without_regex(STRING_RE.sub('""', line))))
+
+
+# Words after which a "/" starts a regex literal, not a division.
+REGEX_KEYWORDS = frozenset(
+    {"return", "typeof", "case", "void", "throw", "yield", "await", "in", "of", "delete", "instanceof", "new", "else"}
+)
+
+
+CONDITION_KEYWORDS = frozenset({"if", "while", "for", "with"})
+
+
+def _regex_allowed(last: str, word: str) -> bool:
+    """Whether a "/" after the last token starts a regex literal (an expression can start there)."""
+    if last == "word":
+        return word in REGEX_KEYWORDS
+    return last not in (")", "]", "literal", "}")
+
+
+def blank_comments(lines: list[str], go: bool = False) -> list[str]:
+    """The lines with comments blanked and string and regex contents filled, in one pass over the file.
+
+    The pass knows whether it is in code, a // or /* */ comment, a string (also a template or Go raw
+    string over several lines) or a regex literal, so quotes inside comments, `src/*` inside a
+    string and `/[/*]/` are read as what they are. The contents of a template's `${...}` stay code,
+    so their calls count. Line numbers stay; the parse of function bodies then never sees a brace in a
+    comment or a string. Go has no regex literals and no escapes in its raw strings.
+    """
+    text = "\n".join(lines)
+    out = list(text)
+    size = len(text)
+    templates: list[int] = []  # open "{" count inside each open `${` expression, innermost last
+    conditions: list[bool] = []  # for each open "(": whether it holds the condition of if, while, for or with
+
+    def fill(begin: int, stop: int, char: str) -> None:
+        """Replace text[begin:stop] with char, keeping line breaks."""
+        for position in range(begin, min(stop, size)):
+            if out[position] != "\n":
+                out[position] = char
+
+    def template_text(begin: int) -> tuple[int, str]:
+        """Fill template text from begin; (where code resumes, the last token: a literal or `${`)."""
+        stop = begin
+        while stop < size:
+            if text[stop] == "\\":
+                stop += 2
+                continue
+            if text[stop] == "`":
+                fill(begin, stop, "_")
+                out[stop] = "_"  # a literal stays: "`` / 2" divides
+                return stop + 1, "literal"
+            if text.startswith("${", stop):
+                fill(begin, stop, "_")
+                fill(stop, stop + 2, " ")  # blank delimiters: `VALUES ${rows}` is no one-line body
+                templates.append(0)
+                return stop + 2, "{"
+            stop += 1
+        fill(begin, size, "_")
+        return size, "literal"
+
+    # `last` is the last token: "word", "literal", or a punctuation character; `word` is the last word.
+    position, last, word = 0, "", ""
+    while position < size:
+        char = text[position]
+        if char in " \t\r\n":
+            position += 1
+            continue
+        pair = text[position : position + 2]
+        if pair == "//":
+            stop = text.find("\n", position)
+            stop = size if stop == -1 else stop
+            fill(position, stop, " ")
+            position = stop
+            continue
+        if pair == "/*":
+            stop = text.find("*/", position + 2)
+            stop = size if stop == -1 else stop + 2
+            fill(position, stop, " ")
+            position = stop
+            continue
+        if char == "`" and not go:
+            # Template backticks become a space and a "_": a later per-line string pass must not
+            # pair the backticks of a template and of one nested in its `${...}`.
+            out[position] = " "
+            position, last = template_text(position + 1)
+            continue
+        if char in "\"'`":
+            stop = position + 1
+            while stop < size and text[stop] != char:
+                if text[stop] == "\\" and char != "`":
+                    stop += 2
+                    continue
+                if char != "`" and text[stop] == "\n":
+                    break  # an unterminated one-line string ends at the line
+                stop += 1
+            fill(position + 1, stop, "_")
+            position, last = min(stop + 1, size), "literal"
+            continue
+        if templates and char in "{}":
+            if char == "{":
+                templates[-1] += 1
+            elif templates[-1] == 0:
+                templates.pop()  # the "}" of `${`: the template text goes on
+                out[position] = " "
+                position, last = template_text(position + 1)
+                continue
+            else:
+                templates[-1] -= 1
+        if not go and char == "/" and _regex_allowed(last, word):
+            stop, in_class = position + 1, False
+            while stop < size and text[stop] != "\n":
+                if text[stop] == "\\":
+                    stop += 2
+                    continue
+                if text[stop] == "[":
+                    in_class = True
+                elif text[stop] == "]":
+                    in_class = False
+                elif text[stop] == "/" and not in_class:
+                    break
+                stop += 1
+            if stop < size and text[stop] == "/":
+                fill(position + 1, stop, "_")
+                stop += 1
+                while stop < size and text[stop].isalpha():
+                    stop += 1
+                position, last = stop, "literal"
+                continue
+        if pair in ("++", "--"):
+            # Postfix (`index++`) ends an expression, so a "/" after it divides; prefix (`++index`) does not.
+            postfix = last in (")", "]", "literal") or (last == "word" and word not in REGEX_KEYWORDS)
+            position, last = position + 2, "literal" if postfix else char
+            continue
+        if char.isalnum() or char in "_$":
+            stop = position
+            while stop < size and (text[stop].isalnum() or text[stop] in "_$"):
+                stop += 1
+            # A name after a dot (`units.in`) is a property, never a keyword.
+            word = "" if last == "." else text[position:stop]
+            position, last = stop, "word"
+            continue
+        if char == "(":
+            # `if (x) /re/.test(y)`: after the condition of if, while, for or with a statement starts.
+            conditions.append(last == "word" and word in CONDITION_KEYWORDS)
+        elif char == ")" and conditions and conditions.pop():
+            last, position = ";", position + 1
+            continue
+        last = char
+        position += 1
+    return "".join(out).split("\n")
 
 
 def _brace_end(lines: list[str], start: int) -> int:
@@ -1100,13 +1295,16 @@ def functions_of(path: str, text: str) -> list[Function]:
     bodies end where the indentation returns to the def's level. A declaration
     between two functions belongs to neither.
     """
-    lines = text.splitlines()
-    patterns = _patterns_for(path)
     python = path.endswith(".py")
+    raw = text.splitlines()
+    # Ranges and calls come from the blanked lines (same length); route paths from the original text.
+    lines = raw if python else blank_comments(raw, go=path.endswith(".go"))
+    patterns = _patterns_for(path)
     out = []
     for index, line in enumerate(lines, start=1):
-        route = None if python or path.endswith(".go") else ROUTE_RE.match(line)
-        if route:
+        route = None if python or path.endswith(".go") else ROUTE_RE.match(raw[index - 1])
+        # A registration inside a comment or a string is blanked: it is no route.
+        if route and line[: route.start(2)] == raw[index - 1][: route.start(2)]:
             end, inline = _route_end(lines, index)
             body = "\n".join(lines[index - 1 : end])
             names = set(CALL_RE.findall(body))
