@@ -25,6 +25,9 @@ gates below.
 3. Install the wrapper from a checkout of `orbit-search/orbit-infrastructure`:
    `mkdir -p ~/.local/bin && ln -sf "$PWD/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
    Make sure `~/.local/bin` is on your `PATH`, then check `orbit-agent-gh whoami`.
+4. Connect Slack, so your agent can send approval requests itself: in
+   Claude, add the Slack connector (claude.ai Settings > Connectors); in Codex,
+   add a Slack MCP server to `~/.codex/config.toml`.
 
 ### Rules
 
@@ -61,5 +64,29 @@ gates below.
   `agent-policy` passes. Rollbacks are started by a human: a release that
   fails its release check posts an alert with the rollback command
   (`docs/RELEASE_PIPELINE.md`).
+- **Do not ask your human before merging.** A PR that passes every check
+  merges; the merge bot does it on the server, and you may merge it yourself
+  too. The bot (`agent-merge-sweep` in orbit-infrastructure, every 5 minutes,
+  for repos with `"agentMerge": true` in `.github/agent-policy.json`)
+  squash-merges, as `orbit-harness[bot]`, exactly the head commit it checked,
+  when the PR is open and not a draft, `agent-policy` passes, every check
+  passes, Greptile reviewed that commit and no review thread is open. It never
+  updates a branch that is behind. To keep a ready PR open, mark it as a draft
+  or add the `hold` label.
+- **Ask for approval in Slack.** When `agent-policy` needs approval from
+  someone who is not in your session (a gate, or owner clearance where your
+  human is not an owner), send the request yourself as a Slack direct message
+  through your human's Slack connector. Message only the people the check
+  names (the `owners` in `.github/agent-policy.json`; Slack ids are in
+  `release/release_people.json`), in one group DM per request, never in a
+  channel post: the PR link, what needs approval and why, and how to answer
+  (comment "ship it" on the PR, or reply in the DM and you record their
+  words). Record the approval on the PR as usual. If no Slack connector is
+  available, tell your human once to connect Slack, and continue other work.
+- **Merge deploys.** A merge to `main` deploys (`docs/RELEASE_PIPELINE.md`).
+  Agents never move deploy tags and never run the deploy triggers to ship; to
+  ship, merge. Never cancel a deploy, rollback or release-check build. A build
+  that already deploys still finishes: let it finish, then roll back as
+  `docs/RELEASE_PIPELINE.md` says.
 - **A human owns each change:** the person who started the agent.
 

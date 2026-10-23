@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "agentMerge": true,
   "about": "Agent review policy read by .github/scripts/agent_policy_check.py from the base branch. Agents merge their own PRs; humans approve only the gates below, in words. See AGENTS.md 'Agent review and release policy'.",
   "owners": [
     "NicholasDominici",
