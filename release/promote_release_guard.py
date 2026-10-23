@@ -488,14 +488,29 @@ class Guard:
             )
         print(f"On {branch}: {self.commit} is reachable from {repo}@{branch} ({status})", flush=True)
 
-    def wait_for_dev(self, own: Build, dev_triggers: tuple[str, ...], timeout_seconds: float, branch: str) -> Build:
-        """Wait for a successful dev build of the commit and return it; raise GuardError when it fails or times out."""
+    def wait_for_dev(
+        self,
+        own: Build,
+        dev_triggers: tuple[str, ...],
+        timeout_seconds: float,
+        branch: str,
+        *,
+        allow_overlap: bool = False,
+    ) -> Build:
+        """Wait for a successful dev build of the commit and return it; raise GuardError when it fails or times out.
+
+        allow_overlap: the prod build does not read the :<commit> tag (the light kinds take their
+        artifacts from the dev verify index), so two dev builds of the commit that overlapped are fine.
+        """
         dev_trigger = dev_triggers[0]
         deadline = self.clock() + timeout_seconds
         last_seen = ""
         while True:
             self.check_superseded(own)
-            decision, dev_build = decide_dev(self.api.commit_builds(dev_triggers, self.commit))
+            dev_builds = self.api.commit_builds(dev_triggers, self.commit)
+            decision, dev_build = decide_dev(dev_builds)
+            if decision == "overlap" and allow_overlap:
+                decision, dev_build = "ok", max(dev_builds, key=lambda b: b.order_key)
             if decision == "ok" and dev_build is not None:
                 print(f"Dev first: {dev_trigger} build {dev_build.describe()} succeeded", flush=True)
                 return dev_build

@@ -4,9 +4,11 @@ Instructions for every agent (Codex, Claude, others) working in `orbit-mcp`. `CL
 
 ## Deploys and the release check
 
-- A merge to `main` deploys both Cloud Run services (`cloudbuild.yaml`, trigger `orbit-mcp-deploy`) by
-  digest, behind single flight, with a release record, a deploy check and a watch window
-  (`docs/RELEASE_PIPELINE.md`). Agents never run the deploy trigger to ship; to ship, merge.
+- A merge to `main` deploys a candidate revision of both Cloud Run services with no traffic
+  (`cloudbuild.dev.yaml`, trigger `orbit-mcp-deploy-dev`), runs dev verify on the candidate tag URLs, and
+  then the prod build (`cloudbuild.prod.yaml`, trigger `orbit-mcp-prod`) moves the traffic to exactly
+  those revisions. A failed release rolls back on its own and prod promotes hold (`docs/RELEASE_PIPELINE.md`).
+  Agents never run the deploy triggers to ship; to ship, merge.
 - `release/` is a pinned copy of `orbit-infrastructure/release-kit`; change it there and sync. This repo
   owns only `release/services/orbit-mcp.json`.
 
@@ -99,9 +101,8 @@ Your human does two things once, both in a browser. Your agent does the rest.
   format that the `agent-policy` check prints. A later commit that only fixes
   CI or a review finding keeps the approval with a carry record.
 - **Merge** when CI is green, every review thread is resolved and
-  `agent-policy` passes. Rollbacks are started by a human: a release that
-  fails its release check posts an alert with the rollback command
-  (`docs/RELEASE_PIPELINE.md`).
+  `agent-policy` passes. A release that fails its release check rolls back on
+  its own; a human can also roll back (`docs/RELEASE_PIPELINE.md`).
 - **When to ask your human.** Finish on your own when you can verify the goal
   yourself: bug fixes, backend features, optimizations, infra and CI changes
   get a goal you can check (tests, a replay, a metric), and they merge when

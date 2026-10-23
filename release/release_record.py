@@ -260,16 +260,24 @@ def live_pods(clients: Clients, deployment: rc.Deployment) -> list[dict]:
     ]
 
 
-def snapshot_workloads(clients: Clients) -> dict[str, dict]:
+def snapshot_workloads(clients: Clients, *, missing_ok: bool = False) -> dict[str, dict]:
     """Read the image of every Deployment that the deploy build moves to the release image.
 
     Keys: deployment/<name>. "image" is the template reference and "digest"
     the digest that the Deployment is set to (the template digest, or for a
-    tag-only template the one digest its live pods run).
+    tag-only template the one digest its live pods run). missing_ok: a
+    Deployment that does not exist yet (the first deploy of a new environment)
+    is left out instead of failing.
     """
     workloads: dict[str, dict] = {}
     for item in clients.env.deployments:
-        deployment = clients.kubectl_json("get", "deployment", item.name)
+        try:
+            deployment = clients.kubectl_json("get", "deployment", item.name)
+        except RecordError as error:
+            if missing_ok and "NotFound" in str(error):
+                print(f"deployment/{item.name} does not exist yet (first deploy)", flush=True)
+                continue
+            raise
         pods = clients.kubectl_json("get", "pods", "-l", item.selector)["items"]
         replica_sets = clients.kubectl_json("get", "replicasets", "-l", item.selector)["items"]
         container = _container(deployment["spec"]["template"]["spec"], item.container)
@@ -771,7 +779,8 @@ def _read_text(path: str | None) -> str | None:
 def cmd_begin(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
     """Before the first change to the cluster: snapshot what runs now and write a "deploying" record."""
     started_at = utc_now()
-    before = snapshot_workloads(clients)
+    # The first deploy of a new environment creates its Deployments: before it, nothing runs.
+    before = snapshot_workloads(clients, missing_ok=True)
     previous = previous_release(store, env, before)
     image = _read_text(args.image_file)
     if not digest_of(image):

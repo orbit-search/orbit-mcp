@@ -1,0 +1,197 @@
+# Dev stage of the Orbit MCP servers, the first half of a merge deploy
+# (docs/RELEASE_PIPELINE.md). The push trigger orbit-mcp-deploy-dev runs it for
+# every merge to main. It builds each image once, deploys it as a new revision of
+# the prod Cloud Run service with no traffic and the tag `candidate`, runs dev
+# verify (the candidate revisions run these digests; /health answers on the tag
+# URLs https://candidate---<host>), and when dev verify passes it starts the prod
+# build for the same commit (release/release_gate.py request-promote). The prod
+# build moves the traffic to exactly these revisions; nothing rebuilds them.
+#
+# The candidate revision is a revision of the prod service: it reads the prod
+# config, secrets and data. Its service template changes here, before dev
+# verify; only traffic waits. Existing IAM is preserved.
+substitutions:
+  # "false": deploy and verify the candidates, start no prod build (manual runs of a branch).
+  _AUTO_PROMOTE: "true"
+  # "true": print the prod trigger command instead of running it.
+  _PROMOTE_DRY_RUN: "false"
+  # Test runs: a non-empty text makes dev verify fail with it, to prove that a failure stops the promote.
+  _DEV_VERIFY_FORCE_FAIL: ""
+
+steps:
+  # Build and push both images by commit; write their pushed digests for the dev record.
+  - name: gcr.io/cloud-builders/docker
+    id: build-images
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        printf '{' > /workspace/release_images.json
+        SEP=""
+        for pair in "orbit-mcp:packages/mcp-server" "orbit-profile-mcp:packages/profile-server"; do
+          NAME="$${pair%%:*}"; DIR="$${pair#*:}"
+          REPO="gcr.io/$PROJECT_ID/$${NAME}"
+          docker build -f "$${DIR}/Dockerfile" -t "$${REPO}:$COMMIT_SHA" "$${DIR}"
+          docker push "$${REPO}:$COMMIT_SHA"
+          DIGEST="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$${REPO}:$COMMIT_SHA" | grep -F "$${REPO}@" | head -1 | grep -o 'sha256:[0-9a-f]\{64\}')"
+          test -n "$${DIGEST}"
+          printf '%s\n' "$${REPO}@$${DIGEST}" > "/workspace/$${NAME}.image"
+          printf '%s"%s": "%s"' "$${SEP}" "$${NAME}" "$${REPO}@$${DIGEST}" >> /workspace/release_images.json
+          SEP=", "
+          echo "Pushed $${REPO}@$${DIGEST}"
+        done
+        printf '}\n' >> /workspace/release_images.json
+
+  # Single flight among dev builds: wait for an older one that still runs; a newer
+  # one supersedes this build, which then deploys nothing and ends green.
+  - name: gcr.io/cloud-builders/gcloud
+    id: dev-turn
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        python3 release/release_light.py turn --env dev --build-id "$BUILD_ID" --commit "$COMMIT_SHA" \
+          --older-timeout-seconds 3000
+        TURN_STATUS=$$?
+        if [ "$${TURN_STATUS}" -eq 3 ]; then touch /workspace/deploy_superseded; exit 0; fi
+        exit "$${TURN_STATUS}"
+    timeout: 3300s
+
+  # Dev release record (gs://orbit-search-release-records/orbit-mcp/dev/) with the
+  # digests this build pushed. Without a record dev verify cannot run, so the
+  # commit is not promoted.
+  - name: gcr.io/cloud-builders/gcloud
+    id: release-record-begin
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        python3 release/release_light.py begin --env dev --commit "$COMMIT_SHA" --build-id "$BUILD_ID" \
+          --images-file /workspace/release_images.json \
+          --release-id-file /workspace/release_id \
+          || { echo "WARNING: dev release record not written; dev verify cannot run" >&2; rm -f /workspace/release_id; }
+
+  # The candidates: a new revision of each prod service with no traffic and the tag `candidate`.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-candidates
+    entrypoint: bash
+    allowExitCodes: [1]
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        gcloud run deploy orbit-mcp --image "$(cat /workspace/orbit-mcp.image)" --region us-central1 \
+          --project "$PROJECT_ID" --platform managed --remove-env-vars MCP_BYPASS_KEY \
+          --no-traffic --tag candidate \
+          || { touch /workspace/deploy_failed; exit 1; }
+        gcloud run deploy orbit-profile-mcp --image "$(cat /workspace/orbit-profile-mcp.image)" --region us-central1 \
+          --project "$PROJECT_ID" --platform managed \
+          --no-traffic --tag candidate \
+          || { touch /workspace/deploy_failed; exit 1; }
+
+  # Dev record: the candidate revisions with the digests they run (the artifacts prod promotes).
+  - name: gcr.io/cloud-builders/gcloud
+    id: release-record-finish
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_superseded ] || [ ! -s /workspace/release_id ]; then exit 0; fi
+        STATUS=deployed
+        if [ -f /workspace/deploy_failed ]; then STATUS=deploy_failed; fi
+        python3 release/release_light.py finish --env dev --release-id-file /workspace/release_id --status "$${STATUS}" \
+          || echo "WARNING: dev release record not finished" >&2
+
+  # Dev verify (release/release_light.py check --env dev): each candidate revision
+  # is Ready, runs the digest this build pushed and still has the tag, and
+  # /health answers {"status": "ok"} on both tag URLs. The verdict goes into the
+  # dev record and its commit index. A failure posts the author mention and a fix
+  # prompt, and the commit is not promoted.
+  - name: gcr.io/cloud-builders/gcloud
+    id: dev-verify
+    entrypoint: bash
+    secretEnv: [WEBHOOK_ORBIT]
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        if [ ! -s /workspace/release_id ]; then
+          touch /workspace/release_verify_failed
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":":x: orbit-mcp dev verify could not run for `$SHORT_SHA` (no dev release record); the prod promote did not start"}' \
+            "$$WEBHOOK_ORBIT"
+          exit 0
+        fi
+        python3 release/release_light.py check --env dev \
+          --release-id-file /workspace/release_id \
+          --force-fail "$${DEV_VERIFY_FORCE_FAIL}" \
+          --build-url "https://console.cloud.google.com/cloud-build/builds;region=us-central1/$BUILD_ID?project=$PROJECT_ID" \
+          --build-id "$BUILD_ID" \
+          --failed-marker /workspace/release_verify_failed
+        VERIFY_STATUS=$$?
+        if [ "$${VERIFY_STATUS}" -ne 0 ] && [ "$${VERIFY_STATUS}" -ne 2 ]; then
+          touch /workspace/release_verify_failed
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":":x: orbit-mcp dev verify could not run for `$SHORT_SHA`; the prod promote did not start (see the dev-verify step)"}' \
+            "$$WEBHOOK_ORBIT"
+        fi
+        exit 0
+    env:
+      # Free text goes through the environment, never into the script text.
+      - DEV_VERIFY_FORCE_FAIL=$_DEV_VERIFY_FORCE_FAIL
+    timeout: 1200s
+
+  # Promote: when dev verify passed, start the prod build for this commit
+  # (trigger orbit-mcp-prod, --sha) unless the gate says freeze, hold after a
+  # rollback, or a newer verified commit. It never fails this build.
+  - name: gcr.io/cloud-builders/gcloud
+    id: promote-request
+    entrypoint: bash
+    secretEnv: [WEBHOOK_ORBIT]
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ] || [ -f /workspace/release_verify_failed ]; then exit 0; fi
+        DRY_RUN_FLAG=""
+        if [ "$_PROMOTE_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
+        python3 release/release_gate.py request-promote \
+          --commit "$COMMIT_SHA" \
+          --build-id "$BUILD_ID" \
+          --trigger-name "$TRIGGER_NAME" \
+          --auto-promote "$_AUTO_PROMOTE" \
+          $${DRY_RUN_FLAG}
+        exit 0
+
+  # A failed candidate deploy or dev verify ends the build red (the prod promote did not start).
+  - name: gcr.io/cloud-builders/gcloud
+    id: dev-result
+    entrypoint: bash
+    secretEnv: [WEBHOOK_ORBIT]
+    args:
+      - -c
+      - |
+        if [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        if [ -f /workspace/deploy_failed ]; then
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":":x: orbit-mcp candidate deploy failed for commit `$SHORT_SHA`; prod traffic did not move and the prod promote did not start"}' \
+            "$$WEBHOOK_ORBIT"
+          echo "a candidate deploy failed; see the deploy-candidates step" >&2
+          exit 1
+        fi
+        if [ -f /workspace/release_verify_failed ]; then
+          echo "dev verify failed; see the dev-verify step and the dev release record" >&2
+          exit 1
+        fi
+
+# Up to 50 minutes waiting for an older dev build, then the images, the candidates and dev verify.
+timeout: 7200s
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/slack-webhook-workspace-orbit/versions/latest
+      env: WEBHOOK_ORBIT

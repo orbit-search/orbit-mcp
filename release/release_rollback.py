@@ -28,6 +28,11 @@ A human runs this command, or the watch-window build of a release that failed
 release-verify starts the trigger itself (release_verify.start_rollback, with
 _EXPECT_LATEST so that it refuses when prod moved on).
 
+Services that are not GKE Deployments (release_light.py, tier full) use the same
+commands. A Cloud Run rollback sends the traffic back to the revisions of the
+target release; a Composer rollback syncs the target commit's DAGs to dags/.
+The lock, the record, `_EXPECT_LATEST` and the hold are the same code.
+
 Part of the release kit (orbit-infrastructure/release-kit); ported from
 deep-search bin/release_rollback.py (#2232) and orbit-api #1525.
 """
@@ -42,7 +47,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -85,6 +90,8 @@ class Plan:
     not_rolled_back: list[str]
     notes: list[str]
     problems: list[str]
+    settings_compared: bool = False
+    target_artifacts: dict[str, str] = field(default_factory=dict)
 
     def changes(self) -> list[Step]:
         """The steps that set a new image."""
@@ -117,6 +124,7 @@ def resolve_target(store: rr.Store, target: str) -> tuple[dict, dict]:
             "commit": previous.get("commit"),
             "images": previous.get("images") or {},
             "workloads": previous.get("workloads") or {},
+            "artifacts": previous.get("artifacts") or {},
         }
     record = rr.read_record(store, target)
     if record.get("status") not in ("deployed", "rolled_back"):
@@ -126,6 +134,7 @@ def resolve_target(store: rr.Store, target: str) -> tuple[dict, dict]:
         "commit": record["commit"],
         "images": record.get("images") or {},
         "workloads": record.get("workloads") or {},
+        "artifacts": record.get("artifacts") or {},
     }
 
 
@@ -152,9 +161,14 @@ def build_plan(service: rc.Service, latest: dict, target: dict, live: dict[str, 
         steps.append(Step(key, item.name, item.container, current, reference, "none" if current == digest else "set"))
     notes = []
     not_rolled_back: list[str] = []
+    settings_compared = bool(target.get("commit") and target["commit"] == latest.get("commit"))
     if target.get("commit") and latest.get("commit") and token and target["commit"] != latest["commit"]:
         try:
             payload = rr.github_json(f"repos/{env.github_repo}/compare/{target['commit']}...{latest['commit']}", token)
+            files = payload.get("files")
+            settings_compared = isinstance(files, list) and len(files) < 300
+            if not settings_compared:
+                notes.append("the manifest comparison is missing or may be truncated")
             not_rolled_back = sorted(
                 item["filename"]
                 for item in payload.get("files") or []
@@ -177,6 +191,7 @@ def build_plan(service: rc.Service, latest: dict, target: dict, live: dict[str, 
         target_images=target.get("images") or {},
         steps=steps,
         not_rolled_back=not_rolled_back,
+        settings_compared=settings_compared,
         notes=notes,
         problems=problems,
     )
@@ -327,9 +342,21 @@ def cmd_apply(
     alive: Callable[[str], bool] | None = None,
 ) -> int:
     """Run inside the rollback build: take the prod lock, then guard, record, apply, verify, record."""
+    return locked_apply(args, service, store, lambda: _apply(args, service, store, clients), alive=alive)
+
+
+def locked_apply(
+    args: argparse.Namespace,
+    service: object,
+    store: rr.Store,
+    apply: Callable[[], int],
+    *,
+    alive: Callable[[str], bool] | None = None,
+) -> int:
+    """Run a rollback apply under the prod lock (any kind of service); a dry run takes no lock."""
     if args.dry_run:
         # A dry run changes nothing, so it takes no lock.
-        return _apply(args, service, store, clients)
+        return apply()
     if not args.reason.strip():
         raise rr.RecordError("--reason is required: say why prod rolls back")
     if not args.build_id:
@@ -337,32 +364,31 @@ def cmd_apply(
     alive = alive or rr.build_alive(service.prod)
     rr.acquire_lock(store, args.build_id, "rollback", alive, wait_seconds=LOCK_WAIT_SECONDS)
     try:
-        return _apply(args, service, store, clients)
+        return apply()
     finally:
         rr.release_lock(store, args.build_id)
 
 
-def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
-    """Apply the rollback: write a rollback record, set the images, verify, and hold automatic prod deploys."""
-    env = service.prod
-    title = service.title
-    assert_alone(service, args.build_id)
-    latest, target, before, plan = _plan_for(service, store, clients, args.target)
+def check_expect_latest(args: argparse.Namespace, latest: dict) -> None:
+    """Refuse when --expect-latest names another release than the newest record (prod moved on)."""
     if args.expect_latest and latest["release_id"] != args.expect_latest:
         raise rr.RecordError(
             f"prod moved on: the newest record is {latest['release_id']}, not {args.expect_latest}; nothing changed"
         )
-    print_plan(service, plan)
-    if plan.problems:
-        raise rr.RecordError(f"rollback blocked before any change: {plan.problems[0]}")
-    if args.dry_run:
-        print("\nDry run (_DRY_RUN=true): nothing changed.")
-        return 0
-    if not plan.changes():
-        # A retry after an attempt that set every image but did not finish: wait,
-        # verify and record as usual instead of reporting success.
-        print("Every Deployment is already set to the target; waiting for rollouts and verifying.")
-    previous_workloads, previous_images = rolled_back_images(env, latest, before)
+
+
+def create_rollback_record(
+    service: object,
+    store: rr.Store,
+    args: argparse.Namespace,
+    latest: dict,
+    target: dict,
+    previous: tuple[dict, dict],
+    plan: Plan,
+) -> dict:
+    """Write the "rollback" record before the first change; previous = (workloads, images) of the rolled-back release."""
+    env = service.prod
+    workloads, images = previous
     record = rr.new_record(
         env,
         kind="rollback",
@@ -373,8 +399,8 @@ def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clien
             "release_id": latest["release_id"],
             "commit": latest.get("commit"),
             "recorded": True,
-            "images": previous_images,
-            "workloads": previous_workloads,
+            "images": images,
+            "workloads": workloads,
             "deploy_finished": (latest.get("times") or {}).get("deploy_finished"),
         },
         started_at=rr.utc_now(),
@@ -386,23 +412,40 @@ def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clien
         "rolled_back_release": latest["release_id"],
         "plan": [asdict(step) for step in plan.steps],
         "not_rolled_back": plan.not_rolled_back,
+        "settings_compared": plan.settings_compared,
     }
-    rr.create_record(store, record, "rollback_started")
-    failures = apply_plan(plan, clients)
-    after = rr.snapshot_workloads(clients)
-    # Each Deployment is checked against its own planned digest (a snapshot target can hold two).
-    targets = {step.workload: rr.digest_of(step.target) for step in plan.steps if step.target}
-    check = rv.check_images(record, after, targets=targets)
-    if check.status == "failed":
-        failures += check.details[1:]
+    if latest.get("artifacts"):
+        record["previous"]["artifacts"] = latest["artifacts"]
+    if plan.target_artifacts:
+        record["artifacts"] = dict(plan.target_artifacts)
+    return rr.create_record(store, record, "rollback_started")
+
+
+def finish_rollback(
+    service: object,
+    store: rr.Store,
+    args: argparse.Namespace,
+    record: dict,
+    latest: dict,
+    target: dict,
+    after: dict,
+    checks: list,
+    failures: list[str],
+) -> int:
+    """Write the result on the rollback record; a complete rollback moves latest.json and holds prod deploys."""
+    title = service.title
     status = "deploy_failed" if failures else "deployed"
 
     def finish(current: dict) -> None:
         """Write the result on the rollback record; a complete rollback also gets the promote hold."""
         current["workloads"] = after
         current["status"] = status
+        if target.get("artifacts"):
+            current["artifacts"] = dict(target["artifacts"])
         current["times"]["deploy_finished"] = rr.utc_now()
-        current["checks"] = {"rollback": {"at": rr.utc_now(), "checks": [asdict(check)], "failures": failures}}
+        current["checks"] = {
+            "rollback": {"at": rr.utc_now(), "checks": [asdict(check) for check in checks], "failures": failures}
+        }
         current["verdict"] = {"status": "failed" if failures else "passed", "at": rr.utc_now(), "phase": "rollback"}
         if not failures:
             # Automatic prod deploys pause until the bad change is reverted or fixed (release_gate.py).
@@ -442,6 +485,33 @@ def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clien
     )
     print(f"Rollback complete: {where}")
     return 0
+
+
+def _apply(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
+    """Apply the rollback: write a rollback record, set the images, verify, and hold automatic prod deploys."""
+    env = service.prod
+    assert_alone(service, args.build_id)
+    latest, target, before, plan = _plan_for(service, store, clients, args.target)
+    check_expect_latest(args, latest)
+    print_plan(service, plan)
+    if plan.problems:
+        raise rr.RecordError(f"rollback blocked before any change: {plan.problems[0]}")
+    if args.dry_run:
+        print("\nDry run (_DRY_RUN=true): nothing changed.")
+        return 0
+    if not plan.changes():
+        # A retry after an attempt that set every image but did not finish: wait,
+        # verify and record as usual instead of reporting success.
+        print("Every Deployment is already set to the target; waiting for rollouts and verifying.")
+    record = create_rollback_record(service, store, args, latest, target, rolled_back_images(env, latest, before), plan)
+    failures = apply_plan(plan, clients)
+    after = rr.snapshot_workloads(clients)
+    # Each Deployment is checked against its own planned digest (a snapshot target can hold two).
+    targets = {step.workload: rr.digest_of(step.target) for step in plan.steps if step.target}
+    check = rv.check_images(record, after, targets=targets)
+    if check.status == "failed":
+        failures += check.details[1:]
+    return finish_rollback(service, store, args, record, latest, target, after, [check], failures)
 
 
 def cmd_run(args: argparse.Namespace, service: rc.Service, store: rr.Store, clients: rr.Clients) -> int:
@@ -537,6 +607,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.env != "prod":
             raise rc.ConfigError("rollbacks are for prod only")
+        if rc.config_kind(args.service) != "gke":
+            # Cloud Run and Composer (release_light.py, tier full): the same run, lock, record and hold;
+            # the plan and the change are the kind's own.
+            import release_light as rl  # noqa: PLC0415 - release_light imports this module
+
+            service = rl.load_light(args.service)
+            if not service.has_gate:
+                raise rc.ConfigError(
+                    f"{service.name} is tier {service.tier}: run the command its alert prints "
+                    f"({service.kit_command('release_light.py', 'rollback-command')})"
+                )
+            store = rl.open_store(service, args.dry_run_dir, uri=args.store)
+            light = {"plan": rl.cmd_rollback_plan, "run": cmd_run, "apply": rl.cmd_rollback_apply}
+            return light[args.command](args, service, store, None)
         service, _, store, clients = rr.open_from_args(args)
         return handlers[args.command](args, service, store, clients)
     except (rr.RecordError, GuardError, rc.ConfigError, subprocess.SubprocessError, KeyError, OSError) as error:

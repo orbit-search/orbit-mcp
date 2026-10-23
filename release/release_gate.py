@@ -9,6 +9,11 @@ the same commit (trigger <service>-prod, `--sha`). The prod build runs
 Tiers without a dev stage: the prod build of a merge runs `check-direct`
 before it changes anything: the freeze and the hold apply, dev verify does not.
 
+The same gate serves the services that are not GKE Deployments (release_light.py,
+kinds cloud_run and composer, tier full): their dev stage is a no-traffic Cloud
+Run revision or a Composer candidate folder, and `check-prod --artifacts-file`
+compares what the prod build promotes with what dev verify checked.
+
 A promote goes ahead only when all of these hold:
 
 - No freeze: a human can stop every automatic prod deploy (`freeze`) and start
@@ -43,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import sys
@@ -290,11 +296,15 @@ def _hold(stores: Stores, commit: str, token: str, pointer: dict | None) -> Deci
     )
 
 
-def decide(stores: Stores, commit: str, token: str, images: dict | None = None) -> Decision:
+def decide(
+    stores: Stores, commit: str, token: str, images: dict | None = None, artifacts: dict | None = None
+) -> Decision:
     """Whether the commit may be promoted to prod now (full tier).
 
     images (the prod build): the image it is about to deploy; it must be the digest that dev
-    verify checked.
+    verify checked. artifacts (the prod build of a light kind): what it is about to promote (Cloud
+    Run revisions with their digests, a Composer candidate folder's content hash); they must be the
+    ones that dev verify checked.
     """
     repo = stores.service.github_repo
     if frozen := _frozen(stores):
@@ -312,6 +322,16 @@ def decide(stores: Stores, commit: str, token: str, images: dict | None = None) 
         ]
         if moved:
             return Decision("unverified", f"prod would deploy images that dev verify did not check: {'; '.join(moved)}")
+    if artifacts is not None:
+        verified = index.get("artifacts") or {}
+        moved = [
+            f"{name} {artifacts.get(name)} (dev verified {verified.get(name)})"
+            for name in sorted(set(artifacts) | set(verified))
+            if artifacts.get(name) != verified.get(name)
+        ]
+        if moved or not artifacts:
+            what = "; ".join(moved) or "nothing"
+            return Decision("unverified", f"prod would promote artifacts that dev verify did not check: {what}")
     pointer, _ = stores.prod.read("latest.json")
     prod_commit = (pointer or {}).get("commit")
     if pointer and pointer.get("kind") != "rollback" and prod_commit and contains(repo, commit, prod_commit, token):
@@ -473,12 +493,15 @@ def _skip(args: argparse.Namespace, decision: Decision) -> None:
 def cmd_check_prod(args: argparse.Namespace, stores: Stores) -> int:
     """Prod build of the full tier, after preflight: 0 go, 4 skip (frozen, held, stale), 1 blocked.
 
-    The image preflight resolved must be the digest that dev verify checked. With --build-id the
-    build takes the prod lock first and keeps it on go, until `release_record.py finish`.
+    The image preflight resolved must be the digest that dev verify checked (--image-file, GKE);
+    for the light kinds the artifacts preflight read live must be the ones dev verify checked
+    (--artifacts-file). With --build-id the build takes the prod lock first and keeps it on go,
+    until the record's `finish`.
     """
-    images = {rr.IMAGE_ROLE: Path(args.image_file).read_text(encoding="utf-8").strip()}
+    images = {rr.IMAGE_ROLE: Path(args.image_file).read_text(encoding="utf-8").strip()} if args.image_file else None
+    artifacts = json.loads(Path(args.artifacts_file).read_text(encoding="utf-8")) if args.artifacts_file else None
     with gate_lock(stores, args.build_id) as lock:
-        decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images)
+        decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images, artifacts=artifacts)
         print(f"Gate: {decision.status}: {decision.reason}", flush=True)
         if decision.go:
             lock.keep()
@@ -706,7 +729,9 @@ def main(argv: list[str] | None = None) -> int:
     check = commands.add_parser("check-prod", help="full-tier prod build: 0 go, 4 skip, 1 blocked")
     check.add_argument("--commit", required=True)
     check.add_argument("--skip-reason-file")
-    check.add_argument("--image-file", required=True, help="the image (repo@digest) preflight resolved")
+    promoted = check.add_mutually_exclusive_group(required=True)
+    promoted.add_argument("--image-file", help="GKE: the image (repo@digest) preflight resolved")
+    promoted.add_argument("--artifacts-file", help="light kinds: the artifacts (JSON) preflight read live")
     check.add_argument("--build-id", default="", help="the prod build ($BUILD_ID): it takes the prod lock")
 
     direct = commands.add_parser("check-direct", help="prod build without a dev stage: 0 go, 4 skip")
@@ -729,7 +754,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"release-gate: --commit must be a full 40-character sha, got {commit!r}", file=sys.stderr)
         return EXIT_ERROR
     try:
-        service = rc.load_service(args.service)
+        service = rc.load_any_service(args.service)
+        if not service.has_gate:
+            raise rc.ConfigError(f"{service.name} is tier {service.tier}: it has no release gate")
         stores = open_stores(service, args.store, args.dry_run_dir)
         if args.command == "request-promote":
             return cmd_request_promote(args, stores)

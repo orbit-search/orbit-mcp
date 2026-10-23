@@ -209,7 +209,8 @@ class Finding:
     baseline_samples: float
     candidate_samples: float
     limit: str
-    status: str  # ok, exceeded, insufficient, within_spread, no_runtime_change
+    # ok, exceeded, insufficient, within_spread, no_spread, no_runtime_change, environmental, environmental_marked
+    status: str
     unit: str = ""
 
     def line(self) -> str:
@@ -338,6 +339,413 @@ def apply_spread(findings: list[Finding], hourly: dict[str, dict[str, list[float
             )
 
 
+# --------------------------------------------------------------------------- control by version, environmental signals
+
+# Spans with DD_VERSION carry the release's commit in the `version` tag. In deep-search, from 2026-10-21
+# 23:00 UTC, the profile store's prod writes failed (a switch, not code), and 3 releases in a row rolled
+# back on their HTTP error rate while the rollback target ran as bad or worse in the same windows. An
+# exceeded rate of a `versioned` metric is therefore compared with the other versions too.
+NO_VERSION = frozenset({"", "*", "N/A", "n/a", "none"})
+GROUP_BY_RE = re.compile(r"\bby \{([^}]*)\}")
+
+
+def versioned_query(query: str) -> str:
+    """The query with `version` as its last group tag: `by {a}` -> `by {a,version}`, none -> `by {version}`."""
+    match = GROUP_BY_RE.search(query)
+    if match:
+        return f"{query[: match.end(1)]},version{query[match.end(1) :]}"
+    if query.endswith(".as_count()"):
+        return query[: -len(".as_count()")] + " by {version}.as_count()"
+    return query + " by {version}"
+
+
+def is_release_version(version: str, commit: str) -> bool:
+    """Whether a version tag names the commit (DD_VERSION holds the commit or its short form)."""
+    return len(version) >= 7 and commit.startswith(version)
+
+
+def by_version(
+    dd: DatadogClient, metric: rc.Metric, start: datetime, end: datetime
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Per scope and version: (numerator, denominator) of a versioned rate metric in [start, end)."""
+    numerator = dd.scalar(versioned_query(metric.numerator), "sum", start, end)
+    denominator = dd.scalar(versioned_query(metric.denominator), "sum", start, end)
+    out: dict[str, dict[str, tuple[float, float]]] = {}
+    for key, samples in denominator.items():
+        group, _, version = key.rpartition("|")
+        if version in NO_VERSION or samples <= 0:
+            continue
+        out.setdefault(scope_of(metric, group or "*"), {})[version] = (numerator.get(key) or 0.0, samples)
+    return out
+
+
+def control_by_version(
+    service: rc.Service,
+    dd: DatadogClient,
+    record: dict,
+    findings: list[Finding],
+    end: datetime,
+    judged_commits: tuple[str, ...] = (),
+) -> None:
+    """An exceeded rate that the other versions in prod show too is not the release's: "environmental".
+
+    The window runs from the deploy start to the checkpoint, so it holds the rollout overlap (the
+    previous version's pods) and any older pod that still serves, the rollback target among them.
+    Environmental when the other versions, pooled, also exceed the limit over the baseline and the
+    release does not exceed the limit over them. With too few samples on the other versions the plain
+    limit decides. judged_commits: the commits of the earlier unjudged releases judged with this one;
+    their versions count as the release, never as controls (the error may have started in them).
+    """
+    metrics = {metric.name: metric for metric in service.metrics if metric.versioned and metric.kind == "rate"}
+    exceeded = [f for f in findings if f.status == "exceeded" and f.metric in metrics]
+    if not exceeded:
+        return
+    start = rr.parse_utc(record["times"]["deploy_started"])
+    commits = (record["commit"], *judged_commits)
+
+    def released(version: str) -> bool:
+        """Whether a version is one of the releases under judgment."""
+        return any(is_release_version(version, commit) for commit in commits)
+
+    rates: dict[str, dict[str, dict[str, tuple[float, float]]]] = {}
+    for finding in exceeded:
+        metric = metrics[finding.metric]
+        if metric.name not in rates:
+            rates[metric.name] = by_version(dd, metric, start, end)
+        versions = rates[metric.name].get(finding.scope) or {}
+        own = {version: value for version, value in versions.items() if released(version)}
+        others = {version: value for version, value in versions.items() if not released(version)}
+        newest = [value for version, value in own.items() if is_release_version(version, record["commit"])]
+        newest_errors, newest_n = sum(errors for errors, _ in newest), sum(n for _, n in newest)
+        control_n = sum(n for _, n in others.values())
+        if not (newest_n and control_n):
+            finding.limit += "; no other version served in the window"
+            continue
+        control, rate = sum(errors for errors, _ in others.values()) / control_n, newest_errors / newest_n
+        names = ", ".join(version[:9] for version in sorted(others, key=lambda version: -others[version][1])[:3])
+        same_window = (
+            f"in the same window ({start:%H:%M}-{end:%H:%M} UTC) the other versions ({names}) ran "
+            f"{control:.2%} (n={control_n:,.0f}), the release {rate:.2%} (n={newest_n:,.0f})"
+        )
+        rise = judge(metric, finding.scope, (finding.baseline, finding.baseline_samples), (control, control_n))
+        # Each release version on its own, the newest first: pooled, a healthy earlier one could hide it.
+        versus = [judge(metric, finding.scope, (control, control_n), (rate, newest_n))]
+        versus += [
+            judge(metric, finding.scope, (control, control_n), (errors / n, n))
+            for version, (errors, n) in own.items()
+            if n and not is_release_version(version, record["commit"])
+        ]
+        if rise.status == "exceeded" and versus[0].status == "ok" and all(v.status == "ok" for v in versus):
+            finding.status = "environmental"
+            finding.limit += f"; not the release: {same_window}"
+        else:
+            finding.limit += f"; {same_window}"
+
+
+# A signal that still fails on the rollback target after an automatic rollback has an environmental
+# cause (watch_rollback). It is marked in this object of the store; while it is marked, an exceeded
+# limit on it is a quiet warning and never rolls back. The mark ends when the signal is back within
+# its limit of the baseline from before the cause.
+ENVIRONMENTAL_OBJECT = "environmental_signals.json"
+ROLLBACK_WINDOW_MINUTES = 15
+ROLLBACK_RECORD_WAIT_SECONDS = 600
+
+
+def signal_key(metric: str, scope: str) -> str:
+    """The key of a signal in the marks: the metric and its scope."""
+    return f"{metric} {scope}"
+
+
+def environmental_signals(store: rr.Store) -> dict[str, dict]:
+    """The signals marked environmental now, by signal_key. Unreadable: none (the plain limits decide)."""
+    try:
+        data, _ = store.read(ENVIRONMENTAL_OBJECT)
+    except rr.RecordError as error:
+        print(f"WARNING: the environmental signals could not be read: {error}", file=sys.stderr, flush=True)
+        return {}
+    return {key: entry for key, entry in ((data or {}).get("signals") or {}).items() if entry.get("status") == "active"}
+
+
+def alert_marks(store: rr.Store) -> None:
+    """Post the Slack line of each mark that Slack has not taken yet; marks of one rollback share a line.
+
+    Never raises: the watch posts again at its next checkpoint.
+    """
+    try:
+        data, _ = store.read(ENVIRONMENTAL_OBJECT)
+        pending = {
+            entry["alert"]
+            for entry in ((data or {}).get("signals") or {}).values()
+            if entry.get("status") == "active" and not entry.get("alerted") and entry.get("alert")
+        }
+        posted = {alert for alert in sorted(pending) if rr.post_slack(alert)}
+        if not posted:
+            return
+
+        def change(current: dict | None) -> dict:
+            """Note the marks whose line Slack took."""
+            data = current or {"signals": {}}
+            for entry in (data.get("signals") or {}).values():
+                if entry.get("alert") in posted:
+                    entry["alerted"] = True
+            return data
+
+        rr.update_object(store, ENVIRONMENTAL_OBJECT, change)
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        print(f"WARNING: the environmental alerts could not be posted: {error}", file=sys.stderr, flush=True)
+
+
+def apply_environmental(findings: list[Finding], signals: dict[str, dict]) -> None:
+    """An exceeded limit on a marked signal is a quiet warning: no automatic rollback until it recovers."""
+    for finding in findings:
+        entry = signals.get(signal_key(finding.metric, finding.scope))
+        if entry and finding.status == "exceeded":
+            finding.status = "environmental_marked"
+            finding.limit += (
+                f"; environmental since {entry['since']} (rollback {entry['rollback_id']} did not help), "
+                "so no automatic rollback on it until it recovers"
+            )
+
+
+def recovered_signals(service: rc.Service, findings: list[Finding], signals: dict[str, dict]) -> list[str]:
+    """The marked signals that are back within their limit of the baseline from before the cause."""
+    metrics = {metric.name: metric for metric in service.metrics}
+    recovered = []
+    for finding in findings:
+        key = signal_key(finding.metric, finding.scope)
+        entry = signals.get(key)
+        if not entry or finding.metric not in metrics:
+            continue
+        base = (entry["baseline"], entry["baseline_samples"])
+        if (
+            judge(metrics[finding.metric], finding.scope, base, (finding.candidate, finding.candidate_samples)).status
+            == "ok"
+        ):
+            recovered.append(key)
+    return recovered
+
+
+def note_recovered(service: rc.Service, store: rr.Store, record: dict, keys: list[str]) -> None:
+    """End the marks of recovered signals: automatic rollbacks on them are on again. Never raises."""
+    if not keys:
+        return
+    ended: list[str] = []
+
+    def change(current: dict | None) -> dict:
+        """Mark the recovered signals with when and in which release."""
+        data = current or {"signals": {}}
+        ended.clear()
+        for key in keys:
+            entry = (data.get("signals") or {}).get(key)
+            if entry and entry.get("status") == "active":
+                entry.update(status="recovered", recovered_at=rr.utc_now(), recovered_in=record["release_id"])
+                ended.append(key)
+        return data
+
+    try:
+        rr.update_object(store, ENVIRONMENTAL_OBJECT, change)
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        print(f"WARNING: could not end the environmental marks: {error}", file=sys.stderr, flush=True)
+        return
+    if ended:
+        rr.post_slack(
+            f":white_check_mark: {service.title} {record['environment']}: {', '.join(ended)} recovered (release "
+            f"{record['commit'][:9]}); automatic rollbacks on it are on again."
+        )
+
+
+def signal_value(
+    dd: DatadogClient, metric: rc.Metric, scope: str, commit: str, start: datetime, end: datetime
+) -> tuple[float | None, float]:
+    """(value, samples) of a metric scope in [start, end): the commit's own version when the metric has one."""
+    if metric.versioned and metric.kind == "rate":
+        versions = by_version(dd, metric, start, end).get(scope) or {}
+        own = [value for version, value in versions.items() if is_release_version(version, commit)]
+        errors, samples = sum(e for e, _ in own), sum(n for _, n in own)
+        return (errors / samples if samples else None), samples
+    values = {scope_of(metric, group): value for group, value in metric_values(dd, metric, start, end).items()}
+    return values.get(scope, (None, 0.0))
+
+
+def watch_rollback(
+    service: rc.Service,
+    store: rr.Store,
+    dd: DatadogClient | None,
+    record: dict,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    now: Callable[[], datetime] = lambda: datetime.now(rr.UTC),
+    prod_busy: Callable[[], list[str]] | None = None,
+) -> str:
+    """After an automatic rollback, judge the metrics that caused it on the rollback target.
+
+    ROLLBACK_WINDOW_MINUTES after the rollback deployed, each metric limit of the failed checkpoint is
+    judged again against the same baseline, on the rollback target's own version where the metric
+    has one. Still exceeded: the cause is environmental, not the release. The signal is marked (no
+    automatic rollback on it until it recovers), one Slack line asks a human to look, and when every
+    regression of the checkpoint is such a signal, the promote hold of the rollback ends. Metrics
+    with the spread rule are not judged again (a rollback back inside the hourly spread proves
+    nothing), and nothing is judged while a build changes prod. Returns the outcome; never raises.
+    """
+    if dd is None:
+        return "not checked: no Datadog client"
+
+    def busy() -> list[str]:
+        """Builds that change prod now: deploys past their gate (the prod lock) and running rollbacks."""
+        holder = rr.lock_holder(store, rr.build_alive(service.prod))
+        running = builds_changing_prod(service, None)[1]
+        return (
+            [f"{holder.get('kind')} build {holder.get('holder')} (holds the prod lock)"] if holder else []
+        ) + running
+
+    try:
+        return _watch_rollback(service, store, dd, record, sleep, clock, now, prod_busy or busy)
+    except Exception as error:  # noqa: BLE001 - the rollback already happened; this check only adds to it
+        print(f"WARNING: the check after the rollback could not run: {error}", file=sys.stderr, flush=True)
+        return f"not checked: {error}"
+
+
+def _watch_rollback(
+    service: rc.Service,
+    store: rr.Store,
+    dd: DatadogClient,
+    record: dict,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    now: Callable[[], datetime],
+    prod_busy: Callable[[], list[str]],
+) -> str:
+    """watch_rollback without the catch-all."""
+    release_id = record["release_id"]
+    current = rr.read_record(store, release_id)
+    phase = (current.get("verdict") or {}).get("phase", "")
+    regressions = ((current.get("checks") or {}).get(phase) or {}).get("regressions") or []
+    items = [item for item in regressions if item.get("kind") == "metric"]
+    metrics = {metric.name: metric for metric in service.metrics}
+    # Spread metrics need the baseline's hourly values; the check after a rollback does not judge them.
+    items = [item for item in items if item.get("metric") in metrics and not metrics[item["metric"]].spread]
+    if not items:
+        return "no metric without the spread rule regressed"
+    deadline = clock() + ROLLBACK_RECORD_WAIT_SECONDS
+    while not (by := current.get("rolled_back_by")):
+        if clock() > deadline:
+            return f"no rollback record for {release_id} after {ROLLBACK_RECORD_WAIT_SECONDS // 60} min"
+        sleep(30)
+        current = rr.read_record(store, release_id)
+    rollback = rr.read_record(store, by)
+    kept = (rollback.get("rollback") or {}).get("not_rolled_back") or []
+    if kept:
+        # The rollback set images (and rollback_env) only; a setting the release changed may still run.
+        return f"not judged: rollback {by} left changes in place ({', '.join(kept[:5])})"
+    if (rollback.get("rollback") or {}).get("settings_compared") is not True:
+        return f"not judged: rollback {by} did not verify which settings stayed in place"
+    finished = rr.parse_utc(rollback["times"].get("deploy_finished") or rollback["times"]["deploy_started"])
+    wait = (finished + timedelta(minutes=ROLLBACK_WINDOW_MINUTES) - now()).total_seconds()
+    if wait > 0:
+        print(f"Waiting {wait / 60:.1f} min to judge {len(items)} metric(s) on the rollback target", flush=True)
+        sleep(wait)
+    pointer, _ = store.read("latest.json")
+    if (pointer or {}).get("release_id") != by:
+        return f"prod moved on from rollback {by}"
+    if changing := prod_busy():
+        # A Fixes-release deploy may be past its gate while latest.json still names the rollback.
+        return f"not judged: {changing[0]} changes prod"
+    end, target = now(), rollback["commit"]
+    findings = [
+        judge(
+            metrics[item["metric"]],
+            item["scope"],
+            (item["baseline"], item["baseline_samples"]),
+            signal_value(dd, metrics[item["metric"]], item["scope"], target, finished, end),
+        )
+        for item in items
+    ]
+    pointer, _ = store.read("latest.json")
+    if (pointer or {}).get("release_id") != by:
+        return f"prod moved on from rollback {by} during the metric reads"
+    if changing := prod_busy():
+        return f"not judged: {changing[0]} changes prod"
+    still = [f for f in findings if f.status == "exceeded"]
+    window = f"{finished:%m-%d %H:%M}-{end:%H:%M} UTC on {target[:9]}"
+
+    def note(current: dict) -> None:
+        """Keep what the check after the rollback found in the rollback's record."""
+        current.setdefault("checks", {})["rollback_window"] = {
+            "at": rr.utc_now(),
+            "window": window,
+            "findings": [asdict(f) for f in findings],
+            "environmental": [signal_key(f.metric, f.scope) for f in still],
+        }
+
+    rr.update_record(store, by, note, "rollback_window", {"still_failing": len(still)})
+    for finding in findings:
+        print(f"   after the rollback {finding.status:>11}  {finding.line()}", flush=True)
+    if not still:
+        return f"the rollback helped ({window})"
+    every = len(still) == len(regressions)
+    keys = [signal_key(f.metric, f.scope) for f in still]
+    if every:
+        why = (
+            f"The cause is environmental (a switch, a provider, data), not release {record['commit'][:9]}, "
+            f"and the promote hold of {by} ends"
+        )
+    else:
+        why = (
+            f"These signals did not come from release {record['commit'][:9]}; its other regressions keep "
+            f"the promote hold of {by}"
+        )
+    alert = (
+        f":warning: {service.title} {record['environment']}: rollback {by} did not help. {window}: "
+        f"{'; '.join(f.line() for f in still)[:600]}. {why}. Automatic rollbacks on {', '.join(keys)} stop "
+        f"until it recovers. Please look. Marks: {store.location(ENVIRONMENTAL_OBJECT)}"
+    )
+
+    def mark(current: dict | None) -> dict:
+        """Mark each signal that still fails (a mark that is active stays as it is)."""
+        data = current or {"signals": {}}
+        signals = data.setdefault("signals", {})
+        for finding in still:
+            key = signal_key(finding.metric, finding.scope)
+            if (signals.get(key) or {}).get("status") == "active":
+                continue
+            signals[key] = {
+                "status": "active",
+                "metric": finding.metric,
+                "scope": finding.scope,
+                "baseline": finding.baseline,
+                "baseline_samples": finding.baseline_samples,
+                "value": finding.candidate,
+                "samples": finding.candidate_samples,
+                "window": window,
+                "since": rr.utc_now(),
+                "release_id": release_id,
+                "rollback_id": by,
+                # One Slack line per rollback; alert_marks posts it and retries until Slack takes it.
+                "alert": alert,
+                "alerted": False,
+            }
+        return data
+
+    rr.update_object(store, ENVIRONMENTAL_OBJECT, mark)
+
+    def cause(current: dict) -> None:
+        """Note the environmental signals on the failed release; the cause only when every regression was one."""
+        verdict = current.setdefault("verdict", {})
+        verdict["environmental_signals"] = keys
+        if every:
+            verdict["cause"] = "environmental"
+
+    rr.update_record(store, release_id, cause, "cause_environmental", {"signals": len(still)})
+    if every:
+        import release_gate as rg  # noqa: PLC0415 - release_gate imports this module
+
+        stores = rg.Stores(service=service, prod=store, dev=None)
+        rg.release_hold(stores, by, f"environmental: {', '.join(keys)} still failed on {window}", AUTO_REQUESTER)
+    alert_marks(store)
+    return f"environmental: {', '.join(keys)}"
+
+
 # Lines of a manifest that set only the Datadog version.
 VERSION_LINE_RE = re.compile(
     r'DD_VERSION|tags\.datadoghq\.com/version|^\s*value:\s*"(unreleased|1\.0\.0)"\s*$|^\s*(#.*)?$'
@@ -419,6 +827,7 @@ def judge_metrics(
     window: tuple[datetime, datetime],
     token: str | None,
     base_commit: str | None = None,
+    judged_commits: tuple[str, ...] = (),
 ) -> list[Finding]:
     """compare() of the two windows, then the spread rule, then no rollback for releases without runtime code.
 
@@ -443,6 +852,10 @@ def judge_metrics(
             print(f"WARNING: the hourly spread could not be read: {error}", file=sys.stderr, flush=True)
             hourly = {metric.name: {} for metric in spread}  # every exceeded spread finding becomes no_spread
         apply_spread(findings, hourly)
+    try:
+        control_by_version(service, dd, record, findings, window[1], judged_commits)
+    except GuardError as error:
+        print(f"WARNING: the per-version control could not be read: {error}", file=sys.stderr, flush=True)
     left = [f for f in findings if f.status == "exceeded"]
     if left:
         runtime, why = runtime_change(service, record, token, base_commit)
@@ -920,6 +1333,7 @@ def evaluate(
     elif metrics_error and service.metrics:
         checks.append(Check("metrics", "skipped", [metrics_error]))
     findings: list[Finding] = []
+    recovered: list[str] = []
     new_errors: dict | None = None
     window_note = ""
     candidate_minutes = 0.0
@@ -946,9 +1360,14 @@ def evaluate(
                     (c_start, c_end),
                     token,
                     base_commit=(oldest.get("previous") or {}).get("commit"),
+                    judged_commits=tuple(item["commit"] for item in chain[1:]),
                 )
             except GuardError as error:
                 checks.append(Check("metrics", "skipped", [f"Datadog query failed: {error}"]))
+            if store is not None and findings:
+                marks = environmental_signals(store)
+                apply_environmental(findings, marks)
+                recovered = recovered_signals(service, findings, marks)
         if store is not None and candidate_minutes >= 1:
             try:
                 new_errors = rs.check_new_errors(
@@ -1005,6 +1424,17 @@ def evaluate(
         for item in findings
         if item.status == "no_spread"
     ]
+    warnings += [
+        {
+            "kind": "metric",
+            "name": f"{item.metric}:{item.scope}",
+            "text": f"{item.line()}; the other versions in prod show it too, so it does not roll back",
+            "suspects": [],
+            "candidates": [],
+        }
+        for item in findings
+        if item.status == "environmental"
+    ]
     judged_metrics = {metric.name for metric in service.metrics if metric.judged}
     judged = sum(
         item.candidate_samples for item in findings if item.metric in judged_metrics and item.status != "insufficient"
@@ -1027,6 +1457,7 @@ def evaluate(
         "new_errors": new_errors,
         "warnings": warnings,
         "chain": [item["release_id"] for item in chain],
+        "recovered_signals": recovered,
         "result": "failed" if regressions else "passed",
     }
 
@@ -1448,6 +1879,8 @@ def finish_dev_verify(
             "release_id": saved["release_id"],
             "verdict": verdict,
             "images": saved.get("images"),
+            # The light kinds (Cloud Run revisions, a Composer candidate folder): what prod must promote.
+            **({"artifacts": saved["artifacts"]} if saved.get("artifacts") else {}),
             "build": saved.get("build"),
             "updated_at": rr.utc_now(),
         },
@@ -1840,7 +2273,7 @@ def cmd_watch(
     record = rr.read_record(store, args.release_id)
     if (record.get("verdict") or {}).get("status") == "failed":
         # The deploy checks failed in the prod build: act now, not at the first checkpoint.
-        on_failure(service, store, record)
+        on_failure(service, store, record, _datadog(service, clients)[0])
         return EXIT_OK
     finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
     checkpoints = sorted(int(value) for value in args.checkpoints.replace(",", " ").split())
@@ -1898,6 +2331,8 @@ def cmd_watch(
                 checkpoints.append(minutes + args.extend_minutes)
             saved = apply_result(service, store, record, result, final=last and not extend, token=token)
             post_warnings(service, store, saved, result["fresh_warnings"])
+            note_recovered(service, store, saved, result.get("recovered_signals") or [])
+            alert_marks(store)
         except (rr.RecordError, GuardError, rc.ConfigError, OSError, ValueError, KeyError) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
             _record_checkpoint_error(store, record, minutes, str(error), final=last)
@@ -1909,7 +2344,7 @@ def cmd_watch(
         if saved["verdict"]["status"] == "failed" or (last and not extend):
             rr.post_slack(slack_line(service, saved, result, store))
             if saved["verdict"]["status"] == "failed":
-                on_failure(service, store, saved)
+                on_failure(service, store, saved, dd)
             return EXIT_OK
     return EXIT_OK
 
@@ -1934,10 +2369,14 @@ def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error:
         print(f"WARNING: could not record the checkpoint error: {write_error}", file=sys.stderr, flush=True)
 
 
-def on_failure(service: rc.Service, store: rr.Store, record: dict) -> None:
-    """A failed prod release: start the rollback (tiers with automatic rollback), else ping the author."""
+def on_failure(service: rc.Service, store: rr.Store, record: dict, dd: DatadogClient | None = None) -> None:
+    """A failed prod release: start the rollback (tiers with automatic rollback), else ping the author.
+
+    After an automatic rollback, watch_rollback judges the regressed metrics on the rollback target.
+    """
     if service.auto_rollback:
-        start_rollback(service, store, record)
+        if start_rollback(service, store, record, followed=lambda status: status == "SUCCESS"):
+            print(f"After the rollback: {watch_rollback(service, store, dd, record)}", flush=True)
         return
     if os.environ.get("RELEASE_AUTO_ROLLBACK", "").strip() != "1":
         print("Test run: no alert for the failed release (RELEASE_AUTO_ROLLBACK is not 1)", flush=True)
@@ -2080,6 +2519,7 @@ def start_rollback(
     runner: Callable[[list[str]], str] | None = None,
     builds: Callable[[rc.Service, str | None], tuple[bool, list[str]]] | None = None,
     follow: bool = True,
+    followed: Callable[[str], bool] | None = None,
 ) -> str | None:
     """Start the rollback build for a failed release that still runs in prod; return the build id.
 
@@ -2204,7 +2644,9 @@ def start_rollback(
     print(f"Automatic rollback build {build_id} started: {url}", flush=True)
     rr.post_slack(*rollback_alert(service, current, url, store.location(rr.record_name(release_id))))
     if follow:
-        follow_rollback(service, store, release_id, build_id, claim_id, target=target)
+        status = follow_rollback(service, store, release_id, build_id, claim_id, target=target)
+        if followed is not None and not followed(status):
+            return None
     return build_id
 
 
