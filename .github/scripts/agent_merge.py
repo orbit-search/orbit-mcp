@@ -83,7 +83,8 @@ class PullState:
     default_branch: str
     head: str
     created_at: str
-    head_committed_at: str
+    # When the head reached GitHub: its first check run (a commit date can be older than the push).
+    head_pushed_at: str
     labels: list[str] = field(default_factory=list)
     reviews: list[dict] = field(default_factory=list)
     unresolved_threads: int = 0
@@ -93,18 +94,21 @@ class PullState:
 
 @dataclass
 class Decision:
+    """Merge now, or wait, and why."""
+
     merge: bool
     reason: str
 
 
 def latest_check_runs(check_runs: list[dict]) -> dict[tuple[str, str], dict]:
-    """The newest run of each (app, name) pair; a re-run replaces the older result."""
+    """The newest run of each (app, name) pair; a re-run replaces the older result.
+
+    Newest = the highest id (creation order): a queued re-run has no start time yet."""
     latest: dict[tuple[str, str], dict] = {}
     for run in check_runs:
         key = (((run.get("app") or {}).get("slug") or ""), run.get("name") or "")
-        stamp = (run.get("started_at") or "", run.get("id") or 0)
         current = latest.get(key)
-        if current is None or stamp > (current.get("started_at") or "", current.get("id") or 0):
+        if current is None or (run.get("id") or 0) > (current.get("id") or 0):
             latest[key] = run
     return latest
 
@@ -126,11 +130,10 @@ def check_problems(check_runs: list[dict], statuses: list[dict]) -> list[str]:
 
 
 def greptile_reviewed(pr: PullState) -> bool:
-    """True when Greptile finished a review of the head commit."""
-    for run in pr.check_runs:
-        app = (run.get("app") or {}).get("slug")
-        if run.get("name") == GREPTILE_CHECK and app == GREPTILE_APP and run.get("status") == "completed":
-            return True
+    """True when Greptile finished a review of the head commit (a cancelled or stale check is no review)."""
+    run = latest_check_runs(pr.check_runs).get((GREPTILE_APP, GREPTILE_CHECK))
+    if run and run.get("status") == "completed" and run.get("conclusion") not in NO_RESULT:
+        return True
     return any(
         ((review.get("author") or {}).get("login") or "").lower() in GREPTILE_LOGINS
         and ((review.get("commit") or {}).get("oid") or "") == pr.head
@@ -148,7 +151,7 @@ def decide(pr: PullState) -> Decision:
         return Decision(False, "draft")
     if any(label.lower() == HOLD_LABEL for label in pr.labels):
         return Decision(False, f"has the {HOLD_LABEL} label")
-    if max(pr.created_at, pr.head_committed_at) < ELIGIBLE_SINCE:
+    if max(pr.created_at, pr.head_pushed_at) < ELIGIBLE_SINCE:
         return Decision(False, f"opened and last pushed before {ELIGIBLE_SINCE}")
     policy = [status for status in pr.statuses if status.get("context") == POLICY_CONTEXT]
     if not policy or policy[0].get("state") != "success":
@@ -170,6 +173,8 @@ def decide(pr: PullState) -> Decision:
 
 
 class GitHub:
+    """A small GitHub REST and GraphQL client that uses one token."""
+
     def __init__(self, token: str) -> None:
         """Keep the token for API calls."""
         self.token = token
@@ -202,18 +207,20 @@ class GitHub:
         raise AssertionError("unreachable")
 
     def paginate(self, path: str, key: str | None = None) -> list[dict]:
-        """Read up to 10 pages of a list endpoint (`key` names the list in an object answer)."""
+        """Read every page of a list endpoint (`key` names the list in an object answer).
+
+        More than 10 pages raises: a partial list of checks must never pass as complete."""
         items: list[dict] = []
         for page in range(1, 11):
             sep = "&" if "?" in path else "?"
             answer = self.request("GET", f"{path}{sep}per_page=100&page={page}")
             batch = (answer or {}).get(key, []) if key else answer
             if not isinstance(batch, list) or not batch:
-                break
+                return items
             items += batch
             if len(batch) < 100:
-                break
-        return items
+                return items
+        raise RuntimeError(f"more than {len(items)} items at {path}; not deciding on a partial list")
 
     def graphql(self, query: str, variables: dict) -> dict:
         """Run a GraphQL query and return its data; errors raise."""
@@ -244,6 +251,7 @@ def read_pull(github: GitHub, repo: str, number: int) -> PullState | None:
         time.sleep(3)
     head = node["headRefOid"]
     last = (node["commits"]["nodes"] or [{}])[0].get("commit") or {}
+    committed = (last.get("committedDate") or "") if last.get("oid") == head else ""
     statuses = github.paginate(f"/repos/{repo}/commits/{head}/status", key="statuses")
     check_runs = github.paginate(f"/repos/{repo}/commits/{head}/check-runs?filter=all", key="check_runs")
     return PullState(
@@ -255,7 +263,7 @@ def read_pull(github: GitHub, repo: str, number: int) -> PullState | None:
         default_branch=data["repository"]["defaultBranchRef"]["name"],
         head=head,
         created_at=node["createdAt"],
-        head_committed_at=(last.get("committedDate") or "") if last.get("oid") == head else "",
+        head_pushed_at=min((run["started_at"] for run in check_runs if run.get("started_at")), default=committed),
         labels=[label["name"] for label in node["labels"]["nodes"]],
         reviews=node["reviews"]["nodes"],
         unresolved_threads=threads,
@@ -322,10 +330,14 @@ def has_merge_workflow(github: GitHub, repo: dict) -> bool:
 
 
 def handle(github: GitHub, repo: str, numbers: list[int], dry_run: bool) -> list[str]:
-    """Decide, and merge when ready, each PR; one log line per PR."""
+    """Decide, and merge when ready, each PR; one log line per PR (an API failure is an `error` line)."""
     lines = []
     for number in numbers:
-        pr = read_pull(github, repo, number)
+        try:
+            pr = read_pull(github, repo, number)
+        except (urllib.error.URLError, RuntimeError) as error:
+            lines.append(f"{repo}#{number}: error: {error}")
+            continue
         if pr is None:
             continue
         decision = decide(pr)
@@ -338,6 +350,7 @@ def handle(github: GitHub, repo: str, numbers: list[int], dry_run: bool) -> list
 
 
 def main() -> int:
+    """Check the event's PRs (or, with --sweep, every repo's), merge the ready ones and log one line each."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--sweep", action="store_true", help="every open PR in every repo with the workflow")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
@@ -354,12 +367,12 @@ def main() -> int:
     if args.sweep:
         repos = github.paginate("/installation/repositories", key="repositories")
         for repo in sorted(repos, key=lambda item: item["full_name"]):
-            if repo.get("archived") or not has_merge_workflow(github, repo):
-                continue
+            # One repo's API failure must not stop the sweep of the others.
             try:
+                if repo.get("archived") or not has_merge_workflow(github, repo):
+                    continue
                 lines += handle(github, repo["full_name"], open_pull_numbers(github, repo["full_name"]), args.dry_run)
             except (urllib.error.URLError, RuntimeError) as error:
-                # One repo's API failure must not stop the sweep of the others.
                 lines.append(f"{repo['full_name']}: error: {error}")
     else:
         if args.pr:
@@ -376,7 +389,8 @@ def main() -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as out:
             out.write(f"```\n{report}\n```\n")
-    return 0
+    # An API failure fails the run, so it shows in the Actions log; the other PRs were still handled.
+    return 1 if any(": error: " in line for line in lines) else 0
 
 
 if __name__ == "__main__":

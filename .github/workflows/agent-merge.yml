@@ -1,6 +1,7 @@
 # Merges a ready pull request as orbit-harness[bot], so no agent waits for a
 # human to say "merge". Runs .github/scripts/agent_merge.py from the default
-# branch and never runs pull request code. It squash-merges only the head
+# branch and never runs pull request code; the App key is used only by events
+# that run the default branch's copy of this file. It squash-merges only the head
 # commit it checked, when the PR is open and not a draft, has no `hold` label,
 # agent-policy passes, every check passes, Greptile reviewed the head and no
 # review thread is open. It never updates a branch that is behind: the human's
@@ -38,15 +39,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A review event runs this file from the PR's merge ref, so this job holds no
+  # key: it starts the merge job on the default branch for that PR.
+  relay-review:
+    if: >-
+      vars.ORBIT_AGENT_CLIENT_ID != '' &&
+      github.event_name == 'pull_request_review' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Start agent-merge on the default branch
+        run: gh workflow run agent-merge.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr="$PR"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR: ${{ github.event.pull_request.number }}
+
   merge:
     name: agent-merge
-    # Skip events that cannot make a PR ready. A review on a fork PR gets no
-    # secrets. No client id = the org secret and variable are not set yet.
+    # Every event here runs the default branch's copy of this file. Skip events
+    # that cannot make a PR ready. No client id = the org secret and variable
+    # are not set yet.
     if: >-
       vars.ORBIT_AGENT_CLIENT_ID != '' && (
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request_target' ||
-      (github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'check_suite' && contains(fromJSON('["success","neutral","skipped"]'), github.event.check_suite.conclusion)) ||
       (github.event_name == 'status' && github.event.state == 'success') ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && contains(fromJSON('["success","neutral","skipped"]'), github.event.workflow_run.conclusion)))

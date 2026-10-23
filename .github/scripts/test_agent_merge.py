@@ -43,7 +43,7 @@ def ready(**changes):
         default_branch="main",
         head=HEAD,
         created_at="2026-10-23T02:00:00Z",
-        head_committed_at="2026-10-23T02:00:00Z",
+        head_pushed_at="2026-10-23T02:00:00Z",
         labels=["agent"],
         reviews=[],
         unresolved_threads=0,
@@ -105,6 +105,14 @@ class DecideTest(unittest.TestCase):
         ]
         self.assertTrue(bot.decide(ready(check_runs=runs)).merge)
 
+    def test_queued_rerun_replaces_older_success(self):
+        runs = [run("test", run_id=10), run("test", status="queued", started=None, run_id=11), GREPTILE_RUN]
+        self.assertWaits(ready(check_runs=runs), "test is queued")
+
+    def test_cancelled_greptile_check_is_no_review(self):
+        runs = [run("test"), run("Greptile Review", "cancelled", app="greptile-apps", run_id=60)]
+        self.assertWaits(ready(check_runs=runs, merge_state="UNSTABLE"), "Greptile")
+
     def test_cancelled_run_is_no_result_and_unstable_merges(self):
         # A newer run in a concurrency group cancels the pending one; GitHub then says UNSTABLE.
         runs = [run("test"), run("evaluate", "cancelled", run_id=4), GREPTILE_RUN]
@@ -143,11 +151,24 @@ class DecideTest(unittest.TestCase):
             self.assertWaits(ready(merge_state=state), state)
 
     def test_old_pr_without_new_push_waits(self):
-        pr = ready(created_at="2026-03-01T00:00:00Z", head_committed_at="2026-03-02T00:00:00Z")
+        pr = ready(created_at="2026-03-01T00:00:00Z", head_pushed_at="2026-03-02T00:00:00Z")
         self.assertWaits(pr, "before")
 
+    def test_old_commit_pushed_after_cutoff_merges(self):
+        # read_pull takes the push time from the head's first check run, not the commit date.
+        github = FakeGitHub(
+            node(
+                createdAt="2026-03-01T00:00:00Z",
+                commits={"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-03-02T00:00:00Z"}}]},
+                reviewThreads={"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+            )
+        )
+        pr = bot.read_pull(github, "orbit-search/x", 7)
+        self.assertEqual(pr.head_pushed_at, "2026-10-23T01:00:00Z")
+        self.assertTrue(bot.decide(pr).merge)
+
     def test_old_pr_with_new_push_merges(self):
-        pr = ready(created_at="2026-03-01T00:00:00Z", head_committed_at="2026-10-23T05:00:00Z")
+        pr = ready(created_at="2026-03-01T00:00:00Z", head_pushed_at="2026-10-23T05:00:00Z")
         self.assertTrue(bot.decide(pr).merge)
 
 
@@ -207,7 +228,7 @@ class GitHubFlowTest(unittest.TestCase):
         pr = bot.read_pull(FakeGitHub(node()), "orbit-search/x", 7)
         self.assertEqual(pr.unresolved_threads, 1)
         self.assertEqual(pr.default_branch, "main")
-        self.assertEqual(pr.head_committed_at, "2026-10-23T02:00:00Z")
+        self.assertEqual(pr.head_pushed_at, "2026-10-23T01:00:00Z")
 
     def test_merge_squashes_at_the_checked_head(self):
         github = FakeGitHub(node())
@@ -236,6 +257,23 @@ class GitHubFlowTest(unittest.TestCase):
         lines = bot.handle(github, "orbit-search/x", [7], dry_run=True)
         self.assertIn("dry run: would merge", lines[0])
         self.assertFalse([call for call in github.calls if call[0] == "PUT"])
+
+    def test_paginate_refuses_a_partial_list(self):
+        class Endless(bot.GitHub):
+            def request(self, method, path, payload=None):
+                return {"check_runs": [run("test", run_id=i) for i in range(100)]}
+
+        with self.assertRaises(RuntimeError):
+            Endless("t").paginate("/repos/o/r/commits/x/check-runs?filter=all", key="check_runs")
+
+    def test_api_failure_on_one_pr_is_an_error_line(self):
+        class Broken(FakeGitHub):
+            def graphql(self, query, variables):
+                raise RuntimeError("GraphQL error: boom")
+
+        lines = bot.handle(Broken(node()), "orbit-search/x", [7, 8], dry_run=False)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(": error: " in line for line in lines))
 
     def test_events_map_to_pull_requests(self):
         github = FakeGitHub(
