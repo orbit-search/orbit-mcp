@@ -8,28 +8,81 @@
   "connected_repository": "orbit-search-orbit-mcp",
   "release_branch": "main",
   "docs": "docs/RELEASE_PIPELINE.md",
-  "cloud_run_services": ["orbit-mcp", "orbit-profile-mcp"],
+  "cloud_run_services": [
+    "orbit-mcp",
+    "orbit-profile-mcp"
+  ],
   "cloud_run_urls": {
     "orbit-mcp": "https://orbit-mcp-k7iyipqilq-uc.a.run.app",
     "orbit-profile-mcp": "https://orbit-profile-mcp-k7iyipqilq-uc.a.run.app"
   },
   "candidate_tag": "candidate",
   "triggers": {
-    "dev": ["orbit-mcp-deploy-dev"],
-    "prod": ["orbit-mcp-prod", "orbit-mcp-deploy"],
+    "dev": [
+      "orbit-mcp-deploy-dev"
+    ],
+    "prod": [
+      "orbit-mcp-prod",
+      "orbit-mcp-deploy"
+    ],
     "rollback": "orbit-mcp-rollback"
   },
   "smoke": [
-    {"type": "http_public", "name": "orbit-mcp health", "url": "https://orbit-mcp-k7iyipqilq-uc.a.run.app/health", "expect_status": [200], "expect_json": {"status": "ok"}},
-    {"type": "http_public", "name": "orbit-profile-mcp health", "url": "https://orbit-profile-mcp-k7iyipqilq-uc.a.run.app/health", "expect_status": [200], "expect_json": {"status": "ok"}}
+    {
+      "type": "http_public",
+      "name": "orbit-mcp health",
+      "url": "https://orbit-mcp-k7iyipqilq-uc.a.run.app/health",
+      "expect_status": [
+        200
+      ],
+      "expect_json": {
+        "status": "ok"
+      }
+    },
+    {
+      "type": "http_public",
+      "name": "orbit-profile-mcp health",
+      "url": "https://orbit-profile-mcp-k7iyipqilq-uc.a.run.app/health",
+      "expect_status": [
+        200
+      ],
+      "expect_json": {
+        "status": "ok"
+      }
+    },
+    {
+      "type": "http_public",
+      "name": "orbit-mcp auth gate",
+      "url": "https://orbit-mcp-k7iyipqilq-uc.a.run.app/mcp",
+      "expect_status": [
+        401
+      ]
+    },
+    {
+      "type": "http_public",
+      "name": "orbit-profile-mcp auth gate",
+      "url": "https://orbit-profile-mcp-k7iyipqilq-uc.a.run.app/mcp",
+      "expect_status": [
+        401
+      ]
+    }
   ],
   "verify": {
-    "checkpoints": [15, 60],
+    "checkpoints": [
+      15,
+      60
+    ],
     "log_filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=(\"orbit-mcp\" OR \"orbit-profile-mcp\") AND severity>=WARNING",
     "log_min_spread": 1
   },
   "code": {
-    "source_prefixes": ["packages/mcp-server/src/", "packages/profile-server/src/"],
-    "extensions": [".ts", ".js"]
+    "source_prefixes": [
+      "packages/mcp-server/src/",
+      "packages/profile-server/src/"
+    ],
+    "extensions": [
+      ".ts",
+      ".js"
+    ]
   }
 }
