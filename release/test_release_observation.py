@@ -2,12 +2,15 @@
 
 from pathlib import Path
 import sys
+import base64
+import json
 import unittest
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE if (HERE / "release_observation.py").exists() else HERE.parents[1] / "bin"))
 import release_observation as ro  # noqa: E402
+import promote_release_guard as guard  # noqa: E402
 
 
 def check(detail=None):
@@ -165,3 +168,36 @@ class ObservationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ro.claim_owner({}, thread, pr)
         self.assertFalse(ro.owned({"followup": {"owner": {"thread_url": "codex://threads/one"}}}))
+
+    def test_confirmed_noop_requires_an_explicit_decoded_receipt(self):
+        payload = {
+            "id": "skipped",
+            "status": "SUCCESS",
+            "createTime": "2026-10-23T20:00:00Z",
+            "steps": [
+                {"id": "promote-still-current", "status": "SUCCESS"},
+                {"id": "release-record-begin", "status": "SUCCESS"},
+            ],
+        }
+        self.assertFalse(guard.Build.from_api(payload).confirmed_noop)
+        receipt = base64.b64encode(json.dumps({"release_deploy": "skipped_before_mutation"}).encode()).decode()
+        payload["results"] = {"buildStepOutputs": [receipt]}
+        skipped = guard.Build.from_api(payload)
+        self.assertTrue(skipped.confirmed_noop)
+        self.assertFalse(skipped.changing_cluster)
+        payload["results"] = {"buildStepOutputs": ["not-base64"]}
+        self.assertFalse(guard.Build.from_api(payload).confirmed_noop)
+
+    def test_extension_plan_roundtrips_and_keeps_the_due_time(self):
+        record = {
+            "release_id": "r1",
+            "times": {"deploy_finished": "2026-10-23T20:00:00Z"},
+        }
+        ro.extend_plan(record, 75)
+        ro.extend_plan(record, 75)
+        restored = json.loads(json.dumps(record))
+        self.assertEqual(ro.restore_extensions(restored, [15, 60]), [15, 60, 75])
+        self.assertEqual(
+            restored["followup"]["checkpoints"]["window_75m"]["due_at"],
+            "2026-10-23T21:15:00Z",
+        )

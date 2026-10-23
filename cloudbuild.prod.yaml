@@ -89,6 +89,9 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/deploy_superseded ] && [ -n "$${BUILDER_OUTPUT:-}" ]; then
+          printf '%s\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
+        fi
         if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ]; then exit 0; fi
         python3 release/release_light.py begin --env prod --commit "$COMMIT_SHA" --build-id "$BUILD_ID" \
           --artifacts-file /workspace/release_artifacts.json \

@@ -1490,11 +1490,13 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         return rv.EXIT_OK if rv.require_owner(store, rr.read_record(store, record["release_id"])) else rv.EXIT_FAILED
     finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
     checkpoints = sorted(int(value) for value in (args.checkpoints or " ".join(map(str, service.checkpoints))).split())
+    checkpoints = rv.ro.restore_extensions(record, checkpoints)
     for index, minutes in enumerate(checkpoints):
         last = index == len(checkpoints) - 1
         current = rr.read_record(store, record["release_id"])
         receipt = ((current.get("followup") or {}).get("checkpoints") or {}).get(f"window_{minutes}m") or {}
-        if receipt.get("state") == "completed" and not getattr(args, "retry_completed", False):
+        if (receipt.get("state") == "completed" and not getattr(args, "retry_completed", False)
+                and not rv.ro.needs_final_decision(current, receipt, last)):
             print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
             continue
         wait = (finished + timedelta(minutes=minutes) - datetime.now(rr.UTC)).total_seconds()
@@ -1625,7 +1627,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
     current = rr.read_record(store, record["release_id"])
     return (
         rv.EXIT_FAILED
-        if (current.get("verdict") or {}).get("status") == "inconclusive" or not rv.require_owner(store, current)
+        if (current.get("verdict") or {}).get("status") not in ("passed", "warning", "failed") or not rv.require_owner(store, current)
         else rv.EXIT_OK
     )
 

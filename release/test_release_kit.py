@@ -847,16 +847,26 @@ class VerdictTest(unittest.TestCase):
             self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "completed")
             self.assertNotIn("window_18m", saved["checks"])
 
-    def _run_owned_watch(self, store, record, *, result=None, error=None, history=None):
+    def _run_owned_watch(
+        self,
+        store,
+        record,
+        *,
+        result=None,
+        error=None,
+        history=None,
+        dd=None,
+        checkpoints="15,60",
+    ):
         args = argparse.Namespace(
             release_id=record["release_id"],
-            checkpoints="15,60",
+            checkpoints=checkpoints,
             extend_minutes=15,
             max_window_minutes=180,
             retry_completed=False,
         )
         with (
-            mock.patch.object(rv, "_datadog", return_value=(None, None)),
+            mock.patch.object(rv, "_datadog", return_value=(dd, None)),
             mock.patch.object(rv, "_token", return_value=None),
             mock.patch.object(rv, "wait_until_settled", return_value=None),
             mock.patch.object(rv, "prod_state", return_value=(None, None)),
@@ -985,6 +995,83 @@ class VerdictTest(unittest.TestCase):
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["verdict"], {"status": "passed", "phase": "window_60m"})
             self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["completed_at"], "original")
+
+    def test_adaptive_checkpoint_survives_process_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_owned_watch(
+                    store,
+                    record,
+                    checkpoints="60",
+                    dd=object(),
+                    error=[
+                        self._result(judged=0),
+                        KeyboardInterrupt("simulated process stop"),
+                    ],
+                )
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "pending")
+            self.assertEqual(saved["followup"]["extensions_minutes"], [75])
+            self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+            outcome, count = self._run_owned_watch(store, saved, checkpoints="60")
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            final = rr.read_record(store, record["release_id"])
+            self.assertEqual(
+                (final["verdict"]["status"], final["verdict"]["phase"]),
+                ("passed", "window_75m"),
+            )
+
+    def test_completed_manual_attempt_still_requires_a_final_decision(self):
+        for judged, expected in [(0, rv.EXIT_FAILED), (500, rv.EXIT_OK)]:
+            with self.subTest(judged=judged), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                record["checks"]["window_60m"] = self._result(judged=judged)
+                rv.ro.note_checkpoint(record, {"at": "manual", "result": "passed"}, "window_60m")
+                _save(store, record)
+                outcome, count = self._run_owned_watch(
+                    store, record, checkpoints="60", result=self._result(judged=judged)
+                )
+                self.assertEqual((outcome, count), (expected, 1))
+                saved = rr.read_record(store, record["release_id"])
+                self.assertNotEqual(saved["verdict"]["status"], "pending")
+                prior = saved["followup"]["checkpoints"]["window_60m"]["attempt_history"][0]
+                self.assertEqual(prior["completed_at"], "manual")
+                self.assertEqual(prior["check"]["judged"], judged)
+
+    def test_historical_manual_check_never_writes_current_recovery_or_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(
+                release_id=record["release_id"],
+                phase="window",
+                no_metrics=True,
+                now="2026-10-21T10:20:00Z",
+                wait_rollouts_seconds=0,
+                force_fail="",
+                final=True,
+                failed_marker="",
+            )
+            result = self._result(recovered_signals=["active-today"])
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "evaluate", return_value=result) as evaluate,
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rr, "update_record") as update,
+                mock.patch.object(rv, "note_recovered") as recovery,
+            ):
+                self.assertEqual(
+                    rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()),
+                    rv.EXIT_OK,
+                )
+            update.assert_not_called()
+            recovery.assert_not_called()
+            self.assertIsNone(evaluate.call_args.kwargs["observation_state"])
 
     def test_final(self) -> None:
         """Final."""
@@ -1634,20 +1721,41 @@ class ReviewFixTest(unittest.TestCase):
 
     def test_red_cleanup_build_does_not_recommend_a_second_rollback(self) -> None:
         """A restored, held rollback can end red for cleanup without reversing to the failed release."""
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+        ):
             store = _store(tmp)
             record = _record(auto_rollback={"status": "started", "claim": "c1", "build_id": "rb1"})
             _save(store, record)
             rollback = _record(
                 release_id="20261021T110000Z-bbbbbbbbb",
                 kind="rollback",
-                status="deployed",
+                status="deploying",
                 build={"id": "rb1"},
                 rollback={"rolled_back_release": record["release_id"]},
-                promote_hold={"status": "held"},
-                checks={"rollback": {"cleanup_failures": ["failed candidate tag remains"]}},
             )
-            _save(store, rollback)
+            _save(store, rollback, latest=False)
+            code = rb.finish_rollback(
+                SERVICE,
+                store,
+                argparse.Namespace(requested_by="test", reason="restore prod"),
+                rollback,
+                record,
+                {"commit": PREVIOUS},
+                {},
+                [],
+                [],
+                cleanup_failures=["failed candidate tag remains"],
+            )
+            self.assertEqual(code, 1)
+            written = rr.read_record(store, rollback["release_id"])
+            self.assertEqual(written["status"], "deployed")
+            self.assertEqual(written["promote_hold"]["status"], "held")
+            self.assertEqual(
+                written["checks"]["rollback"]["cleanup_failures"],
+                ["failed candidate tag remains"],
+            )
             status = rv.follow_rollback(
                 SERVICE,
                 store,
@@ -2270,6 +2378,30 @@ class LightTest(unittest.TestCase):
                     self.assertEqual(saved["verdict"]["status"], "failed" if failed else "passed")
                     self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
                     self.assertEqual(rollback.call_count, int(failed))
+
+    def test_light_manual_final_attempt_gets_a_terminal_verdict(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            prior = {"at": "manual", "result": "passed", "evidence": "preserved"}
+            record["checks"]["window_60m"] = prior
+            rv.ro.note_checkpoint(record, prior, "window_60m")
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+            clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_OK)
+            self.assertEqual(evaluate.call_count, 1)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            receipt = saved["followup"]["checkpoints"]["window_60m"]
+            self.assertEqual(receipt["attempt_history"][0]["check"], prior)
 
     def test_light_terminal_mutation_ends_at_15m_unchecked(self):
         service = rl.parse_light(light_data("cloud_run"))
@@ -4153,6 +4285,67 @@ class VersionTest(unittest.TestCase):
                         "build": {"id": "rb"},
                     },
                 ),
+                [],
+            )
+
+    def test_active_unknown_marker_waits_before_mutation_but_terminal_unknown_is_conservative(
+        self,
+    ):
+        for marker in ("", "STATUS_UNKNOWN"):
+            active = guard.Build.from_api(
+                {
+                    "id": "building",
+                    "status": "WORKING",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [{"id": "release-record-begin", "status": marker}],
+                }
+            )
+            terminal = guard.Build.from_api(
+                {
+                    "id": "ended",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [{"id": "release-record-begin", "status": marker}],
+                }
+            )
+            started = guard.Build.from_api(
+                {
+                    "id": "started",
+                    "status": "WORKING",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [
+                        {
+                            "id": "release-record-begin",
+                            "status": marker,
+                            "timing": {"startTime": "2026-10-21T11:02:00Z"},
+                        }
+                    ],
+                }
+            )
+            self.assertTrue(started.changing_cluster)
+            with mock.patch.object(rv, "GoogleApi") as api:
+                api.return_value.list_builds.side_effect = [
+                    [active, terminal, started],
+                    [],
+                ]
+                observed = rv.builds_since_rollback(SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}})
+            self.assertEqual(len(observed), 2)
+            self.assertIn("ended", observed[0])
+
+    def test_confirmed_skipped_history_does_not_contaminate_the_window(self):
+        skipped = guard.Build(
+            id="noop",
+            status="SUCCESS",
+            create_time="2026-10-21T11:01:00Z",
+            commit=COMMIT,
+            trigger_name="prod",
+            step_status=(("release-record-begin", "SUCCESS"),),
+            step_outputs=('{"release_deploy":"skipped_before_mutation"}',),
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[skipped], []]
+            self.assertEqual(
+                rv.builds_since_rollback(SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}}),
                 [],
             )
 

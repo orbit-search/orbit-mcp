@@ -1787,7 +1787,11 @@ def require_owner(store: rr.Store, record: dict) -> bool:
 
 
 def cmd_check(
-    args: argparse.Namespace, service: rc.Service, env: rc.Environment, store: rr.Store, clients: rr.Clients
+    args: argparse.Namespace,
+    service: rc.Service,
+    env: rc.Environment,
+    store: rr.Store,
+    clients: rr.Clients,
 ) -> int:
     """Run one phase of checks, save the result, and alert; return 1 when the verdict is failed."""
     record = rr.read_record(store, args.release_id)
@@ -1796,8 +1800,9 @@ def cmd_check(
     if args.phase == "window" and not args.no_metrics:
         dd, metrics_error = _datadog(service, clients)
         logs = rs.CloudLogging(env.project, GoogleApi(env.project, env.region).access_token)
+    historical = bool(getattr(args, "now", None))
     checkpoint = None
-    if args.phase == "window":
+    if args.phase == "window" and not historical:
         finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
         checkpoint = ro.scheduled_minute(
             record, (_now(args) - finished).total_seconds() / 60, getattr(args, "checkpoint_minutes", None)
@@ -1824,9 +1829,16 @@ def cmd_check(
             pod_get=_pod_get(clients, env) if args.phase == "deploy" else None,
             force_fail=args.force_fail,
             observation_state=(lambda: prod_state(service, store, record))
-            if args.phase == "window" and env.name == "prod"
+            if args.phase == "window" and env.name == "prod" and not historical
             else None,
         )
+        if historical:
+            print_result(result)
+            print(
+                "Historical evaluation only; no release, ownership or recovery state changed",
+                flush=True,
+            )
+            return EXIT_OK if result["result"] == "passed" else EXIT_FAILED
         if checkpoint is not None:
             result["checkpoint_minutes"] = checkpoint
         if args.phase == "window" and env.name == "prod":
@@ -1891,7 +1903,14 @@ def cmd_check(
             else EXIT_OK
         )
 
-    except (rr.RecordError, GuardError, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
+    except (
+        rr.RecordError,
+        GuardError,
+        subprocess.SubprocessError,
+        OSError,
+        ValueError,
+        KeyError,
+    ) as error:
         if checkpoint is not None:
             _record_checkpoint_error(store, record, checkpoint, str(error), final=args.final)
             return EXIT_FAILED
@@ -2402,7 +2421,11 @@ def wait_until_settled(
 
 
 def cmd_watch(
-    args: argparse.Namespace, service: rc.Service, env: rc.Environment, store: rr.Store, clients: rr.Clients
+    args: argparse.Namespace,
+    service: rc.Service,
+    env: rc.Environment,
+    store: rr.Store,
+    clients: rr.Clients,
 ) -> int:
     """Sleep to each checkpoint after the deploy and check.
 
@@ -2418,6 +2441,7 @@ def cmd_watch(
         return EXIT_OK if require_owner(store, rr.read_record(store, record["release_id"])) else EXIT_FAILED
     finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
     checkpoints = sorted(int(value) for value in args.checkpoints.replace(",", " ").split())
+    checkpoints = ro.restore_extensions(record, checkpoints)
     dd, metrics_error = _datadog(service, clients)
     token = _token(env)
     logs = rs.CloudLogging(env.project, GoogleApi(env.project, env.region).access_token)
@@ -2428,7 +2452,11 @@ def cmd_watch(
         index += 1
         current = rr.read_record(store, record["release_id"])
         receipt = ((current.get("followup") or {}).get("checkpoints") or {}).get(f"window_{minutes}m") or {}
-        if receipt.get("state") == "completed" and not getattr(args, "retry_completed", False):
+        if (
+            receipt.get("state") == "completed"
+            and not getattr(args, "retry_completed", False)
+            and not ro.needs_final_decision(current, receipt, last)
+        ):
             print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
             continue
         due = finished + timedelta(minutes=minutes)
@@ -2503,6 +2531,12 @@ def cmd_watch(
             )
             if extend:
                 print(f"Only {result['judged']:.0f} samples judged (< {service.min_judged}); extending", flush=True)
+                rr.update_record(
+                    store,
+                    record["release_id"],
+                    lambda current, extra=minutes + args.extend_minutes: ro.extend_plan(current, extra),
+                    "checkpoint_extended",
+                )
                 checkpoints.append(minutes + args.extend_minutes)
             saved = apply_result(service, store, record, result, final=last and not extend, token=token)
             require_owner(store, saved)
@@ -2520,7 +2554,11 @@ def cmd_watch(
             ValueError,
             KeyError,
         ) as error:
-            print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
+            print(
+                f"Checkpoint +{minutes} min could not run: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
             _record_checkpoint_error(store, record, minutes, str(error), final=last)
             rr.post_slack(
                 f":warning: {service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
@@ -2542,7 +2580,8 @@ def cmd_watch(
     final_record = rr.read_record(store, record["release_id"])
     return (
         EXIT_FAILED
-        if (final_record.get("verdict") or {}).get("status") == "inconclusive" or not ro.owned(final_record)
+        if (final_record.get("verdict") or {}).get("status") not in ("passed", "warning", "failed")
+        or not ro.owned(final_record)
         else EXIT_OK
     )
 
@@ -2650,10 +2689,21 @@ def builds_since_rollback(service: rc.Service, rollback: dict) -> list[str]:
     deploys = api.list_builds(f"({names}) AND {overlap}")
     rollbacks = api.list_builds(f'tags="{service.rollback_build_tag}" AND {overlap}')
     own = (rollback.get("build") or {}).get("id")
+
+    def may_have_changed(build) -> bool:
+        """An active placeholder is unstarted only without timing; terminal ambiguity stays conservative."""
+        marker = dict(build.step_status).get("release-record-begin")
+        started = "release-record-begin" in build.started_steps
+        if not started and marker in ("PENDING", "QUEUED"):
+            return False
+        if not started and build.ongoing and marker in ("", "STATUS_UNKNOWN"):
+            return False
+        return True
+
     return [
         build.describe()
         for build in deploys
-        if build.id != own and dict(build.step_status).get("release-record-begin") not in ("PENDING", "QUEUED")
+        if build.id != own and not build.confirmed_noop and may_have_changed(build)
     ] + [build.describe() for build in rollbacks if build.id != own and not build.rollback_dry_run]
 
 

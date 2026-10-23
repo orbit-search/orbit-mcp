@@ -94,9 +94,10 @@ def begin_checkpoint(record: dict, key: str) -> None:
     """Record an attempt before querying providers, so a killed checker remains detectable."""
     receipt = record.setdefault("followup", {}).setdefault("checkpoints", {}).setdefault(key, {})
     if receipt.get("attempts", 0) or receipt.get("state") in ("completed", "error"):
-        receipt.setdefault("attempt_history", []).append(
-            {name: value for name, value in receipt.items() if name != "attempt_history"}
-        )
+        previous = {name: value for name, value in receipt.items() if name != "attempt_history"}
+        if (record.get("checks") or {}).get(key):
+            previous["check"] = record["checks"][key]
+        receipt.setdefault("attempt_history", []).append(previous)
     for terminal in ("last_error", "completed_at", "result", "observation", "at", "superseded_by"):
         receipt.pop(terminal, None)
     receipt.update(
@@ -171,4 +172,27 @@ def later_terminal(verdict: dict, checkpoint: str) -> bool:
         and current
         and int(previous[1]) > int(current[1])
         and verdict.get("status") in ("passed", "warning", "inconclusive")
+    )
+
+
+def extend_plan(record: dict, minutes: int) -> None:
+    """Persist an adaptive checkpoint before the previous result can become completed."""
+    extensions = record.setdefault("followup", {}).setdefault("extensions_minutes", [])
+    if minutes not in extensions:
+        extensions.append(minutes)
+        extensions.sort()
+    merge_plan(record, [minutes])
+
+
+def restore_extensions(record: dict, requested: list[int]) -> list[int]:
+    """A restarted watch restores adaptive checkpoints as well as the configured window."""
+    return sorted(set(requested) | set(record.get("followup", {}).get("extensions_minutes") or []))
+
+
+def needs_final_decision(record: dict, receipt: dict, last: bool) -> bool:
+    """A completed manual attempt without a terminal decision cannot be skipped as a finished watch."""
+    return bool(
+        last
+        and receipt.get("state") == "completed"
+        and (record.get("verdict") or {}).get("status") not in ("passed", "warning", "failed", "inconclusive")
     )
