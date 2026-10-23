@@ -151,6 +151,25 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(ro.scheduled_minute({}, 63), 60)
         self.assertEqual(ro.scheduled_minute({}, 99, 15), 15)
 
+    def test_manual_repair_restores_adaptive_checkpoint_without_rewriting_earlier_evidence(self):
+        record = {"release_id": "r1", "times": {"deploy_finished": "2026-10-23T20:00:00Z"}}
+        ro.merge_plan(record, [15, 60])
+        ro.note_checkpoint(record, {"at": "original", "result": "pending"}, "window_60m")
+        ro.extend_plan(record, 75)
+        ro.begin_checkpoint(record, "window_75m")
+        record["followup"]["checkpoints"]["window_75m"].update(state="error", last_error="read failed")
+        restored = json.loads(json.dumps(record))
+        minute = ro.scheduled_minute(restored, 80)
+        self.assertEqual(minute, 75)
+        ro.begin_checkpoint(restored, f"window_{minute}m")
+        ro.note_checkpoint(restored, {"at": "repaired", "result": "passed"}, f"window_{minute}m")
+        receipts = restored["followup"]["checkpoints"]
+        self.assertEqual(receipts["window_60m"], record["followup"]["checkpoints"]["window_60m"])
+        self.assertEqual(receipts["window_75m"]["state"], "completed")
+        self.assertNotIn("last_error", receipts["window_75m"])
+        self.assertEqual(receipts["window_75m"]["attempt_history"][0]["last_error"], "read failed")
+        self.assertEqual(ro.scheduled_minute(restored, 80, 60), 60)
+
     def test_crashed_running_attempt_is_archived_and_stale_error_is_cleared(self):
         record = {"release_id": "r1"}
         ro.begin_checkpoint(record, "window_15m")

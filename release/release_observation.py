@@ -160,6 +160,7 @@ def scheduled_minute(record: dict, elapsed: float, requested: int | None = None)
     if requested is not None:
         return requested
     planned = (record.get("checks", {}).get("window_build") or {}).get("checkpoints_minutes") or [15, 60]
+    planned = restore_extensions(record, planned)
     return max((minute for minute in planned if minute <= elapsed), default=min(planned))
 
 
