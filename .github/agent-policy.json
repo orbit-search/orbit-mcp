@@ -24,7 +24,9 @@
       "paths": [
         ".github/agent-policy.json",
         ".github/scripts/agent_policy_check.py",
-        ".github/workflows/agent-policy.yml"
+        ".github/workflows/agent-policy.yml",
+        ".github/scripts/agent_merge.py",
+        ".github/workflows/agent-merge.yml"
       ]
     }
   ],
