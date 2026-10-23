@@ -59,8 +59,9 @@ Your human does two things once, both in a browser. Your agent does the rest.
 **Your agent**, itself, never asking its human:
 
 3. When `orbit-agent-gh` is missing, install the wrapper from a checkout of
-   `orbit-search/orbit-infrastructure` (clone it first if there is none):
-   `mkdir -p ~/.local/bin && ln -sf "<orbit-infrastructure checkout>/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
+   `orbit-search/orbit-infrastructure` (clone it first if there is none).
+   Give the absolute path of the checkout; a relative path makes a broken link:
+   `mkdir -p ~/.local/bin && ln -sf "<absolute path of the checkout>/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
    Make sure `~/.local/bin` is on `PATH`, then check `orbit-agent-gh whoami`.
 4. When `orbit-agent-gh` cannot mint a token because the Infisical login is
    missing or expired, ask the human for `infisical login` (a browser login),
