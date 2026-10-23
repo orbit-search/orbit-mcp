@@ -53,7 +53,8 @@ Your human does two things once, both in a browser. Your agent does the rest.
 
    Manual Codex MCP setup needs the `[mcp_servers.slack.oauth]` client ID:
    Slack's server accepts only a registered Slack app, not Codex's automatic
-   client registration. If Orbit's Slack app also has a client secret, run
+   client registration. Get the registered client ID from Nicholas Dominici
+   or another Orbit Slack app owner. If that app has a client secret, run
    `codex mcp add slack --url https://mcp.slack.com/mcp --oauth-client-id <id> --oauth-client-secret <secret>`
    instead of editing the file.
 
