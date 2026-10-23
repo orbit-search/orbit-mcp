@@ -66,11 +66,13 @@ gates below.
   (`docs/RELEASE_PIPELINE.md`).
 - **Do not ask your human before merging.** A PR that passes every check
   merges; the merge bot does it on the server, and you may merge it yourself
-  too. The bot (`.github/workflows/agent-merge.yml`) squash-merges, as
-  `orbit-harness[bot]`, exactly the head commit it checked, when the PR is open
-  and not a draft, `agent-policy` passes, every check passes, Greptile reviewed
-  that commit and no review thread is open. It never updates a branch that is
-  behind. To keep a ready PR open, mark it as a draft or add the `hold` label.
+  too. The bot (`agent-merge-sweep` in orbit-infrastructure, every 5 minutes,
+  for repos with `"agentMerge": true` in `.github/agent-policy.json`)
+  squash-merges, as `orbit-harness[bot]`, exactly the head commit it checked,
+  when the PR is open and not a draft, `agent-policy` passes, every check
+  passes, Greptile reviewed that commit and no review thread is open. It never
+  updates a branch that is behind. To keep a ready PR open, mark it as a draft
+  or add the `hold` label.
 - **Ask for approval in Slack.** When `agent-policy` needs approval from
   someone who is not in your session (a gate, or owner clearance where your
   human is not an owner), send the request yourself as a Slack direct message
