@@ -82,13 +82,15 @@ steps:
       - -c
       - |
         if [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        # Plan exact revision names before either deployment, including a partial failure.
+        printf '{"orbit-mcp":"orbit-mcp-b%s","orbit-profile-mcp":"orbit-profile-mcp-b%s"}\n' "$BUILD_ID" "$BUILD_ID" > /workspace/candidate_revisions.json
         gcloud run deploy orbit-mcp --image "$(cat /workspace/orbit-mcp.image)" --region us-central1 \
           --project "$PROJECT_ID" --platform managed --remove-env-vars MCP_BYPASS_KEY \
-          --no-traffic --tag candidate \
+          --no-traffic --tag candidate --revision-suffix "b$BUILD_ID" \
           || { touch /workspace/deploy_failed; exit 1; }
         gcloud run deploy orbit-profile-mcp --image "$(cat /workspace/orbit-profile-mcp.image)" --region us-central1 \
           --project "$PROJECT_ID" --platform managed \
-          --no-traffic --tag candidate \
+          --no-traffic --tag candidate --revision-suffix "b$BUILD_ID" \
           || { touch /workspace/deploy_failed; exit 1; }
 
   # Dev record: the candidate revisions with the digests they run (the artifacts prod promotes).
@@ -143,6 +145,20 @@ steps:
       - DEV_VERIFY_FORCE_FAIL=$_DEV_VERIFY_FORCE_FAIL
     timeout: 1200s
 
+  # Remove public tags from this build's failed candidates. The kit uses an etag
+  # precondition and exact planned revisions, so it cannot remove a newer tag.
+  - name: gcr.io/cloud-builders/gcloud
+    id: cleanup-failed-candidates
+    entrypoint: bash
+    allowExitCodes: [1]
+    args:
+      - -c
+      - |
+        if [ ! -f /workspace/deploy_failed ] && [ ! -f /workspace/release_verify_failed ]; then exit 0; fi
+        python3 release/release_light.py cleanup-candidates --revisions-file /workspace/candidate_revisions.json \
+          || { touch /workspace/candidate_cleanup_failed; exit 1; }
+    timeout: 600s
+
   # Promote: when dev verify passed, start the prod build for this commit
   # (trigger orbit-mcp-prod, --sha) unless the gate says freeze, hold after a
   # rollback, or a newer verified commit. It never fails this build.
@@ -173,6 +189,12 @@ steps:
       - -c
       - |
         if [ -f /workspace/deploy_superseded ]; then exit 0; fi
+        if [ -f /workspace/candidate_cleanup_failed ]; then
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data '{"text":":x: orbit-mcp failed-candidate tag cleanup FAILED for `$SHORT_SHA`; the failed revision may still be public. Inspect cleanup-failed-candidates immediately."}' \
+            "$$WEBHOOK_ORBIT"
+          exit 1
+        fi
         if [ -f /workspace/deploy_failed ]; then
           curl -s -X POST -H 'Content-type: application/json' \
             --data '{"text":":x: orbit-mcp candidate deploy failed for commit `$SHORT_SHA`; prod traffic did not move and the prod promote did not start"}' \

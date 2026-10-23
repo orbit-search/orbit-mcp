@@ -64,6 +64,13 @@ on), and Slack pings the suspected PR's author with a fix prompt. After a
 rollback, prod promotes hold until a revert of the held PRs or a commit with the
 trailer `Fixes-release: <release id>` merges.
 
+A failed candidate deploy or dev verification removes only the candidate tags
+owned by that build's deterministic revision names. Rollback also removes the
+failed release's tags. Cleanup preserves traffic percentages and other tags,
+requires the current Cloud Run etag, and checks the operation completed. A newer
+build's tag is preserved. Cleanup failure is a red build and an explicit alert.
+The conditional traffic update uses the [Cloud Run v2 service API](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services).
+
 ## Commands
 
 ```bash

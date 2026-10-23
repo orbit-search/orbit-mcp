@@ -486,6 +486,92 @@ def candidate_revisions(service: LightService, snapshot: dict[str, dict]) -> dic
     }
 
 
+def remove_candidate_tags(service: LightService, revisions: dict[str, str]) -> list[str]:
+    """Remove only these revisions' candidate tags, with an etag precondition against concurrent dev builds.
+
+    The Cloud Run v2 traffic-only PATCH preserves percentages and other tags. A missing etag,
+    conflict or incomplete operation fails cleanup rather than removing a newer build's tag.
+    """
+    failures = []
+    api = GoogleApi(service.project, service.region)
+    for name, revision in revisions.items():
+        try:
+            if (
+                name not in service.services
+                or not isinstance(revision, str)
+                or not re.fullmatch(re.escape(name) + r"-[a-z0-9-]+", revision)
+            ):
+                raise rr.RecordError("cleanup needs an exact revision of a configured service")
+            resource = f"projects/{service.project}/locations/{service.region}/services/{name}"
+            url = f"https://run.googleapis.com/v2/{resource}"
+            headers = {"Authorization": f"Bearer {api.access_token()}", "Content-Type": "application/json"}
+            current = _http_json(urllib.request.Request(url, headers=headers))
+            traffic = current.get("traffic") or []
+            matched = [
+                item
+                for item in traffic
+                if item.get("tag") == service.candidate_tag
+                and str(item.get("revision") or "").rsplit("/", 1)[-1] == revision
+            ]
+            if not matched:
+                continue
+            if not current.get("etag"):
+                raise rr.RecordError("Cloud Run returned no etag; refusing an unguarded tag removal")
+            updated = [
+                {key: value for key, value in item.items() if key != "tag"} if item in matched else dict(item)
+                for item in traffic
+            ]
+            operation = _http_json(
+                urllib.request.Request(
+                    url + "?updateMask=traffic",
+                    data=json.dumps({"name": resource, "etag": current["etag"], "traffic": updated}).encode(),
+                    method="PATCH",
+                    headers=headers,
+                )
+            )
+            deadline = time.monotonic() + 120
+            while not operation.get("done"):
+                operation_name = str(operation.get("name") or "")
+                if not operation_name.startswith(f"projects/{service.project}/locations/{service.region}/operations/"):
+                    raise rr.RecordError("Cloud Run returned no valid cleanup operation")
+                if time.monotonic() >= deadline:
+                    raise rr.RecordError("Cloud Run tag cleanup did not finish within 120 seconds")
+                time.sleep(2)
+                operation = _http_json(
+                    urllib.request.Request(
+                        f"https://run.googleapis.com/v2/{operation_name}",
+                        headers=headers,
+                    )
+                )
+            if operation.get("error"):
+                raise rr.RecordError(f"Cloud Run tag cleanup failed: {operation['error']}")
+            after = _http_json(urllib.request.Request(url, headers=headers))
+            if any(
+                item.get("tag") == service.candidate_tag
+                and str(item.get("revision") or "").rsplit("/", 1)[-1] == revision
+                for item in [*(after.get("traffic") or []), *(after.get("trafficStatuses") or [])]
+            ):
+                raise rr.RecordError("the failed revision still has its candidate tag after cleanup")
+            print(f"{name}: removed {service.candidate_tag} tag from {revision}", flush=True)
+        except (rr.RecordError, GuardError, OSError) as error:
+            failures.append(f"{name}: {str(error)[:300]}")
+    return failures
+
+
+def cmd_cleanup_candidates(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Failure cleanup of explicitly named Cloud Run candidate revisions; never infer ownership from a live tag."""
+    _full(service)
+    if service.kind != "cloud_run":
+        raise rc.ConfigError("cleanup-candidates is only for Cloud Run")
+    revisions = _json_file(args.revisions_file)
+    if not revisions:
+        raise rr.RecordError("candidate cleanup needs the revisions planned by this dev build")
+    failures = remove_candidate_tags(service, revisions)
+    for failure in failures:
+        print(f"CLEANUP FAILED: {failure}", file=sys.stderr)
+    return rv.EXIT_ERROR if failures else rv.EXIT_OK
+
+
 def dags_uri(service: LightService, runner: Runner) -> str:
     """The environment's DAG folder (gs://<bucket>/dags); the config's bucket when it cannot be read."""
     try:
@@ -1603,6 +1689,11 @@ def cmd_fetch_dags(args: argparse.Namespace, service: LightService, store: rr.St
     _full(service)
     dags = dags_uri(service, runner)
     out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    # Invalidate a previous attempt before downloading either folder. A partial
+    # rsync must not authorize a parse of the leftover/empty local directories.
+    (out / "fetch-complete").unlink(missing_ok=True)
+    (out / "result.json").unlink(missing_ok=True)
     for name, source in (("candidate", candidate_uri(service, dags, args.commit)), ("baseline", dags)):
         (out / name).mkdir(parents=True, exist_ok=True)
         gsutil_rsync(runner, source, str(out / name))
@@ -1611,6 +1702,7 @@ def cmd_fetch_dags(args: argparse.Namespace, service: LightService, store: rr.St
         for name in [*folders, *files]:
             os.chmod(os.path.join(root, name), 0o777 if name in folders else 0o666)
     os.chmod(out, 0o777)
+    (out / "fetch-complete").write_text(args.commit + "\n", encoding="utf-8")
     print(f"Candidate and prod DAGs in {out}", flush=True)
     return rv.EXIT_OK
 
@@ -1995,6 +2087,12 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
     record = rb.create_rollback_record(service, store, args, latest, target, previous, plan)
     failures = apply_rollback(service, plan, runner)
     if service.kind == "cloud_run":
+        failed_candidates = {
+            name: str(artifact).partition("@")[0]
+            for name, artifact in (latest.get("artifacts") or {}).items()
+            if name in service.services
+        }
+        failures += remove_candidate_tags(service, failed_candidates)
         after = snapshot_cloud_run(service, runner)
     else:
         try:
@@ -2100,6 +2198,8 @@ def main(argv: list[str] | None = None) -> int:
     fetch = commands.add_parser("fetch-dags", help="tier full, composer: candidate and prod DAGs for parse-dags")
     fetch.add_argument("--commit", required=True)
     fetch.add_argument("--out-dir", required=True)
+    cleanup = commands.add_parser("cleanup-candidates", help="remove this build's failed Cloud Run candidate tags")
+    cleanup.add_argument("--revisions-file", required=True)
     parse = commands.add_parser("parse-dags", help="tier full, composer: parse DAG folders (in the Airflow image)")
     parse.add_argument("--candidate", default="")
     parse.add_argument("--baseline", default="")
@@ -2132,6 +2232,7 @@ def main(argv: list[str] | None = None) -> int:
         "rollback-command": cmd_rollback_command,
         "stage": cmd_stage,
         "fetch-dags": cmd_fetch_dags,
+        "cleanup-candidates": cmd_cleanup_candidates,
         "preflight": cmd_preflight,
         "still-current": cmd_still_current,
         "apply": cmd_apply,

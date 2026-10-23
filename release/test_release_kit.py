@@ -2419,6 +2419,61 @@ def _args(**values) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
+class LightCandidateCleanupTest(unittest.TestCase):
+    def test_removes_only_matching_tag_with_etag_and_preserves_traffic(self) -> None:
+        """Cleanup is a traffic-only conditional update, preserving percentages and unrelated tags."""
+        traffic = [
+            {"revision": "demo-a-1", "percent": 100, "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"},
+            {"revision": "demo-a-2", "percent": 0, "tag": "candidate"},
+            {"revision": "demo-a-1", "percent": 0, "tag": "stable"},
+        ]
+        with mock.patch.object(rl, "GoogleApi"), mock.patch.object(rl, "_http_json") as request:
+            request.side_effect = [{"etag": "v1", "traffic": traffic}, {"done": True}, {"traffic": traffic[:1]}]
+            self.assertEqual(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"}), [])
+        patch = request.call_args_list[1].args[0]
+        self.assertEqual(patch.get_method(), "PATCH")
+        self.assertTrue(patch.full_url.endswith("?updateMask=traffic"))
+        body = json.loads(patch.data)
+        self.assertEqual(body["etag"], "v1")
+        self.assertEqual(body["traffic"], [traffic[0], {"revision": "demo-a-2", "percent": 0}, traffic[2]])
+
+    def test_leaves_a_newer_candidate_alone(self) -> None:
+        """An older build never removes a newer revision's tag."""
+        with mock.patch.object(rl, "GoogleApi"), mock.patch.object(rl, "_http_json") as request:
+            request.return_value = {"etag": "v2", "traffic": [{"revision": "demo-a-3", "tag": "candidate"}]}
+            self.assertEqual(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"}), [])
+            self.assertEqual(request.call_count, 1)
+
+    def test_conflict_and_missing_etag_refuse_unguarded_cleanup(self) -> None:
+        """A concurrent change or unavailable fingerprint cannot turn into unconditional tag removal."""
+        traffic = [{"revision": "demo-a-2", "tag": "candidate"}]
+        for current, responses in (
+            ({"traffic": traffic}, []),
+            ({"etag": "v1", "traffic": traffic}, [rl.GuardError("PATCH returned HTTP 409")]),
+        ):
+            with (
+                self.subTest(current=current),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rl, "_http_json") as request,
+            ):
+                request.side_effect = [current, *responses]
+                self.assertEqual(len(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"})), 1)
+                if responses:
+                    self.assertEqual(json.loads(request.call_args_list[1].args[0].data)["etag"], "v1")
+                self.assertEqual(request.call_count, 1 + len(responses))
+
+    def test_cleanup_must_finish_and_tag_must_disappear(self) -> None:
+        """A failed operation or a retained public tag makes cleanup fail visibly."""
+        current = {"etag": "v1", "traffic": [{"revision": "demo-a-2", "tag": "candidate"}]}
+        for responses in ([current, {"done": True, "error": "denied"}], [current, {"done": True}, current]):
+            with (
+                self.subTest(responses=responses),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rl, "_http_json", side_effect=responses),
+            ):
+                self.assertEqual(len(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"})), 1)
+
+
 class LightFullConfigTest(unittest.TestCase):
     def test_cloud_run_full_parse(self) -> None:
         """Tier full reads the triggers and URLs; dev verify calls the smoke checks on the candidate tag."""
@@ -2902,11 +2957,29 @@ class LightFullProdTest(unittest.TestCase):
             [command[-1] for command in self.gcloud.commands[-2:]], [str(out / "candidate"), str(out / "baseline")]
         )
         self.assertEqual(oct(out.stat().st_mode & 0o777), "0o777")
+        self.assertEqual((out / "fetch-complete").read_text().strip(), COMMIT)
         with self.assertRaises(rc.ConfigError):
             rl.cmd_stage(_args(source=str(source)), RUN, self.prod, self.gcloud)
         # Without the environment's DAG folder, the config's bucket.
         self.gcloud.fail = "composer environments describe"
         self.assertEqual(rl.dags_uri(FLOW, self.gcloud), "gs://demo-bucket/dags")
+
+    def test_failed_fetch_invalidates_a_previous_parse_and_completion_marker(self) -> None:
+        """Either failed rsync leaves no marker or reusable parse, even after a previous successful fetch."""
+        out = self.root / "parse"
+        out.mkdir()
+        for failed_source in ("data/release-candidate/", "gs://demo-bucket/dags"):
+            (out / "fetch-complete").write_text(COMMIT)
+            (out / "result.json").write_text("{}")
+            self.gcloud.fail = "rsync -r -d " + (
+                f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags"
+                if "candidate" in failed_source
+                else failed_source
+            )
+            with self.subTest(source=failed_source), self.assertRaises(rr.RecordError):
+                rl.cmd_fetch_dags(_args(out_dir=str(out)), FLOW, self.prod, self.gcloud)
+            self.assertFalse((out / "fetch-complete").exists())
+            self.assertFalse((out / "result.json").exists())
 
     def test_failed_full_release_starts_the_rollback(self) -> None:
         """Tier full: a failed deploy check posts that a rollback follows; the window build starts it."""
@@ -3011,7 +3084,9 @@ class LightFullRollbackTest(unittest.TestCase):
             previous={"release_id": "20261020T100000Z-bbbbbbbbb", "commit": PREVIOUS, "workloads": before},
         )
         _save(self.store, self.record)
+        self.cleanup_tags = mock.Mock(return_value=[])
         self.patches = [
+            mock.patch.object(rl, "remove_candidate_tags", self.cleanup_tags),
             mock.patch.object(rb, "assert_alone"),
             mock.patch.object(rr, "build_info", return_value={"id": "rb1"}),
             mock.patch.object(rr, "post_slack", return_value=True),
@@ -3082,6 +3157,7 @@ class LightFullRollbackTest(unittest.TestCase):
                 alive=lambda _: False,
             )
         self.assertEqual(code, 0)
+        self.cleanup_tags.assert_called_once_with(RUN, {"demo-a": "demo-a-2", "demo-b": "demo-b-2"})
         self.assertEqual(self.gcloud.traffic, {"demo-a": {"demo-a-1": 100}, "demo-b": {"demo-b-1": 100}})
         latest = rr.read_record(self.store, "latest")
         self.assertEqual((latest["kind"], latest["status"], latest["commit"]), ("rollback", "deployed", PREVIOUS))
@@ -3096,6 +3172,15 @@ class LightFullRollbackTest(unittest.TestCase):
             mock.patch.object(rg, "commit_messages", return_value=[]),
         ):
             self.assertEqual(rg._hold(stores, "d" * 40, "t", self.store.read("latest.json")[0]).status, "held")
+
+    def test_failed_tag_cleanup_does_not_mark_rollback_successful(self) -> None:
+        """Restored traffic alone cannot declare success while the failed candidate remains public."""
+        self.cleanup_tags.return_value = ["demo-a: failed candidate tag remains"]
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                rl.cmd_rollback_apply(self._apply_args(), RUN, self.store, self.gcloud, alive=lambda _: False), 1
+            )
+        self.assertEqual(rr.read_record(self.store, "latest")["release_id"], self.record["release_id"])
 
     def test_apply_refuses_when_prod_moved_on_and_reports_a_failed_move(self) -> None:
         """_EXPECT_LATEST refuses a stale rollback; a traffic move that fails leaves latest.json as it was."""
