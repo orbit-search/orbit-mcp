@@ -103,6 +103,7 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/release_record_failed ]; then exit 0; fi
         if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ]; then exit 0; fi
         python3 release/release_light.py apply --artifacts-file /workspace/release_artifacts.json \
           || { touch /workspace/deploy_failed; exit 1; }
@@ -118,7 +119,7 @@ steps:
         STATUS=deployed
         if [ -f /workspace/deploy_failed ]; then STATUS=deploy_failed; fi
         python3 release/release_light.py finish --env prod --release-id-file /workspace/release_id --status "$${STATUS}" \
-          || echo "release record not finished; release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
+          || { echo "release record not finished; repair it before starting the watch" | tee -a /workspace/release_verify_unchecked >&2; touch /workspace/release_record_failed; }
 
   # Deploy check: each service sends 100% to its promoted revision and both
   # /health answer. Then the watch window (+15 and +60 min): new warning and
@@ -131,6 +132,7 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/release_record_failed ]; then exit 0; fi
         # A failed promote is checked too: its failed verdict starts the rollback.
         if [ -f /workspace/deploy_superseded ]; then exit 0; fi
         if [ ! -s /workspace/release_id ]; then

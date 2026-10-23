@@ -241,6 +241,19 @@ def _pod_summary(pods: list[dict], container: str) -> dict:
             if reason in BAD_WAITING_REASONS:
                 bad.append(f"{pod['metadata']['name']}: {reason}")
     return {
+        "pod_observations": [
+            {
+                "name": pod["metadata"]["name"],
+                "created_at": pod["metadata"].get("creationTimestamp"),
+                "phase": (pod.get("status") or {}).get("phase"),
+                "reason": (pod.get("status") or {}).get("reason"),
+                "conditions": [
+                    {key: condition.get(key) for key in ("type", "status", "reason", "lastTransitionTime")}
+                    for condition in (pod.get("status") or {}).get("conditions") or []
+                ],
+            }
+            for pod in pods[:100]
+        ],
         "live_pods": live,
         "ready_pods": ready,
         "running_digests": sorted(digests),
@@ -260,7 +273,7 @@ def live_pods(clients: Clients, deployment: rc.Deployment) -> list[dict]:
     ]
 
 
-def snapshot_workloads(clients: Clients, *, missing_ok: bool = False) -> dict[str, dict]:
+def snapshot_workloads(clients: Clients, *, missing_ok: bool = False, resolve_tags: bool = True) -> dict[str, dict]:
     """Read the image of every Deployment that the deploy build moves to the release image.
 
     Keys: deployment/<name>. "image" is the template reference and "digest"
@@ -288,7 +301,7 @@ def snapshot_workloads(clients: Clients, *, missing_ok: bool = False) -> dict[st
         digest = digest_of(container["image"])
         if digest is None and len(summary["running_digests"]) == 1:
             digest = summary["running_digests"][0]
-        if digest is None:
+        if digest is None and resolve_tags:
             digest = tag_digest(clients.env, container["image"])
         workloads[f"deployment/{item.name}"] = {
             "kind": "deployment",

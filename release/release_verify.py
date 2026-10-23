@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -67,6 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release_config as rc  # noqa: E402
 import release_gate as rg  # noqa: E402
+import release_observation as ro  # noqa: E402
 import release_record as rr  # noqa: E402
 import release_signals as rs  # noqa: E402
 from promote_release_guard import (  # noqa: E402
@@ -598,7 +599,9 @@ def watch_rollback(
     def busy() -> list[str]:
         """Builds that change prod now: deploys past their gate (the prod lock) and running rollbacks."""
         holder = rr.lock_holder(store, rr.build_alive(service.prod))
-        running = builds_changing_prod(service, None)[1]
+        current = rr.read_record(store, record["release_id"])
+        rollback = rr.read_record(store, current["rolled_back_by"])
+        running = builds_since_rollback(service, rollback)
         return (
             [f"{holder.get('kind')} build {holder.get('holder')} (holds the prod lock)"] if holder else []
         ) + running
@@ -686,6 +689,8 @@ def _watch_rollback(
     for finding in findings:
         print(f"   after the rollback {finding.status:>11}  {finding.line()}", flush=True)
     if not still:
+        if any(f.status == "insufficient" for f in findings):
+            return f"not judged: not enough samples on the rollback target ({window})"
         return f"the rollback helped ({window})"
     every = len(still) == len(regressions)
     keys = [signal_key(f.metric, f.scope) for f in still]
@@ -1205,7 +1210,9 @@ def suspected_prs(service: rc.Service, record: dict, regressions: list[dict], to
         reason = f"{len(source)} source files" + (f", {len(deploy)} deploy files" if deploy else "")
         if matched:
             reason += f"; matches {', '.join(matched)}"
-        ranked.append({**commit, "score": score if files else 1, "reason": reason if files else "files unknown"})
+        ranked.append(
+            {**commit, "score": score if source or deploy else 0, "reason": reason if files else "files unknown"}
+        )
     known = {item["sha"] for item in ranked}
     ranked += [
         {key: top.get(key) for key in ("sha", "title", "pr", "author")}
@@ -1216,7 +1223,10 @@ def suspected_prs(service: rc.Service, record: dict, regressions: list[dict], to
         if item["sha"] in traced:
             top = traced[item["sha"]]
             item.update(score=top["score"], reason=top["reason"], traced=True, pr=item.get("pr") or top.get("pr"))
-    return sorted(ranked, key=lambda item: (not item.get("traced"), -item["score"]))
+    return sorted(
+        [item for item in ranked if item.get("traced") or item["score"] > 0],
+        key=lambda item: (not item.get("traced"), -item["score"]),
+    )
 
 
 def rollback_suggestion(
@@ -1313,6 +1323,7 @@ def evaluate(
     pod_get: PodGet | None = None,
     get: HttpGet = http_get,
     force_fail: str = "",
+    observation_state: Callable | None = None,
 ) -> dict:
     """Run the checks of one phase and return the result block for record["checks"].
 
@@ -1390,6 +1401,26 @@ def evaluate(
             f"; baseline {b_start:%m-%d %H:%M}-{b_end:%m-%d %H:%M} UTC, "
             f"release {c_start:%m-%d %H:%M}-{c_end:%H:%M} UTC ({candidate_minutes:.0f} min)"
         )
+    availability = None
+    if phase == "window":
+
+        def read_fresh(deadline):
+            """Use one remaining budget for every CLI in this workload sample."""
+
+            def bounded(command, timeout=120):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("workload observation deadline reached")
+                return clients.runner(command, timeout=min(timeout, remaining))
+
+            try:
+                fresh = rr.snapshot_workloads(replace(clients, runner=bounded), resolve_tags=False)
+            except (rr.RecordError, GuardError) as error:
+                raise RuntimeError(str(error)) from error
+            return asdict(check_images(record, fresh)), fresh
+
+        checked, availability = ro.confirm_images(read_fresh, state=observation_state or (lambda: (None, None)))
+        checks = [Check(**checked) if check.name == "images" else check for check in checks]
     exceeded = [item for item in findings if item.status == "exceeded"]
     regressions = [
         {"kind": "check", "name": c.name, "text": f"{c.name}: {'; '.join(c.details[1:] or c.details)}"}
@@ -1446,6 +1477,7 @@ def evaluate(
     parts = (new_errors or {}).get("parts") or {}
     signals_checked = [name for name, part in parts.items() if part.get("status") == "checked"]
     return {
+        "availability": availability,
         "phase": phase,
         "at": rr.utc_now(),
         "evaluated_until": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1462,7 +1494,11 @@ def evaluate(
         "warnings": warnings,
         "chain": [item["release_id"] for item in chain],
         "recovered_signals": recovered,
-        "result": "failed" if regressions else "passed",
+        "result": "failed"
+        if regressions
+        else "inconclusive"
+        if availability and availability["status"] != "confirmed"
+        else "passed",
     }
 
 
@@ -1472,6 +1508,8 @@ def final_verdict(service: rc.Service, result: dict) -> tuple[str, str]:
     With judged metrics configured: their samples must reach the service's min_judged
     (at least 1). Without them: the new-error log check must have run.
     """
+    if (result.get("availability") or {}).get("status") != "confirmed" and result.get("availability"):
+        return "inconclusive", "fresh workload availability is unconfirmed"
     if any(metric.judged for metric in service.metrics):
         if result["judged"] >= max(1, service.min_judged):
             return "passed", ""
@@ -1490,7 +1528,11 @@ def apply_result(
     The change applies to the record as stored at write time, so fields that
     another writer set meanwhile (a rollback's status) stay.
     """
-    key = result["phase"] if result["phase"] == "deploy" else f"window_{result['candidate_minutes']:.0f}m"
+    key = (
+        result["phase"]
+        if result["phase"] == "deploy"
+        else f"window_{result.get('checkpoint_minutes', result['candidate_minutes']):.0f}m"
+    )
     suggestion = None
     # Dev has nothing to roll back: a failed dev verify only stops the promote.
     if result["result"] == "failed" and record["environment"] == "prod":
@@ -1528,6 +1570,7 @@ def apply_result(
     def change(current: dict) -> None:
         """Save the result, collect the fresh warnings and set the verdict (a failed verdict stays)."""
         current.setdefault("checks", {})[key] = result
+        ro.note_checkpoint(current, result, key)
         # Each warning goes to Slack once per release; one whose post failed is sent again at the next checkpoint.
         known = current.setdefault("warnings", {})
         fresh.clear()
@@ -1547,7 +1590,18 @@ def apply_result(
             }
             current["rollback_suggestion"] = suggestion
         elif verdict.get("status") != "failed":
-            if not final:
+            if not final and result["result"] == "passed" and ro.later_terminal(verdict, key):
+                pass  # retain a later completed observation; a new failure above still wins
+            elif (result.get("availability") or {}).get("status") in ("unconfirmed", "superseded"):
+                verdict = {
+                    "status": "inconclusive",
+                    "unchecked": True,
+                    "at": result["at"],
+                    "phase": key,
+                    "reason": "fresh workload availability is unconfirmed; investigate capacity before reverting",
+                    "cause": "availability_unconfirmed",
+                }
+            elif not final:
                 verdict = {"status": "pending", "at": result["at"], "phase": key}
             else:
                 status, reason = final_verdict(service, result)
@@ -1712,6 +1766,26 @@ def _pod_get(clients: rr.Clients, env: rc.Environment) -> PodGet | None:
         return None
 
 
+def require_owner(store: rr.Store, record: dict) -> bool:
+    """Missing ownership stays red even when the bookkeeping write is unavailable."""
+    if ro.owned(record):
+        return True
+    claimed = [False]
+
+    def missing(current):
+        claimed[0] = ro.owned(current)
+        if not claimed[0]:
+            current.setdefault("followup", {}).update(state="owner_missing")
+
+    try:
+        rr.update_record(store, record["release_id"], missing, "followup_owner_missing")
+    except (rr.RecordError, GuardError, OSError):
+        pass
+    if not claimed[0]:
+        rr.post_slack(f":warning: release {record['release_id']} has no deploying-agent owner for +15/+60 recovery")
+    return claimed[0]
+
+
 def cmd_check(
     args: argparse.Namespace, service: rc.Service, env: rc.Environment, store: rr.Store, clients: rr.Clients
 ) -> int:
@@ -1722,51 +1796,106 @@ def cmd_check(
     if args.phase == "window" and not args.no_metrics:
         dd, metrics_error = _datadog(service, clients)
         logs = rs.CloudLogging(env.project, GoogleApi(env.project, env.region).access_token)
-    result = evaluate(
-        service,
-        record,
-        phase=args.phase,
-        clients=clients,
-        dd=dd,
-        now=_now(args),
-        metrics_error=metrics_error,
-        wait_rollouts_seconds=args.wait_rollouts_seconds,
-        store=store if args.phase == "window" else None,
-        token=token,
-        logs=logs,
-        pod_get=_pod_get(clients, env) if args.phase == "deploy" else None,
-        force_fail=args.force_fail,
-    )
-    print_result(result)
-    # The marker comes from the result itself, so a failed record write cannot hide a failed check.
-    if args.failed_marker and result["result"] == "failed":
-        Path(args.failed_marker).write_text("true\n", encoding="utf-8")
-    saved = apply_result(service, store, record, result, final=args.final, token=token)
-    if env.name == "dev":
-        superseded = newer_dev_build(env, args.build_id) if result["result"] == "failed" else None
-        saved = finish_dev_verify(
-            service,
+    checkpoint = None
+    if args.phase == "window":
+        finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
+        checkpoint = ro.scheduled_minute(
+            record, (_now(args) - finished).total_seconds() / 60, getattr(args, "checkpoint_minutes", None)
+        )
+        rr.update_record(
             store,
-            saved,
-            result,
-            build_url=args.build_url,
-            test_run=bool(args.force_fail),
+            record["release_id"],
+            lambda current: ro.begin_checkpoint(current, f"window_{checkpoint}m"),
+            "checkpoint_started",
+        )
+    try:
+        result = evaluate(
+            service,
+            record,
+            phase=args.phase,
+            clients=clients,
+            dd=dd,
+            now=_now(args),
+            metrics_error=metrics_error,
+            wait_rollouts_seconds=args.wait_rollouts_seconds,
+            store=store if args.phase == "window" else None,
             token=token,
-            superseded_by=superseded,
+            logs=logs,
+            pod_get=_pod_get(clients, env) if args.phase == "deploy" else None,
+            force_fail=args.force_fail,
+            observation_state=(lambda: prod_state(service, store, record))
+            if args.phase == "window" and env.name == "prod"
+            else None,
         )
-        if args.failed_marker and saved["verdict"]["status"] != "failed":
-            Path(args.failed_marker).unlink(missing_ok=True)  # superseded: nothing to promote, not red
-        return EXIT_FAILED if saved["verdict"]["status"] == "failed" else EXIT_OK
-    if args.force_fail and saved["verdict"]["status"] == "failed":
-        rr.post_slack(
-            f"{TEST_RUN_LINE}. A test of {service.title} release-verify forced a failure for {record['commit'][:9]}; "
-            "the window build of a test run never rolls back. No action needed."
+        if checkpoint is not None:
+            result["checkpoint_minutes"] = checkpoint
+        if args.phase == "window" and env.name == "prod":
+            ended, busy = prod_state(service, store, record)
+            if ended or busy:
+                rr.update_record(
+                    store,
+                    record["release_id"],
+                    lambda current: ro.supersede(current, ended or busy),
+                    "verify_superseded",
+                )
+                print(f"Workload observation superseded: {ended or busy}; result not recorded", flush=True)
+                return EXIT_ERROR
+        if args.phase == "window" and env.name == "prod":
+            history = builds_since_rollback(service, record)
+            if history:
+                _record_checkpoint_error(
+                    store, record, checkpoint, f"another build changed prod: {history[0]}", final=True
+                )
+                return EXIT_FAILED
+        print_result(result)
+        # The marker comes from the result itself, so a failed record write cannot hide a failed check.
+        if args.failed_marker and result["result"] == "failed":
+            Path(args.failed_marker).write_text("true\n", encoding="utf-8")
+        saved = apply_result(service, store, record, result, final=args.final, token=token)
+        owner_ok = require_owner(store, saved) if args.phase == "window" and env.name == "prod" else True
+        if args.phase == "window":
+            note_recovered(service, store, saved, result.get("recovered_signals") or [])
+        if env.name == "dev":
+            superseded = newer_dev_build(env, args.build_id) if result["result"] == "failed" else None
+            saved = finish_dev_verify(
+                service,
+                store,
+                saved,
+                result,
+                build_url=args.build_url,
+                test_run=bool(args.force_fail),
+                token=token,
+                superseded_by=superseded,
+            )
+            if args.failed_marker and saved["verdict"]["status"] != "failed":
+                Path(args.failed_marker).unlink(missing_ok=True)  # superseded: nothing to promote, not red
+            return (
+                EXIT_FAILED
+                if saved["verdict"]["status"] == "failed" or args.final and saved["verdict"]["status"] == "inconclusive"
+                else EXIT_OK
+            )
+        if args.force_fail and saved["verdict"]["status"] == "failed":
+            rr.post_slack(
+                f"{TEST_RUN_LINE}. A test of {service.title} release-verify forced a failure for {record['commit'][:9]}; "
+                "the window build of a test run never rolls back. No action needed."
+            )
+        else:
+            rr.post_slack(slack_line(service, saved, result, store))
+        if args.failed_marker and saved["verdict"]["status"] == "failed":
+            Path(args.failed_marker).write_text("true\n", encoding="utf-8")
+        if args.final and not owner_ok:
+            return EXIT_FAILED
+        return (
+            EXIT_FAILED
+            if saved["verdict"]["status"] == "failed" or args.final and saved["verdict"]["status"] == "inconclusive"
+            else EXIT_OK
         )
-    else:
-        rr.post_slack(slack_line(service, saved, result, store))
-    if args.failed_marker and saved["verdict"]["status"] == "failed":
-        Path(args.failed_marker).write_text("true\n", encoding="utf-8")
-    return EXIT_FAILED if saved["verdict"]["status"] == "failed" else EXIT_OK
+
+    except (rr.RecordError, GuardError, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
+        if checkpoint is not None:
+            _record_checkpoint_error(store, record, checkpoint, str(error), final=args.final)
+            return EXIT_FAILED
+        raise
 
 
 # --------------------------------------------------------------------------- dev verify
@@ -2053,10 +2182,13 @@ def dev_verify_alert(
 
 
 def likely_prs(record: dict) -> list[dict]:
-    """The suspected PRs worth a human's look: the ones that change source, else the top one."""
+    """The suspected PRs worth a human's look: only commits with runtime/deploy or trace evidence."""
     suspects = (record.get("rollback_suggestion") or {}).get("suspected_prs") or []
-    changed = [item for item in suspects if item.get("score", 0) >= 2]
-    return (changed or suspects[:1])[:3]
+    return [
+        item
+        for item in suspects
+        if item.get("traced") or item.get("score", 0) > 0 and item.get("reason") != "files unknown"
+    ][:3]
 
 
 def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: bool) -> tuple[str, str]:
@@ -2079,7 +2211,12 @@ def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: b
         "What regressed:",
         *[f"- {_clip(reason, 300)}" for reason in (verdict.get("reasons") or ["see the release record"])[:5]],
         "",
-        "Suspected PRs (ranked by release-verify):",
+        "PRs with runtime/deploy or trace evidence (ranking is not causal proof):",
+        *(
+            []
+            if likely_prs(record)
+            else ["- No release suspect identified; investigate scheduling, preemption and health."]
+        ),
         *[
             f"- #{item.get('pr') or '?'} {_clip(_pr_title(item), 150)} ({_clip(item.get('reason', ''), 80)})"
             for item in likely_prs(record)
@@ -2088,7 +2225,7 @@ def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: b
     steps = [
         f"In {service.github_repo}:",
         f"1. Read {service.docs} and the release record: gcloud storage cat {location}",
-        "2. Find which change in the suspected PRs causes the regression. Confirm it with the logs or metrics "
+        "2. Determine whether this is a release regression or infrastructure/capacity failure; PR ranking is not causal proof. Confirm it with the logs or metrics "
         "named above.",
         f"3. Fix it on {branch} with a test, or revert the PR when a fix is not quick. Open the PR as me and "
         "follow the PR review loop in AGENTS.md.",
@@ -2278,7 +2415,7 @@ def cmd_watch(
     if (record.get("verdict") or {}).get("status") == "failed":
         # The deploy checks failed in the prod build: act now, not at the first checkpoint.
         on_failure(service, store, record, _datadog(service, clients)[0])
-        return EXIT_OK
+        return EXIT_OK if require_owner(store, rr.read_record(store, record["release_id"])) else EXIT_FAILED
     finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
     checkpoints = sorted(int(value) for value in args.checkpoints.replace(",", " ").split())
     dd, metrics_error = _datadog(service, clients)
@@ -2289,6 +2426,11 @@ def cmd_watch(
         minutes = checkpoints[index]
         last = index == len(checkpoints) - 1
         index += 1
+        current = rr.read_record(store, record["release_id"])
+        receipt = ((current.get("followup") or {}).get("checkpoints") or {}).get(f"window_{minutes}m") or {}
+        if receipt.get("state") == "completed" and not getattr(args, "retry_completed", False):
+            print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
+            continue
         due = finished + timedelta(minutes=minutes)
         wait = (due - datetime.now(rr.UTC)).total_seconds()
         if wait > 0:
@@ -2296,9 +2438,21 @@ def cmd_watch(
             time.sleep(wait)
         try:
             if reason := wait_until_settled(service, store, record):
-                rr.update_record(store, record["release_id"], lambda _: None, "verify_superseded", {"by": reason})
+                rr.update_record(
+                    store,
+                    record["release_id"],
+                    lambda current, why=reason: ro.supersede(current, why),
+                    "verify_superseded",
+                    {"by": reason},
+                )
                 print(f"Superseded by {reason}; the watch stops", flush=True)
                 return EXIT_OK
+            rr.update_record(
+                store,
+                record["release_id"],
+                lambda current, checkpoint=minutes: ro.begin_checkpoint(current, f"window_{checkpoint}m"),
+                "checkpoint_started",
+            )
             result = evaluate(
                 service,
                 record,
@@ -2310,11 +2464,20 @@ def cmd_watch(
                 store=store,
                 token=token,
                 logs=logs,
+                observation_state=lambda: prod_state(service, store, record),
             )
+            result["checkpoint_minutes"] = minutes
             print_result(result)
             ended, busy = prod_state(service, store, record)
+            busy = busy or ((result.get("availability") or {}).get("changed") if not ended else None)
             if ended:
-                rr.update_record(store, record["release_id"], lambda _: None, "verify_superseded", {"by": ended})
+                rr.update_record(
+                    store,
+                    record["release_id"],
+                    lambda current: ro.supersede(current, ended),
+                    "verify_superseded",
+                    {"by": ended},
+                )
                 print(f"Superseded by {ended} during the check; the result is dropped", flush=True)
                 return EXIT_OK
             if busy:
@@ -2322,6 +2485,14 @@ def cmd_watch(
                 print(f"{busy} during the check; the checkpoint runs again", flush=True)
                 index -= 1
                 continue
+            # A mutating build may start AND end between state polls without moving latest.json.
+            # Its images are not evidence against the original release. Keep the window unchecked.
+            history = builds_since_rollback(service, record)
+            if history:
+                reason = f"another build changed prod during this release's observation: {history[0]}"
+                _record_checkpoint_error(store, record, minutes, reason, final=True)
+                rr.post_slack(f":warning: release-verify {record['release_id']} unchecked: {reason}")
+                return EXIT_FAILED
             extend = (
                 dd is not None
                 and last
@@ -2334,23 +2505,46 @@ def cmd_watch(
                 print(f"Only {result['judged']:.0f} samples judged (< {service.min_judged}); extending", flush=True)
                 checkpoints.append(minutes + args.extend_minutes)
             saved = apply_result(service, store, record, result, final=last and not extend, token=token)
+            require_owner(store, saved)
             post_warnings(service, store, saved, result["fresh_warnings"])
             note_recovered(service, store, saved, result.get("recovered_signals") or [])
             alert_marks(store)
-        except (rr.RecordError, GuardError, rc.ConfigError, OSError, ValueError, KeyError) as error:
+            if saved["verdict"]["status"] == "inconclusive" and not last:
+                rr.post_slack(slack_line(service, saved, result, store))
+        except (
+            rr.RecordError,
+            GuardError,
+            subprocess.SubprocessError,
+            rc.ConfigError,
+            OSError,
+            ValueError,
+            KeyError,
+        ) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
             _record_checkpoint_error(store, record, minutes, str(error), final=last)
             rr.post_slack(
                 f":warning: {service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
                 f"{str(error)[:200]}"
             )
+            if last:
+                return EXIT_FAILED  # a failed receipt write cannot make a failed checker green
             continue
         if saved["verdict"]["status"] == "failed" or (last and not extend):
             rr.post_slack(slack_line(service, saved, result, store))
             if saved["verdict"]["status"] == "failed":
                 on_failure(service, store, saved, dd)
-            return EXIT_OK
-    return EXIT_OK
+            return (
+                EXIT_FAILED
+                if saved["verdict"]["status"] == "inconclusive"
+                or not ro.owned(rr.read_record(store, record["release_id"]))
+                else EXIT_OK
+            )
+    final_record = rr.read_record(store, record["release_id"])
+    return (
+        EXIT_FAILED
+        if (final_record.get("verdict") or {}).get("status") == "inconclusive" or not ro.owned(final_record)
+        else EXIT_OK
+    )
 
 
 def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error: str, *, final: bool) -> None:
@@ -2358,6 +2552,9 @@ def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error:
 
     def change(current: dict) -> None:
         """On the final checkpoint, set the inconclusive verdict unless the record has failed already."""
+        current.setdefault("followup", {}).setdefault("checkpoints", {}).setdefault(f"window_{minutes}m", {}).update(
+            state="error", last_error=error[:500], heartbeat_at=rr.utc_now()
+        )
         if final and (current.get("verdict") or {}).get("status") != "failed":
             current["verdict"] = {
                 "status": "inconclusive",
@@ -2443,6 +2640,23 @@ def _release_claim(store: rr.Store, release_id: str, claim_id: str) -> None:
         print(f"WARNING: could not release the rollback claim {claim_id}: {error}", file=sys.stderr, flush=True)
 
 
+def builds_since_rollback(service: rc.Service, rollback: dict) -> list[str]:
+    """Any deploy/rollback that could have changed prod during the observation, including ended builds."""
+    api = GoogleApi(service.project, service.region)
+    finished = rr.parse_utc(rollback["times"]["deploy_finished"])
+    since = finished.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    overlap = f'(finish_time>="{since}" OR status="PENDING" OR status="QUEUED" OR status="WORKING")'
+    names = " OR ".join(f'substitutions.TRIGGER_NAME="{name}"' for name in service.prod.deploy_triggers)
+    deploys = api.list_builds(f"({names}) AND {overlap}")
+    rollbacks = api.list_builds(f'tags="{service.rollback_build_tag}" AND {overlap}')
+    own = (rollback.get("build") or {}).get("id")
+    return [
+        build.describe()
+        for build in deploys
+        if build.id != own and dict(build.step_status).get("release-record-begin") not in ("PENDING", "QUEUED")
+    ] + [build.describe() for build in rollbacks if build.id != own and not build.rollback_dry_run]
+
+
 def builds_changing_prod(service: rc.Service, own_build: str | None) -> tuple[bool, list[str]]:
     """(the release's own prod build still runs, other builds that change prod now).
 
@@ -2495,6 +2709,27 @@ def follow_rollback(
             f"{ROLLBACK_WAIT_SECONDS // 60} min ({status}); check it: {rr.build_url(service.prod, build_id)}"
         )
         return status
+
+    try:
+        pointer, _ = store.read("latest.json")
+        rollback = rr.read_record(store, pointer["release_id"]) if pointer else {}
+        cleanup = ((rollback.get("checks") or {}).get("rollback") or {}).get("cleanup_failures")
+        if (
+            rollback.get("kind") == "rollback"
+            and rollback.get("status") == "deployed"
+            and (rollback.get("build") or {}).get("id") == build_id
+            and (rollback.get("rollback") or {}).get("rolled_back_release") == release_id
+            and (rollback.get("promote_hold") or {}).get("status") == "held"
+            and cleanup
+        ):
+            rr.post_slack(
+                f":x: {service.title} rollback build {build_id} restored prod and holds promotes, "
+                f"but candidate cleanup is incomplete: {cleanup[0][:300]}. Repair candidate tags; "
+                f"do not roll back again ({rr.build_url(service.prod, build_id)})"
+            )
+            return status
+    except (rr.RecordError, GuardError, OSError, KeyError, ValueError) as error:
+        print(f"WARNING: could not confirm the rollback result: {error}", file=sys.stderr, flush=True)
 
     def failed(current: dict) -> None:
         """Mark our rollback claim as failed with the build status."""
@@ -2711,11 +2946,46 @@ def cmd_schedule_window(
     rr.update_record(
         store,
         rr.read_record(store, args.release_id)["release_id"],
-        lambda current: current.setdefault("checks", {}).__setitem__("window_build", window_build),
+        lambda current: (
+            current.setdefault("checks", {}).__setitem__("window_build", window_build),
+            ro.merge_plan(current, window_build["checkpoints_minutes"]),
+        ),
         "window_scheduled",
         {"build_id": build_id},
     )
     print(f"Watch window build {build_id} submitted (checkpoints {checkpoints} min)", flush=True)
+    return EXIT_OK
+
+
+def cmd_own(
+    args: argparse.Namespace, service: rc.Service, env: rc.Environment, store: rr.Store, clients: rr.Clients
+) -> int:
+    """Acknowledge the deploying agent's durable responsibility for the two checkpoints."""
+    record = rr.read_record(store, args.release_id)
+
+    def own(current):
+        ro.claim_owner(
+            current,
+            args.thread_url,
+            args.pr_url,
+            takeover=getattr(args, "takeover", False),
+            reason=getattr(args, "reason", ""),
+        )
+
+    saved = rr.update_record(store, record["release_id"], own, "followup_owned", {"thread_url": args.thread_url})
+    print(
+        json.dumps(
+            {
+                "release_id": saved["release_id"],
+                "commit": saved["commit"],
+                "images": saved.get("images"),
+                "followup": saved["followup"],
+                "window_build": (saved.get("checks") or {}).get("window_build"),
+                "record": store.location(rr.record_name(saved["release_id"])),
+            },
+            indent=2,
+        )
+    )
     return EXIT_OK
 
 
@@ -2724,11 +2994,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
+    own = commands.add_parser("own", help="acknowledge agent ownership of +15/+60 checks")
+    rr.add_common_args(own)
+    own.add_argument("--release-id", required=True)
+    own.add_argument("--thread-url", required=True)
+    own.add_argument("--pr-url", required=True)
+    own.add_argument("--takeover", action="store_true")
+    own.add_argument("--reason", default="")
+
     check = commands.add_parser("check", help="run one phase of checks now")
     rr.add_common_args(check)
     check.add_argument("--release-id", default="latest")
     check.add_argument("--release-id-file", help="read the release id from this file (Cloud Build workspace)")
     check.add_argument("--phase", choices=["deploy", "window"], default="deploy")
+    check.add_argument("--checkpoint-minutes", type=int, help="manual repair: scheduled checkpoint identity")
     check.add_argument("--final", action="store_true", help="this check sets the final verdict")
     check.add_argument("--no-metrics", action="store_true", help="smoke checks only")
     check.add_argument("--now", help="evaluate as of this UTC time (dry runs of a past window)")
@@ -2743,6 +3022,9 @@ def main(argv: list[str] | None = None) -> int:
     watch = commands.add_parser("watch", help="checks at each checkpoint of the watch window")
     rr.add_common_args(watch)
     watch.add_argument("--release-id", required=True)
+    watch.add_argument(
+        "--retry-completed", action="store_true", help="rerun completed checkpoints, preserving attempt history"
+    )
     watch.add_argument("--checkpoints", default="", help="minutes after the deploy (default: the config's)")
     watch.add_argument("--extend-minutes", type=int, default=15)
     watch.add_argument("--max-window-minutes", type=int, default=180)
@@ -2760,7 +3042,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "release_id_file", None):
         args.release_id = Path(args.release_id_file).read_text(encoding="utf-8").strip()
-    handlers = {"check": cmd_check, "watch": cmd_watch, "schedule-window": cmd_schedule_window}
+    handlers = {"check": cmd_check, "watch": cmd_watch, "schedule-window": cmd_schedule_window, "own": cmd_own}
     try:
         service, env, store, clients = rr.open_from_args(args)
         if args.command == "watch" and not args.checkpoints:

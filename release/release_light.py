@@ -1165,6 +1165,8 @@ def _fail(
                 "reasons": [item["text"] for item in regressions],
             }
             current["rollback_suggestion"] = suggestion
+        if phase.startswith("window_") and (current.get("checks") or {}).get(phase, {}).get("result") == "failed":
+            rv.ro.note_checkpoint(current, current["checks"][phase], phase)
 
     return rr.update_record(store, record["release_id"], change, f"verify_{phase}", {"result": "failed"})
 
@@ -1485,19 +1487,36 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
     record = rr.read_record(store, args.release_id)
     if (record.get("verdict") or {}).get("status") == "failed":
         on_failed(service, store, record)
-        return rv.EXIT_OK
+        return rv.EXIT_OK if rv.require_owner(store, rr.read_record(store, record["release_id"])) else rv.EXIT_FAILED
     finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
     checkpoints = sorted(int(value) for value in (args.checkpoints or " ".join(map(str, service.checkpoints))).split())
     for index, minutes in enumerate(checkpoints):
         last = index == len(checkpoints) - 1
+        current = rr.read_record(store, record["release_id"])
+        receipt = ((current.get("followup") or {}).get("checkpoints") or {}).get(f"window_{minutes}m") or {}
+        if receipt.get("state") == "completed" and not getattr(args, "retry_completed", False):
+            print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
+            continue
         wait = (finished + timedelta(minutes=minutes) - datetime.now(rr.UTC)).total_seconds()
         if wait > 0:
             print(f"Waiting {wait / 60:.1f} min for the +{minutes} min checkpoint", flush=True)
             time.sleep(wait)
         try:
+            rr.update_record(
+                store,
+                record["release_id"],
+                lambda current, checkpoint=minutes: rv.ro.begin_checkpoint(current, f"window_{checkpoint}m"),
+                "checkpoint_started",
+            )
             new_errors = None
             for _ in range(CHECKPOINT_ATTEMPTS):
                 if replaced := wait_for_deploys(service, store, record):
+                    rr.update_record(
+                        store,
+                        record["release_id"],
+                        lambda current, reason=replaced: rv.ro.supersede(current, reason),
+                        "verify_superseded",
+                    )
                     print(f"Superseded by {replaced}; the watch stops", flush=True)
                     return rv.EXIT_OK
                 new_errors = evaluate_window(service, store, record, runner, datetime.now(rr.UTC))
@@ -1505,18 +1524,34 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 # newer release ends the watch; a build that only runs makes the checkpoint run again.
                 if replaced := replaced_by(service, store, record):
                     if replaced.startswith("release "):
+                        rr.update_record(
+                            store,
+                            record["release_id"],
+                            lambda current, reason=replaced: rv.ro.supersede(current, reason),
+                            "verify_superseded",
+                        )
                         print(f"Superseded by {replaced} during the checks; the watch stops", flush=True)
                         return rv.EXIT_OK
                     print(f"{replaced} started during the checks; the checkpoint runs again", flush=True)
                     new_errors = None
                     continue
+                history = rv.builds_since_rollback(service, record)
+                if history:
+                    reason = f"another build changed prod during this observation: {history[0]}"
+                    rv._record_checkpoint_error(store, record, minutes, reason, final=True)
+                    rr.post_slack(f":warning: {service.title} release-verify unchecked: {reason}")
+                    return rv.EXIT_FAILED
                 break
             if new_errors is None:
                 raise rr.RecordError(f"deploy builds kept starting during {CHECKPOINT_ATTEMPTS} attempts")
-        except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        except (rr.RecordError, GuardError, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
+            rv._record_checkpoint_error(store, record, minutes, str(error), final=last)
+            rr.post_slack(
+                f":warning: {service.title} +{minutes} min checkpoint inconclusive: could not run: {str(error)[:200]}"
+            )
             if last:
-                finish_inconclusive(service, store, record, f"window_{minutes}m", str(error))
+                return rv.EXIT_FAILED
             continue
         key = f"window_{minutes}m"
         regressions = [rv.new_error_regression(problem) for problem in new_errors["problems"] if problem["clear"]]
@@ -1525,12 +1560,26 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             for problem in new_errors["problems"]
             if not problem["clear"] and problem.get("suspects") and problem["suspects"][0].get("linked")
         ]
-        result = {"phase": "window", "at": rr.utc_now(), "new_errors": new_errors, "warnings": warnings}
+        result = {
+            "phase": "window",
+            "at": rr.utc_now(),
+            "new_errors": new_errors,
+            "warnings": warnings,
+            "result": "failed"
+            if regressions
+            else "passed"
+            if new_errors["parts"].get("logs", {}).get("status") == "checked"
+            else "inconclusive",
+        }
         fresh: list[dict] = []
 
-        def store_result(current: dict, key: str = key, result: dict = result) -> None:
+        def store_result(
+            current: dict, key: str = key, result: dict = result, complete: bool = not last and not regressions
+        ) -> None:
             """Save the checkpoint result and collect the warnings not posted yet into fresh."""
             current.setdefault("checks", {})[key] = result
+            if complete:
+                rv.ro.note_checkpoint(current, result, key)
             known = current.setdefault("warnings", {})
             fresh.clear()
             for warning in result["warnings"]:
@@ -1543,12 +1592,13 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         saved = rr.update_record(
             store, record["release_id"], store_result, f"verify_{key}", {"problems": len(new_errors["problems"])}
         )
+        owner_ok = rv.require_owner(store, saved)
         for problem in new_errors["problems"]:
             print(f"   {'FAILS' if problem['clear'] else 'warns'}  {problem['text'][:300]}")
         if regressions:
             saved = _fail(service, store, saved, key, regressions, new_errors)
             on_failed(service, store, saved)
-            return rv.EXIT_OK
+            return rv.EXIT_OK if owner_ok else rv.EXIT_FAILED
         if fresh:
             rv.post_warnings(service, store, saved, fresh, command=rollback_command(service, saved))
         if last:
@@ -1558,7 +1608,13 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             def done(current: dict, status: str = status) -> None:
                 """Set the final verdict, unless the record has failed already."""
                 if (current.get("verdict") or {}).get("status") != "failed":
-                    current["verdict"] = {"status": status, "at": rr.utc_now(), "phase": key}
+                    current["verdict"] = {
+                        "status": status,
+                        "at": rr.utc_now(),
+                        "phase": key,
+                        "unchecked": status == "inconclusive",
+                    }
+                rv.ro.note_checkpoint(current, result, key)
 
             rr.update_record(store, record["release_id"], done, "verify_final", {"status": status})
             icon = ":white_check_mark:" if checked else ":grey_question:"
@@ -1566,7 +1622,12 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 f"{icon} {service.title} release-verify {record['commit'][:9]} {status}. "
                 f"Record {store.location(rr.record_name(record['release_id']))}"
             )
-    return rv.EXIT_OK
+    current = rr.read_record(store, record["release_id"])
+    return (
+        rv.EXIT_FAILED
+        if (current.get("verdict") or {}).get("status") == "inconclusive" or not rv.require_owner(store, current)
+        else rv.EXIT_OK
+    )
 
 
 def window_sources(service: LightService) -> list[Path]:
@@ -1618,7 +1679,12 @@ def cmd_schedule_window(args: argparse.Namespace, service: LightService, store: 
     rr.update_record(
         store,
         args.release_id,
-        lambda current: current.setdefault("checks", {}).__setitem__("window_build", {"id": build_id}),
+        lambda current: (
+            current.setdefault("checks", {}).__setitem__(
+                "window_build", {"id": build_id, "checkpoints_minutes": list(service.checkpoints)}
+            ),
+            rv.ro.merge_plan(current, list(service.checkpoints)),
+        ),
         "window_scheduled",
         {"build_id": build_id},
     )
@@ -2086,13 +2152,14 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
     previous = (latest.get("workloads") or {}, latest.get("images") or {})
     record = rb.create_rollback_record(service, store, args, latest, target, previous, plan)
     failures = apply_rollback(service, plan, runner)
+    cleanup_failures = []
     if service.kind == "cloud_run":
         failed_candidates = {
             name: str(artifact).partition("@")[0]
             for name, artifact in (latest.get("artifacts") or {}).items()
             if name in service.services
         }
-        failures += remove_candidate_tags(service, failed_candidates)
+        cleanup_failures = remove_candidate_tags(service, failed_candidates)
         after = snapshot_cloud_run(service, runner)
     else:
         try:
@@ -2115,7 +2182,9 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
     check = check_rollback(service, plan, after)
     if check.status == "failed":
         failures += check.details[1:]
-    return rb.finish_rollback(service, store, args, record, latest, target, after, [check], failures)
+    return rb.finish_rollback(
+        service, store, args, record, latest, target, after, [check], failures, cleanup_failures=cleanup_failures
+    )
 
 
 def cmd_rollback_command(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2132,6 +2201,11 @@ def long_runner(command: list[str]) -> str:
 
 # Commands that change or copy something: their gcloud and gsutil calls may take minutes.
 LONG_COMMANDS = ("stage", "fetch-dags", "apply")
+
+
+def cmd_own(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Acknowledge the deploying chat using the same atomic ownership protocol as GKE."""
+    return rv.cmd_own(args, service, None, store, None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2157,6 +2231,14 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--out-dir", default="/workspace")
         sub.add_argument("--poll-seconds", type=float, default=15.0)
 
+    own = commands.add_parser("own", help="acknowledge the deploying agent's +15/+60 responsibility")
+    env_arg(own)
+    release_id_args(own)
+    own.add_argument("--thread-url", required=True)
+    own.add_argument("--pr-url", required=True)
+    own.add_argument("--takeover", action="store_true")
+    own.add_argument("--reason", default="")
+
     begin = commands.add_parser("begin", help="snapshot and write a deploying record (before the deploy)")
     env_arg(begin)
     begin.add_argument("--commit", required=True)
@@ -2181,6 +2263,7 @@ def main(argv: list[str] | None = None) -> int:
     watch = commands.add_parser("watch", help="the window checks at each checkpoint")
     release_id_args(watch)
     watch.add_argument("--checkpoints", default="")
+    watch.add_argument("--retry-completed", action="store_true")
     schedule = commands.add_parser("schedule-window", help="submit the watch-window build")
     release_id_args(schedule)
     schedule.add_argument("--source-dir", default="/workspace/release-verify-src")
@@ -2223,6 +2306,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "release_id_file", None) and args.command != "begin":
         args.release_id = Path(args.release_id_file).read_text(encoding="utf-8").strip()
     handlers = {
+        "own": cmd_own,
         "begin": cmd_begin,
         "finish": cmd_finish,
         "check": cmd_check,

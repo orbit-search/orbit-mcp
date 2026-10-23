@@ -32,6 +32,12 @@ import release_rollback as rb  # noqa: E402
 import release_signals as rs  # noqa: E402
 import release_verify as rv  # noqa: E402
 
+
+def setUpModule():
+    """Keep suite polling deterministic; explicit retry tests inject their own clock."""
+    rv.ro.MAX_SAMPLES = 1
+
+
 REPO = "us-central1-docker.pkg.dev/orbit-search/demo/demo"
 NEW = "sha256:" + "1" * 64
 OLD = "sha256:" + "2" * 64
@@ -195,6 +201,7 @@ def _record(**overrides) -> dict:
         "schema_version": 1,
         "service": "demo",
         "environment": "prod",
+        "followup": {"owner": {"thread_url": "codex://threads/test-owner", "pr_url": "https://github.com/o/r/pull/1"}},
         "release_id": "20261021T100000Z-aaaaaaaaa",
         "kind": "promote",
         "commit": COMMIT,
@@ -813,6 +820,172 @@ class VerdictTest(unittest.TestCase):
         result.update(overrides)
         return result
 
+    def test_availability_uncertainty_cannot_pass_with_healthy_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            result = self._result(availability={"status": "unconfirmed"}, result="inconclusive")
+            saved = rv.apply_result(SERVICE, store, record, result, final=True, token=None)
+            self.assertEqual(saved["verdict"]["status"], "inconclusive")
+            self.assertTrue(saved["verdict"]["unchecked"])
+            self.assertFalse(saved.get("rollback_suggestion"))
+            self.assertEqual(rv.final_verdict(SERVICE, result)[0], "inconclusive")
+            # An independent error still fails, even while the cluster's capacity is uncertain.
+            result.update(result="failed", regressions=[{"kind": "metric", "text": "error rate regressed"}])
+            saved = rv.apply_result(SERVICE, store, saved, result, final=True, token=None)
+            self.assertEqual(saved["verdict"]["status"], "failed")
+
+    def test_late_checkpoint_keeps_the_scheduled_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            result = self._result(candidate_minutes=18, checkpoint_minutes=15)
+            saved = rv.apply_result(SERVICE, store, record, result, final=False, token=None)
+            self.assertIn("window_15m", saved["checks"])
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "completed")
+            self.assertNotIn("window_18m", saved["checks"])
+
+    def _run_owned_watch(self, store, record, *, result=None, error=None, history=None):
+        args = argparse.Namespace(
+            release_id=record["release_id"],
+            checkpoints="15,60",
+            extend_minutes=15,
+            max_window_minutes=180,
+            retry_completed=False,
+        )
+        with (
+            mock.patch.object(rv, "_datadog", return_value=(None, None)),
+            mock.patch.object(rv, "_token", return_value=None),
+            mock.patch.object(rv, "wait_until_settled", return_value=None),
+            mock.patch.object(rv, "prod_state", return_value=(None, None)),
+            mock.patch.object(rv, "builds_since_rollback", return_value=history or []),
+            mock.patch.object(rv, "evaluate", side_effect=error, return_value=result or self._result()) as evaluate,
+            mock.patch.object(rv, "print_result"),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ):
+            outcome = rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock())
+            return outcome, evaluate.call_count
+
+    def test_missing_owner_runs_health_but_final_followup_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual(count, 2)
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            self.assertEqual(saved["followup"]["state"], "owner_missing")
+
+    def test_resumed_watch_preserves_completed_15m_and_only_checks_60m(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            rv.ro.merge_plan(record, [15, 60])
+            rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_15m")
+            record["checks"]["window_15m"] = {"at": "original", "result": "passed"}
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["checks"]["window_15m"]["at"], "original")
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["completed_at"], "original")
+            self.assertIn("window_60m", saved["checks"])
+
+    def test_final_checker_exception_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record, error=rr.RecordError("cluster unavailable"))
+            self.assertEqual((outcome, count), (rv.EXIT_FAILED, 2))
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "inconclusive")
+
+    def test_terminal_mutation_during_observation_never_rolls_back_the_old_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with mock.patch.object(rv, "on_failure") as rollback:
+                outcome, _ = self._run_owned_watch(store, record, history=["CANCELLED build that mutated prod"])
+                rollback.assert_not_called()
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "inconclusive")
+            self.assertIn("CANCELLED", saved["verdict"]["reason"])
+
+    def test_final_checker_and_receipt_outage_is_still_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with mock.patch.object(rv, "_record_checkpoint_error"):
+                outcome, _ = self._run_owned_watch(store, record, error=rr.RecordError("GCS unavailable"))
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "pending")
+
+    def test_failed_deploy_rolls_back_even_without_an_owner_but_returns_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"}, followup={})
+            _save(store, record)
+            with mock.patch.object(rv, "on_failure") as rollback:
+                outcome, count = self._run_owned_watch(store, record)
+                rollback.assert_called_once()
+            self.assertEqual((outcome, count), (rv.EXIT_FAILED, 0))
+            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["state"], "owner_missing")
+
+    def test_manual_final_health_pass_without_owner_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            args = argparse.Namespace(
+                release_id=record["release_id"],
+                phase="window",
+                no_metrics=True,
+                now=None,
+                wait_rollouts_seconds=0,
+                force_fail="",
+                final=True,
+                failed_marker="",
+            )
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "prod_state", return_value=(None, None)),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rv, "evaluate", return_value=self._result()),
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            self.assertEqual(saved["followup"]["state"], "owner_missing")
+
+    def test_missing_owner_receipt_outage_cannot_grant_ownership(self):
+        with (
+            mock.patch.object(rr, "update_record", side_effect=rr.RecordError("GCS down")),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ):
+            self.assertFalse(rv.require_owner(mock.Mock(), _record(followup={})))
+
+    def test_reverse_resume_cannot_erase_a_completed_60m_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "passed", "phase": "window_60m"})
+            rv.ro.merge_plan(record, [15, 60])
+            rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_60m")
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"], {"status": "passed", "phase": "window_60m"})
+            self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["completed_at"], "original")
+
     def test_final(self) -> None:
         """Final."""
         self.assertEqual(rv.final_verdict(SERVICE, self._result())[0], "passed")
@@ -1021,6 +1194,20 @@ class LogTest(unittest.TestCase):
                 [function.name for function in rs.origins(problem, rs.SourceTree(root, SERVICE.code))], ["GET"]
             )
         self.assertIn(f'jsonPayload.metadata.consoleArgs:"{fragment}"', rs.message_match(fragment))
+
+    def test_short_console_prefix_does_not_hide_the_message(self) -> None:
+        """A generic Error: prefix cannot suppress a searchable structured message."""
+        text = rs.entry_text(
+            {
+                "jsonPayload": {
+                    "message": "database connection failed",
+                    "metadata": {"consoleArgs": ["Error:", {"message": "database connection failed"}]},
+                }
+            }
+        )
+        self.assertEqual(text.splitlines()[0], "database connection failed")
+        sites = rs.count_sites(rs.count_patterns([("2026-10-21", "pod", "app", "ERROR", text)]))
+        self.assertTrue(any("database connection failed" in site for site in sites))
 
     def test_unrelated_metadata_does_not_replace_the_message(self) -> None:
         """Malformed or non-console metadata keeps the existing message reader."""
@@ -1444,6 +1631,36 @@ class ReviewFixTest(unittest.TestCase):
             self.assertEqual(saved["auto_rollback"]["status"], "failed")
             self.assertFalse(rv.claim_blocks(saved, "other", datetime(2026, 10, 21, 11, tzinfo=rr.UTC)))
             self.assertIn("Roll back by hand", slack.call_args[0][0])
+
+    def test_red_cleanup_build_does_not_recommend_a_second_rollback(self) -> None:
+        """A restored, held rollback can end red for cleanup without reversing to the failed release."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            store = _store(tmp)
+            record = _record(auto_rollback={"status": "started", "claim": "c1", "build_id": "rb1"})
+            _save(store, record)
+            rollback = _record(
+                release_id="20261021T110000Z-bbbbbbbbb",
+                kind="rollback",
+                status="deployed",
+                build={"id": "rb1"},
+                rollback={"rolled_back_release": record["release_id"]},
+                promote_hold={"status": "held"},
+                checks={"rollback": {"cleanup_failures": ["failed candidate tag remains"]}},
+            )
+            _save(store, rollback)
+            status = rv.follow_rollback(
+                SERVICE,
+                store,
+                record["release_id"],
+                "rb1",
+                "c1",
+                sleep=lambda _: None,
+                get_build=lambda _: mock.Mock(status="FAILURE"),
+            )
+            self.assertEqual(status, "FAILURE")
+            self.assertEqual(rr.read_record(store, record["release_id"])["auto_rollback"]["status"], "started")
+            self.assertIn("do not roll back again", slack.call_args.args[0])
+            self.assertNotIn("Roll back by hand", slack.call_args.args[0])
 
     def test_single_pod_spread(self) -> None:
         """Single pod spread."""
@@ -2003,6 +2220,115 @@ class PublicRetryTest(unittest.TestCase):
 
 
 class LightTest(unittest.TestCase):
+    def setUp(self):
+        history = mock.patch.object(rv, "builds_since_rollback", return_value=[])
+        history.start()
+        self.addCleanup(history.stop)
+
+    def test_light_terminal_verdict_and_receipt_are_atomic_on_resume(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                _save(store, record)
+                args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+                observed = {
+                    "problems": [{"clear": True, "text": "bad"}] if failed else [],
+                    "parts": {"logs": {"status": "checked"}},
+                    "scope": {},
+                }
+                real_update = rr.update_record
+
+                def outage(*args, **kwargs):
+                    event = args[3]
+                    details = args[4] if len(args) > 4 else {}
+                    if event == "verify_final" or failed and details.get("result") == "failed":
+                        raise rr.RecordError("terminal write down")
+                    return real_update(*args, **kwargs)
+
+                with (
+                    mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                    mock.patch.object(rl, "replaced_by", return_value=None),
+                    mock.patch.object(rl, "evaluate_window", return_value=observed) as evaluate,
+                    mock.patch.object(rl, "on_failed") as rollback,
+                    mock.patch.object(rl, "rr_token", return_value=None),
+                    mock.patch.object(rs, "rollback_target", return_value=None),
+                    mock.patch.object(rv, "suspected_prs", return_value=[]),
+                    mock.patch.object(
+                        rv, "new_error_regression", return_value={"kind": "new_error", "name": "bad", "text": "bad"}
+                    ),
+                    mock.patch.object(rr, "post_slack", return_value=True),
+                ):
+                    with mock.patch.object(rr, "update_record", side_effect=outage), self.assertRaises(rr.RecordError):
+                        rl.cmd_watch(args, service, store, mock.Mock())
+                    saved = rr.read_record(store, record["release_id"])
+                    self.assertNotEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+                    rl.cmd_watch(args, service, store, mock.Mock())
+                    self.assertEqual(evaluate.call_count, 2)
+                    saved = rr.read_record(store, record["release_id"])
+                    self.assertEqual(saved["verdict"]["status"], "failed" if failed else "passed")
+                    self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+                    self.assertEqual(rollback.call_count, int(failed))
+
+    def test_light_terminal_mutation_ends_at_15m_unchecked(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="15 60", retry_completed=False)
+            clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                mock.patch.object(rv, "builds_since_rollback", return_value=["CANCELLED mutating build"]),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertTrue(rr.read_record(store, record["release_id"])["verdict"]["unchecked"])
+
+    def test_owner_and_resumed_checkpoint_receipts(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        for owned in (True, False):
+            with self.subTest(owned=owned), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record() if owned else _record(followup={})
+                rv.ro.merge_plan(record, [15, 60])
+                rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_15m")
+                _save(store, record)
+                args = argparse.Namespace(release_id=record["release_id"], checkpoints="15 60", retry_completed=False)
+                clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+                with (
+                    mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                    mock.patch.object(rl, "replaced_by", return_value=None),
+                    mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                    mock.patch.object(rr, "post_slack", return_value=True),
+                ):
+                    outcome = rl.cmd_watch(args, service, store, mock.Mock())
+                self.assertEqual(outcome, rv.EXIT_OK if owned else rv.EXIT_FAILED)
+                self.assertEqual(evaluate.call_count, 1)
+                saved = rr.read_record(store, record["release_id"])
+                self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["completed_at"], "original")
+                self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+
+    def test_final_light_checker_receipt_outage_still_exits_red(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("provider down")),
+                mock.patch.object(rv, "_record_checkpoint_error"),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+
     def test_parse(self) -> None:
         """Parse."""
         run = rl.parse_light(light_data("cloud_run"))
@@ -2153,7 +2479,10 @@ class LightTest(unittest.TestCase):
             suggestion = saved["rollback_suggestion"]
             self.assertEqual(suggestion["target"]["rollback_to"], f"previous-of:{older['release_id']}")
             self.assertTrue(suggestion["how"][0].endswith(f"--sha={'e' * 40}"))
-            with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            with (
+                mock.patch.dict(os.environ, {"RELEASE_SLACK_DISABLED": "0"}),
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            ):
                 rl.alert(service, store, saved)
                 rl.alert(service, store, rr.read_record(store, newer["release_id"]))
             self.assertEqual(slack.call_count, 1)
@@ -2259,7 +2588,7 @@ class LightTest(unittest.TestCase):
                 mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("logs down")),
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
             ):
-                rl.cmd_watch(args, service, store, mock.Mock())
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("inconclusive", True))
             self.assertIn("inconclusive", slack.call_args[0][0])
@@ -3180,7 +3509,18 @@ class LightFullRollbackTest(unittest.TestCase):
             self.assertEqual(
                 rl.cmd_rollback_apply(self._apply_args(), RUN, self.store, self.gcloud, alive=lambda _: False), 1
             )
-        self.assertEqual(rr.read_record(self.store, "latest")["release_id"], self.record["release_id"])
+        latest = rr.read_record(self.store, "latest")
+        self.assertEqual(latest["kind"], "rollback")
+        self.assertEqual(latest["status"], "deployed")
+        self.assertEqual(latest["verdict"]["status"], "failed")
+        self.assertEqual(latest["promote_hold"]["status"], "held")
+        self.assertEqual(rr.read_record(self.store, self.record["release_id"])["rolled_back_by"], latest["release_id"])
+        stores = rg.Stores(service=RUN, prod=self.store, dev=None)
+        with (
+            mock.patch.object(rg, "contains", return_value=True),
+            mock.patch.object(rg, "commit_messages", return_value=[]),
+        ):
+            self.assertEqual(rg._hold(stores, "d" * 40, "t", self.store.read("latest.json")[0]).status, "held")
 
     def test_apply_refuses_when_prod_moved_on_and_reports_a_failed_move(self) -> None:
         """_EXPECT_LATEST refuses a stale rollback; a traffic move that fails leaves latest.json as it was."""
@@ -3672,6 +4012,184 @@ class VersionTest(unittest.TestCase):
             )  # type: ignore[arg-type]
             self.assertEqual(outcome, "no metric without the spread rule regressed")
             self.assertEqual(rv.environmental_signals(store), {})
+
+    def test_missing_rollback_samples_are_inconclusive(self) -> None:
+        """Missing version-tagged traffic proves no recovery and never releases the hold."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {}),
+                record,
+                sleep=lambda _: None,
+                prod_busy=lambda: [],
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("not enough samples", outcome)
+            self.assertNotIn("helped", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+
+    def test_ended_deploy_in_observation_keeps_the_hold(self) -> None:
+        """A cancelled deploy can contaminate the window without finishing a release record."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True),
+            mock.patch.object(rr, "lock_holder", return_value=None),
+            mock.patch.object(rv, "GoogleApi") as api,
+        ):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            cancelled = guard.Build.from_api(
+                {
+                    "id": "cancelled-fix",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T10:00:00Z",
+                    "finishTime": "2026-10-21T11:10:00Z",
+                    "steps": [{"id": "release-record-begin", "status": "SUCCESS"}],
+                }
+            )
+            api.return_value.list_builds.side_effect = [[cancelled], []]
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}}),
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("cancelled-fix", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+            query = api.return_value.list_builds.call_args_list[0].args[0]
+            self.assertIn("finish_time>=", query)
+            self.assertIn("2026-10-21T11:00:00.000000Z", query)
+
+    def test_cancelled_deploy_appearing_after_metric_reads_blocks_marks(self) -> None:
+        """A build that starts and ends between the two history reads still contaminates the evidence."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True),
+            mock.patch.object(rr, "lock_holder", return_value=None),
+            mock.patch.object(rv, "GoogleApi") as api,
+        ):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            cancelled = guard.Build.from_api(
+                {
+                    "id": "late-fix",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T11:10:00Z",
+                    "finishTime": "2026-10-21T11:15:00Z",
+                    "steps": [{"id": "release-record-begin", "status": "SUCCESS"}],
+                }
+            )
+            api.return_value.list_builds.side_effect = [[], [], [cancelled], []]
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}}),
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("late-fix", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+
+    def test_other_ended_rollback_contaminates_but_dry_run_does_not(self) -> None:
+        """All other actual rollback builds count, regardless of terminal status."""
+        real = guard.Build.from_api(
+            {
+                "id": "other",
+                "status": "FAILURE",
+                "createTime": "2026-10-21T11:01:00Z",
+                "substitutions": {"_DRY_RUN": "false"},
+            }
+        )
+        dry = guard.Build.from_api(
+            {
+                "id": "dry",
+                "status": "SUCCESS",
+                "createTime": "2026-10-21T11:01:00Z",
+                "substitutions": {"_DRY_RUN": "true"},
+            }
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[], [real, dry]]
+            changing = rv.builds_since_rollback(
+                SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}, "build": {"id": "own"}}
+            )
+            self.assertEqual(len(changing), 1)
+            self.assertIn("other", changing[0])
+
+    def test_build_history_ignores_pre_gate_cancel_and_own_rollback(self) -> None:
+        """A cancelled build that never reached mutation and this rollback do not contaminate the window."""
+        pending = guard.Build.from_api(
+            {
+                "id": "before-gate",
+                "status": "CANCELLED",
+                "createTime": "2026-10-21T11:01:00Z",
+                "steps": [{"id": "release-record-begin", "status": "QUEUED"}],
+            }
+        )
+        own = guard.Build.from_api(
+            {
+                "id": "rb",
+                "status": "SUCCESS",
+                "createTime": "2026-10-21T10:58:00Z",
+                "substitutions": {"_DRY_RUN": "false"},
+            }
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[pending], [own]]
+            self.assertEqual(
+                rv.builds_since_rollback(
+                    SERVICE,
+                    {
+                        "times": {"deploy_finished": "2026-10-21T11:00:00Z"},
+                        "build": {"id": "rb"},
+                    },
+                ),
+                [],
+            )
+
+    def test_one_off_window_persists_signal_recovery(self) -> None:
+        """The manual checkpoint re-enables rollback before a recovered signal can fail again."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            key = "http_error_rate demo GET /b"
+            store.write(rv.ENVIRONMENTAL_OBJECT, {"signals": {key: {"status": "active"}}}, 0)
+            saved = {**record, "verdict": {"status": "passed"}}
+            result = {"result": "passed", "recovered_signals": [key]}
+            args = argparse.Namespace(
+                phase="window",
+                no_metrics=True,
+                wait_rollouts_seconds=0,
+                release_id=record["release_id"],
+                failed_marker="",
+                force_fail="",
+                final=False,
+            )
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "_now", return_value=datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC)),
+                mock.patch.object(rv, "evaluate", return_value=result),
+                mock.patch.object(rv, "apply_result", return_value=saved),
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rv, "slack_line", return_value="ok"),
+                mock.patch.object(rv, "prod_state", return_value=(None, None)),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+            ):
+                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_OK)
+            marks, _ = store.read(rv.ENVIRONMENTAL_OBJECT)
+            self.assertEqual(marks["signals"][key]["status"], "recovered")
+            failing = rv.judge(SERVICE.metrics[0], "demo GET /b", (0.001, 1000), (0.3, 1000))
+            rv.apply_environmental([failing], rv.environmental_signals(store))
+            self.assertEqual(failing.status, "exceeded")
 
     def test_rollback_that_helps(self) -> None:
         """After the rollback the target is back at the baseline: nothing is marked."""

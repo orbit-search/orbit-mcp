@@ -434,9 +434,13 @@ def finish_rollback(
     after: dict,
     checks: list,
     failures: list[str],
+    *,
+    cleanup_failures: list[str] | None = None,
 ) -> int:
     """Write the result on the rollback record; a complete rollback moves latest.json and holds prod deploys."""
     title = service.title
+    cleanup_failures = cleanup_failures or []
+    all_failures = failures + cleanup_failures
     status = "deploy_failed" if failures else "deployed"
 
     def finish(current: dict) -> None:
@@ -447,9 +451,14 @@ def finish_rollback(
             current["artifacts"] = dict(target["artifacts"])
         current["times"]["deploy_finished"] = rr.utc_now()
         current["checks"] = {
-            "rollback": {"at": rr.utc_now(), "checks": [asdict(check) for check in checks], "failures": failures}
+            "rollback": {
+                "at": rr.utc_now(),
+                "checks": [asdict(check) for check in checks],
+                "failures": all_failures,
+                "cleanup_failures": cleanup_failures,
+            }
         }
-        current["verdict"] = {"status": "failed" if failures else "passed", "at": rr.utc_now(), "phase": "rollback"}
+        current["verdict"] = {"status": "failed" if all_failures else "passed", "at": rr.utc_now(), "phase": "rollback"}
         if not failures:
             # Automatic prod deploys pause until the bad change is reverted or fixed (release_gate.py).
             current["promote_hold"] = rg.new_hold(service, current["release_id"], latest)
@@ -486,6 +495,12 @@ def finish_rollback(
         f":pause_button: {title} automatic prod deploys are on hold after rollback {saved['release_id']} "
         f"of {latest['release_id']}. To resume: {hold.get('resume')}."
     )
+    if cleanup_failures:
+        rr.post_slack(
+            f":x: {title} prod traffic restored and promotes held, but candidate cleanup failed: "
+            f"{cleanup_failures[0][:300]}. Repair the candidate tags; do not roll back again. Record {where}"
+        )
+        return 1
     print(f"Rollback complete: {where}")
     return 0
 

@@ -71,7 +71,7 @@ steps:
         python3 release/release_light.py begin --env dev --commit "$COMMIT_SHA" --build-id "$BUILD_ID" \
           --images-file /workspace/release_images.json \
           --release-id-file /workspace/release_id \
-          || { echo "WARNING: dev release record not written; dev verify cannot run" >&2; rm -f /workspace/release_id; }
+          || { echo "ERROR: dev release record not written; no verification or promotion" >&2; touch /workspace/release_record_failed /workspace/deploy_failed /workspace/release_verify_failed; echo "dev release record not written; no verification or promotion" >> /workspace/release_verify_unchecked; rm -f /workspace/release_id; }
 
   # The candidates: a new revision of each prod service with no traffic and the tag `candidate`.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -81,6 +81,7 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/release_record_failed ]; then exit 0; fi
         if [ -f /workspace/deploy_superseded ]; then exit 0; fi
         # Plan exact revision names before either deployment, including a partial failure.
         printf '{"orbit-mcp":"orbit-mcp-b%s","orbit-profile-mcp":"orbit-profile-mcp-b%s"}\n' "$BUILD_ID" "$BUILD_ID" > /workspace/candidate_revisions.json
@@ -104,7 +105,7 @@ steps:
         STATUS=deployed
         if [ -f /workspace/deploy_failed ]; then STATUS=deploy_failed; fi
         python3 release/release_light.py finish --env dev --release-id-file /workspace/release_id --status "$${STATUS}" \
-          || echo "WARNING: dev release record not finished" >&2
+          || { echo "ERROR: dev release record not finished; promotion stopped" >&2; touch /workspace/release_record_failed /workspace/release_verify_failed; }
 
   # Dev verify (release/release_light.py check --env dev): each candidate revision
   # is Ready, runs the digest this build pushed and still has the tag, and
@@ -118,6 +119,7 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/release_record_failed ]; then exit 0; fi
         if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ]; then exit 0; fi
         if [ ! -s /workspace/release_id ]; then
           touch /workspace/release_verify_failed
@@ -154,6 +156,7 @@ steps:
     args:
       - -c
       - |
+        if [ -f /workspace/release_record_failed ] && [ ! -s /workspace/candidate_revisions.json ]; then exit 0; fi
         if [ ! -f /workspace/deploy_failed ] && [ ! -f /workspace/release_verify_failed ]; then exit 0; fi
         python3 release/release_light.py cleanup-candidates --revisions-file /workspace/candidate_revisions.json \
           || { touch /workspace/candidate_cleanup_failed; exit 1; }
@@ -193,6 +196,14 @@ steps:
           curl -s -X POST -H 'Content-type: application/json' \
             --data '{"text":":x: orbit-mcp failed-candidate tag cleanup FAILED for `$SHORT_SHA`; the failed revision may still be public. Inspect cleanup-failed-candidates immediately."}' \
             "$$WEBHOOK_ORBIT"
+          exit 1
+        fi
+        if [ -f /workspace/release_record_failed ]; then
+          PHASE=begin
+          if [ -s /workspace/release_id ]; then PHASE=finish; fi
+          TEXT=":x: orbit-mcp dev release record phase $${PHASE} failed for commit $SHORT_SHA; verification and promotion stopped. Inspect release-record steps before retrying."
+          PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$${TEXT}")"
+          curl -s -X POST -H 'Content-type: application/json' --data "$${PAYLOAD}" "$$WEBHOOK_ORBIT" || true
           exit 1
         fi
         if [ -f /workspace/deploy_failed ]; then

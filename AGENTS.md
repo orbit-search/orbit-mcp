@@ -138,3 +138,33 @@ Your human does two things once, both in a browser. Your agent does the rest.
   `docs/RELEASE_PIPELINE.md` says.
 - **A human owns each change:** the person who started the agent.
 
+## The deploying agent owns post-deploy verification
+
+Merging a change that deploys creates a follow-up obligation. Keep the original
+chat responsible until the release's +15 and +60 minute checkpoints are terminal.
+After deployment, bind the PR, full commit, immutable image digest, release ID,
+GCS record and watch build to that chat. With the new release tooling, run
+`release_verify.py own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`
+(use this repository's script path and service flag). Set a native follow-up in
+the same chat for the actual due times; reuse an existing follow-up. Do not
+create a detached reminder that has lost the original goal or implementation context.
+
+At each checkpoint, read the current record and build status, inspect workload
+health and the configured metrics/logs, and confirm the live service behavior
+appropriate to the change. A green deploy build alone does not complete the task.
+If a checkpoint is missing, late, inconclusive or failed, investigate and repair
+the checker or service, preserving the immutable release identity. A rollback
+changes the work to verifying recovery and fixing the underlying cause; do not
+leave the original agent's task silently complete. Report only meaningful changes.
+
+Replica shortages, preemption and HPA expansion are observations, not proof that
+a PR caused a regression. Read fresh workload evidence after slow metric queries;
+allow bounded recovery and keep uncertainty explicit. Do not revert a docs-only
+PR because it happened to be the last merge. Require runtime/deploy or trace
+evidence before naming a suspect, and verify whether rollback actually helped.
+
+Release unit tests must use injected process runners, null cluster credentials
+and an isolated cloud config. Shell helpers are production operations too: never
+let a fake cluster test launch an unmocked kubectl, gcloud or WAL sync helper.
+
+For Cloud Run/Composer use `release/release_light.py --service <service> own` for that ownership command.

@@ -596,6 +596,12 @@ def entry_text(entry: dict) -> str:
     metadata = payload.get("metadata")
     args = metadata.get("consoleArgs") if isinstance(metadata, dict) else None
     parts = [arg for arg in args if isinstance(arg, str) and arg.strip()] if isinstance(args, list) else []
+    # A console prefix that cannot identify a site (for example "Error:") must
+    # not hide the searchable message on a later line.
+    if parts:
+        pattern = log_pattern(parts[0])
+        if not pattern or not site_fragment(pattern):
+            parts.insert(0, message)
     parts.append(message)
     if not any(part.strip() for part in parts):
         return ""  # Stack and request fields are context, never an unsearchable site of their own.

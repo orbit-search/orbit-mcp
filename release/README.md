@@ -190,3 +190,25 @@ flight, on the release branch, the dev build passed, the artifacts as they are
 now), `release_gate.py check-prod --artifacts-file`, `still-current`, `begin`,
 `apply`, `finish`, `check`, `schedule-window`. `release_kit.py render` writes
 the window build and the rollback build (`<service>-rollback`).
+
+### Fresh availability evidence and deploying-agent ownership
+
+Window checks refresh workload state after metric/log queries. Replica-count
+shortfalls alone are retried for up to three minutes; persistent uncertainty is
+recorded as inconclusive and unchecked, alerts at +15, continues to +60, and ends
+red without automatically reverting an unproven code cause. Independent metric
+or traced-error regressions can still roll back. Every sample records its time,
+digests, desired/available replicas and pod creation/scheduling conditions.
+
+`release_verify.py own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`
+records the agent's acknowledgement in `followup.owner`. Use the script's local
+path and service flag. `followup.checkpoints` carries stable release/checkpoint
+IDs, due times, attempt counts, running/error/completion receipts and observed
+results. These receipts support recovery and auditing; they do not themselves
+wake an agent. The deploying agent must set a native follow-up in its original
+chat, read +15/+60 results and retain ownership through recovery or escalation.
+The existing watch build performs server-side checks even while that agent is
+asleep. No generic automatic cross-provider chat delivery is claimed.
+
+Cloud Run/Composer use the same ownership fields through
+`python3 release/release_light.py --service <service> own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`.

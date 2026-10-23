@@ -1,19 +1,21 @@
 {
   "_doc": "Pinned copy of orbit-infrastructure/release-kit/release. Do not edit these files here; change the kit there and run release-kit/sync.py.",
   "files": {
-    "README.md": "1f90acbd8e00279dd69ddc675d2c765b6f5f4de6f351f8c788d4312f2486db4d",
+    "README.md": "a9f52f4f32df8ec24181614d3ef5eea19224dc5560f8a99d40ad6a20075718b1",
     "promote_release_guard.py": "dd9114229cfbeaaa9ee422044303840c5b37874a7ddd0ae0e505c511364189cd",
     "release_config.py": "5eb38db11c96c163ebcd33bb91a7134bdd80a603a5987e6f380e753762e1f7d1",
     "release_gate.py": "8e1350f0ea20740eb5f60754b2f9b9759951391cbe0893b1d385b2e6cfb26206",
-    "release_kit.py": "e98f3e5358e729c5938eec0a3f73949267f03ff7c1e930d5885f83a5bbd3ed1a",
-    "release_light.py": "bb31c59121e81e2823f5e51288484e0def2096972f1a5cb72b3b52c769182a04",
+    "release_kit.py": "984d86623953ba04155f98ca0cfb68f6001342339f809c1db684d4d01a655561",
+    "release_light.py": "22c636877ee7509adda802e212247a94974fa77e0503bb09356219c031994e3a",
+    "release_observation.py": "6c4c3e85be2f034f9ed9b91d1cc4b367976902d2383691126a7c3a627f197f70",
     "release_people.json": "c9c693e85419c29a52c05e7a6611ac12f13efe5b5a0f119a5d65a9ce0c1bd855",
-    "release_record.py": "8e386a8ae3853f8a5abc4e16f8a47535eeeefde21a0a6b295a638550bd855af5",
-    "release_rollback.py": "5e46b4f6ae8fb19d0c069be6312b550e0e512e641d590e370c4f90176bb11d6f",
-    "release_signals.py": "d582e5f5ca6f5bdde98ab5e4b47ac610f0f6f44024ce672c22bac5afa5139099",
-    "release_verify.py": "bebb6beb9452d126060780ee1160608635b537f5ec9efdb277725e5adc7863d2",
-    "test_release_kit.py": "6402ebf090d5900ad00990d6ab902b98c4aeb7bf97bada854f94765d666febf4"
+    "release_record.py": "b92ca06b35d6c03245056835523dc11647c952faa972f654b4ffa3a5719543a2",
+    "release_rollback.py": "d2f338e7a49fb89336f758f6d175a2d0df86e8ea47a9e55885b0ef5f5c000174",
+    "release_signals.py": "7ef374dc5e208c3898c4e2da47a6f7f8cf9da6600a4df3b0a3706d3ce79c3f77",
+    "release_verify.py": "010d7c726673840393f3af0e711a9a1a2eba6ddef85164e209cbb797440609b2",
+    "test_release_kit.py": "1dda28fd61187511cce184a35bcff056d32562fc8aecc72c0190e16c84e93721",
+    "test_release_observation.py": "51b7ef8dfa8e543793715af91df8af50c8babb322fb2a50c5d11ff1b55e52c5c"
   },
   "source": "orbit-search/orbit-infrastructure release-kit/release",
-  "version": "kit-606e8d7c7909"
+  "version": "kit-0bb60dffc3f9"
 }

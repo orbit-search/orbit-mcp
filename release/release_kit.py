@@ -31,6 +31,8 @@ import release_config as rc  # noqa: E402
 KIT_DIR = Path(__file__).resolve().parent
 MANIFEST = KIT_DIR / "KIT.json"
 KIT_FILES = (
+    "release_observation.py",
+    "test_release_observation.py",
     "README.md",
     "promote_release_guard.py",
     "release_config.py",
