@@ -43,7 +43,6 @@ def ready(**changes):
         default_branch="main",
         head=HEAD,
         created_at="2026-10-23T02:00:00Z",
-        head_pushed_at="2026-10-23T02:00:00Z",
         labels=["agent"],
         reviews=[],
         unresolved_threads=0,
@@ -150,26 +149,16 @@ class DecideTest(unittest.TestCase):
         for state in ("BLOCKED", "DIRTY", "UNKNOWN", "DRAFT"):
             self.assertWaits(ready(merge_state=state), state)
 
-    def test_old_pr_without_new_push_waits(self):
-        pr = ready(created_at="2026-03-01T00:00:00Z", head_pushed_at="2026-03-02T00:00:00Z")
-        self.assertWaits(pr, "before")
+    def test_old_pr_waits_even_after_a_new_push(self):
+        self.assertWaits(ready(created_at="2026-10-01T00:00:00Z"), "its author merges it")
 
-    def test_old_commit_pushed_after_cutoff_merges(self):
-        # read_pull takes the push time from the head's first check run, not the commit date.
-        github = FakeGitHub(
-            node(
-                createdAt="2026-03-01T00:00:00Z",
-                commits={"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-03-02T00:00:00Z"}}]},
-                reviewThreads={"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
-            )
-        )
-        pr = bot.read_pull(github, "orbit-search/x", 7)
-        self.assertEqual(pr.head_pushed_at, "2026-10-23T01:00:00Z")
-        self.assertTrue(bot.decide(pr).merge)
+    def test_cancelled_rerun_keeps_the_older_failure(self):
+        runs = [run("test", "failure", run_id=20), run("test", "cancelled", run_id=21), GREPTILE_RUN]
+        self.assertWaits(ready(check_runs=runs, merge_state="UNSTABLE"), "test is failure")
 
-    def test_old_pr_with_new_push_merges(self):
-        pr = ready(created_at="2026-03-01T00:00:00Z", head_pushed_at="2026-10-23T05:00:00Z")
-        self.assertTrue(bot.decide(pr).merge)
+    def test_cancelled_rerun_keeps_the_older_success(self):
+        runs = [run("test", run_id=20), run("test", "cancelled", run_id=21), GREPTILE_RUN]
+        self.assertTrue(bot.decide(ready(check_runs=runs, merge_state="UNSTABLE")).merge)
 
 
 class FakeGitHub:
@@ -213,7 +202,6 @@ def node(**changes):
         "createdAt": "2026-10-23T02:00:00Z",
         "labels": {"nodes": []},
         "reviews": {"nodes": []},
-        "commits": {"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-23T02:00:00Z"}}]},
         "reviewThreads": {
             "nodes": [{"isResolved": True}, {"isResolved": False}],
             "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -228,7 +216,6 @@ class GitHubFlowTest(unittest.TestCase):
         pr = bot.read_pull(FakeGitHub(node()), "orbit-search/x", 7)
         self.assertEqual(pr.unresolved_threads, 1)
         self.assertEqual(pr.default_branch, "main")
-        self.assertEqual(pr.head_pushed_at, "2026-10-23T01:00:00Z")
 
     def test_merge_squashes_at_the_checked_head(self):
         github = FakeGitHub(node())

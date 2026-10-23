@@ -21,8 +21,8 @@ It squash-merges a PR, at exactly the head commit it checked, when:
     the checks above found nothing pending or failing, because a cancelled run
     alone makes GitHub report UNSTABLE).
 A PR that is BEHIND waits: the bot never authors commits, so the human's login
-updates the branch. PRs opened before the bot existed, with no push since,
-are left to their authors.
+updates the branch. PRs opened before the bot existed are left to their
+authors.
 
 Stdlib only. It never runs code from the pull request.
 """
@@ -46,7 +46,7 @@ HOLD_LABEL = "hold"
 GREPTILE_CHECK = "Greptile Review"
 GREPTILE_APP = "greptile-apps"
 GREPTILE_LOGINS = {"greptile-apps", "greptile-apps[bot]"}
-# PRs opened before the bot shipped merge only after a new push.
+# PRs opened before the bot shipped stay with their authors.
 ELIGIBLE_SINCE = "2026-10-23T00:00:00Z"
 PASSED = {"success", "neutral", "skipped"}
 NO_RESULT = {"cancelled", "stale"}
@@ -60,7 +60,6 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
       number state isDraft mergeStateStatus baseRefName headRefOid createdAt
       labels(first: 100) { nodes { name } }
       reviews(last: 100) { nodes { author { login } commit { oid } state } }
-      commits(last: 1) { nodes { commit { oid committedDate } } }
       reviewThreads(first: 100, after: $cursor) {
         nodes { isResolved }
         pageInfo { hasNextPage endCursor }
@@ -83,8 +82,6 @@ class PullState:
     default_branch: str
     head: str
     created_at: str
-    # When the head reached GitHub: its first check run (a commit date can be older than the push).
-    head_pushed_at: str
     labels: list[str] = field(default_factory=list)
     reviews: list[dict] = field(default_factory=list)
     unresolved_threads: int = 0
@@ -100,23 +97,22 @@ class Decision:
     reason: str
 
 
-def latest_check_runs(check_runs: list[dict]) -> dict[tuple[str, str], dict]:
-    """The newest run of each (app, name) pair; a re-run replaces the older result.
-
-    Newest = the highest id (creation order): a queued re-run has no start time yet."""
-    latest: dict[tuple[str, str], dict] = {}
-    for run in check_runs:
+def deciding_check_runs(check_runs: list[dict]) -> dict[tuple[str, str], dict]:
+    """The run that decides each (app, name) pair: the newest one (highest id, creation order;
+    a queued re-run has no start time yet), but a cancelled or stale run never hides an older result."""
+    deciding: dict[tuple[str, str], dict] = {}
+    for run in sorted(check_runs, key=lambda item: item.get("id") or 0, reverse=True):
         key = (((run.get("app") or {}).get("slug") or ""), run.get("name") or "")
-        current = latest.get(key)
-        if current is None or (run.get("id") or 0) > (current.get("id") or 0):
-            latest[key] = run
-    return latest
+        current = deciding.get(key)
+        if current is None or (current.get("status") == "completed" and current.get("conclusion") in NO_RESULT):
+            deciding[key] = run
+    return deciding
 
 
 def check_problems(check_runs: list[dict], statuses: list[dict]) -> list[str]:
     """Checks and statuses on the head that are pending or did not pass."""
     problems = []
-    for (_, name), run in sorted(latest_check_runs(check_runs).items()):
+    for (_, name), run in sorted(deciding_check_runs(check_runs).items()):
         if name == OWN_CHECK:
             continue
         if run.get("status") != "completed":
@@ -131,7 +127,7 @@ def check_problems(check_runs: list[dict], statuses: list[dict]) -> list[str]:
 
 def greptile_reviewed(pr: PullState) -> bool:
     """True when Greptile finished a review of the head commit (a cancelled or stale check is no review)."""
-    run = latest_check_runs(pr.check_runs).get((GREPTILE_APP, GREPTILE_CHECK))
+    run = deciding_check_runs(pr.check_runs).get((GREPTILE_APP, GREPTILE_CHECK))
     if run and run.get("status") == "completed" and run.get("conclusion") not in NO_RESULT:
         return True
     return any(
@@ -151,8 +147,8 @@ def decide(pr: PullState) -> Decision:
         return Decision(False, "draft")
     if any(label.lower() == HOLD_LABEL for label in pr.labels):
         return Decision(False, f"has the {HOLD_LABEL} label")
-    if max(pr.created_at, pr.head_pushed_at) < ELIGIBLE_SINCE:
-        return Decision(False, f"opened and last pushed before {ELIGIBLE_SINCE}")
+    if pr.created_at < ELIGIBLE_SINCE:
+        return Decision(False, f"opened before {ELIGIBLE_SINCE}; its author merges it")
     policy = [status for status in pr.statuses if status.get("context") == POLICY_CONTEXT]
     if not policy or policy[0].get("state") != "success":
         state = policy[0].get("state") if policy else "missing"
@@ -250,8 +246,6 @@ def read_pull(github: GitHub, repo: str, number: int) -> PullState | None:
             break
         time.sleep(3)
     head = node["headRefOid"]
-    last = (node["commits"]["nodes"] or [{}])[0].get("commit") or {}
-    committed = (last.get("committedDate") or "") if last.get("oid") == head else ""
     statuses = github.paginate(f"/repos/{repo}/commits/{head}/status", key="statuses")
     check_runs = github.paginate(f"/repos/{repo}/commits/{head}/check-runs?filter=all", key="check_runs")
     return PullState(
@@ -263,7 +257,6 @@ def read_pull(github: GitHub, repo: str, number: int) -> PullState | None:
         default_branch=data["repository"]["defaultBranchRef"]["name"],
         head=head,
         created_at=node["createdAt"],
-        head_pushed_at=min((run["started_at"] for run in check_runs if run.get("started_at")), default=committed),
         labels=[label["name"] for label in node["labels"]["nodes"]],
         reviews=node["reviews"]["nodes"],
         unresolved_threads=threads,
