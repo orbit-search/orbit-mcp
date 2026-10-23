@@ -580,23 +580,48 @@ MESSAGE_FIELDS = ("message", "msg", "error", "err")
 
 
 def entry_text(entry: dict) -> str:
-    """The message of a log entry: the text, or the message field of a JSON line."""
+    """Keep a console prefix before the message, with structured error context after it."""
     if entry.get("textPayload"):
         return str(entry["textPayload"])
     payload = entry.get("jsonPayload") or {}
+    message = ""
     for key in MESSAGE_FIELDS:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            return value
+            message = value
+            break
         if isinstance(value, dict) and isinstance(value.get("message"), str):
-            return value["message"]
-    return ""
+            message = value["message"]
+            break
+    metadata = payload.get("metadata")
+    args = metadata.get("consoleArgs") if isinstance(metadata, dict) else None
+    parts = [arg for arg in args if isinstance(arg, str) and arg.strip()] if isinstance(args, list) else []
+    # A console prefix that cannot identify a site (for example "Error:") must
+    # not hide the searchable message on a later line.
+    if parts:
+        pattern = log_pattern(parts[0])
+        if not pattern or not site_fragment(pattern):
+            parts.insert(0, message)
+    parts.append(message)
+    if not any(part.strip() for part in parts):
+        return ""  # Stack and request fields are context, never an unsearchable site of their own.
+    for key in ("error", "err"):
+        error = payload.get(key)
+        if isinstance(error, dict) and isinstance(error.get("stack"), str):
+            parts.append(error["stack"])
+    request = payload.get("request")
+    if isinstance(request, dict):
+        route = " ".join(request[key] for key in ("method", "path") if isinstance(request.get(key), str))
+        if route:
+            parts.append(route)
+    return "\n".join(dict.fromkeys(part for part in parts if part.strip()))
 
 
 def message_match(text: str) -> str:
     """A Cloud Logging filter that finds `text` in any field entry_text() reads."""
     fields = ["textPayload"] + [f"jsonPayload.{key}" for key in MESSAGE_FIELDS]
     fields += [f"jsonPayload.{key}.message" for key in MESSAGE_FIELDS]
+    fields.append("jsonPayload.metadata.consoleArgs")
     return "(" + " OR ".join(f'{field}:"{text}"' for field in fields) + ")"
 
 

@@ -4,9 +4,11 @@ Instructions for every agent (Codex, Claude, others) working in `orbit-mcp`. `CL
 
 ## Deploys and the release check
 
-- A merge to `main` deploys both Cloud Run services (`cloudbuild.yaml`, trigger `orbit-mcp-deploy`) by
-  digest, behind single flight, with a release record, a deploy check and a watch window
-  (`docs/RELEASE_PIPELINE.md`). Agents never run the deploy trigger to ship; to ship, merge.
+- A merge to `main` deploys a candidate revision of both Cloud Run services with no traffic
+  (`cloudbuild.dev.yaml`, trigger `orbit-mcp-deploy-dev`), runs dev verify on the candidate tag URLs, and
+  then the prod build (`cloudbuild.prod.yaml`, trigger `orbit-mcp-prod`) moves the traffic to exactly
+  those revisions. A failed release rolls back on its own and prod promotes hold (`docs/RELEASE_PIPELINE.md`).
+  Agents never run the deploy triggers to ship; to ship, merge.
 - `release/` is a pinned copy of `orbit-infrastructure/release-kit`; change it there and sync. This repo
   owns only `release/services/orbit-mcp.json`.
 
@@ -101,9 +103,8 @@ Your human does two things once, both in a browser. Your agent does the rest.
   format that the `agent-policy` check prints. A later commit that only fixes
   CI or a review finding keeps the approval with a carry record.
 - **Merge** when CI is green, every review thread is resolved and
-  `agent-policy` passes. Rollbacks are started by a human: a release that
-  fails its release check posts an alert with the rollback command
-  (`docs/RELEASE_PIPELINE.md`).
+  `agent-policy` passes. A release that fails its release check rolls back on
+  its own; a human can also roll back (`docs/RELEASE_PIPELINE.md`).
 - **When to ask your human.** Finish on your own when you can verify the goal
   yourself: bug fixes, backend features, optimizations, infra and CI changes
   get a goal you can check (tests, a replay, a metric), and they merge when
@@ -137,3 +138,33 @@ Your human does two things once, both in a browser. Your agent does the rest.
   `docs/RELEASE_PIPELINE.md` says.
 - **A human owns each change:** the person who started the agent.
 
+## The deploying agent owns post-deploy verification
+
+Merging a change that deploys creates a follow-up obligation. Keep the original
+chat responsible until the release's +15 and +60 minute checkpoints are terminal.
+After deployment, bind the PR, full commit, immutable image digest, release ID,
+GCS record and watch build to that chat. With the new release tooling, run
+`release_verify.py own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`
+(use this repository's script path and service flag). Set a native follow-up in
+the same chat for the actual due times; reuse an existing follow-up. Do not
+create a detached reminder that has lost the original goal or implementation context.
+
+At each checkpoint, read the current record and build status, inspect workload
+health and the configured metrics/logs, and confirm the live service behavior
+appropriate to the change. A green deploy build alone does not complete the task.
+If a checkpoint is missing, late, inconclusive or failed, investigate and repair
+the checker or service, preserving the immutable release identity. A rollback
+changes the work to verifying recovery and fixing the underlying cause; do not
+leave the original agent's task silently complete. Report only meaningful changes.
+
+Replica shortages, preemption and HPA expansion are observations, not proof that
+a PR caused a regression. Read fresh workload evidence after slow metric queries;
+allow bounded recovery and keep uncertainty explicit. Do not revert a docs-only
+PR because it happened to be the last merge. Require runtime/deploy or trace
+evidence before naming a suspect, and verify whether rollback actually helped.
+
+Release unit tests must use injected process runners, null cluster credentials
+and an isolated cloud config. Shell helpers are production operations too: never
+let a fake cluster test launch an unmocked kubectl, gcloud or WAL sync helper.
+
+For Cloud Run/Composer use `release/release_light.py --service <service> own` for that ownership command.

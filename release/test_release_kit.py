@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +31,12 @@ import release_record as rr  # noqa: E402
 import release_rollback as rb  # noqa: E402
 import release_signals as rs  # noqa: E402
 import release_verify as rv  # noqa: E402
+
+
+def setUpModule():
+    """Keep suite polling deterministic; explicit retry tests inject their own clock."""
+    rv.ro.MAX_SAMPLES = 1
+
 
 REPO = "us-central1-docker.pkg.dev/orbit-search/demo/demo"
 NEW = "sha256:" + "1" * 64
@@ -194,6 +201,7 @@ def _record(**overrides) -> dict:
         "schema_version": 1,
         "service": "demo",
         "environment": "prod",
+        "followup": {"owner": {"thread_url": "codex://threads/test-owner", "pr_url": "https://github.com/o/r/pull/1"}},
         "release_id": "20261021T100000Z-aaaaaaaaa",
         "kind": "promote",
         "commit": COMMIT,
@@ -292,6 +300,25 @@ def _build(build_id: str, created: str, status: str = "SUCCESS", **extra) -> gua
         finish_time=extra.get("finish", created),
         auto_promote=extra.get("auto_promote", True),
     )
+
+
+class FirstDeployTest(unittest.TestCase):
+    def test_missing_deployment_before_the_first_deploy(self) -> None:
+        """Before the first deploy of an environment its Deployments do not exist: the snapshot leaves them out."""
+        cluster = FakeCluster()
+
+        def runner(command: list[str]) -> str:
+            """A cluster where prod-demo-worker does not exist yet."""
+            if "prod-demo-worker" in command and "deployment" in command:
+                raise rr.RecordError(
+                    'kubectl get deployment exited 1: Error from server (NotFound): "prod-demo-worker"'
+                )
+            return cluster(command)
+
+        clients = rr.Clients(env=PROD, runner=runner)
+        self.assertEqual(sorted(rr.snapshot_workloads(clients, missing_ok=True)), ["deployment/prod-demo"])
+        with self.assertRaises(rr.RecordError):
+            rr.snapshot_workloads(clients)
 
 
 class GuardTest(unittest.TestCase):
@@ -523,6 +550,18 @@ class RollbackTest(unittest.TestCase):
 
 
 class LockTest(unittest.TestCase):
+    def test_unlock_cli_is_idempotent_and_preserves_other_builds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            with mock.patch.object(rr, "open_from_args", return_value=(SERVICE, SERVICE.prod, store, mock.Mock())):
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "own"]), 0)
+                rr.acquire_lock(store, "other", "deploy", lambda _: True, wait_seconds=1)
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "own"]), 0)
+                self.assertEqual(store.read(rr.LOCK_OBJECT)[0]["holder"], "other")
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "other"]), 0)
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "other"]), 0)
+                self.assertFalse(store.read(rr.LOCK_OBJECT)[0]["holder"])
+
     """One build at a time changes prod: deploys from the gate to `finish`, rollbacks during apply."""
 
     def test_acquire_wait_take_over_release(self) -> None:
@@ -793,6 +832,259 @@ class VerdictTest(unittest.TestCase):
         result.update(overrides)
         return result
 
+    def test_availability_uncertainty_cannot_pass_with_healthy_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            result = self._result(availability={"status": "unconfirmed"}, result="inconclusive")
+            saved = rv.apply_result(SERVICE, store, record, result, final=True, token=None)
+            self.assertEqual(saved["verdict"]["status"], "inconclusive")
+            self.assertTrue(saved["verdict"]["unchecked"])
+            self.assertFalse(saved.get("rollback_suggestion"))
+            self.assertEqual(rv.final_verdict(SERVICE, result)[0], "inconclusive")
+            # An independent error still fails, even while the cluster's capacity is uncertain.
+            result.update(result="failed", regressions=[{"kind": "metric", "text": "error rate regressed"}])
+            saved = rv.apply_result(SERVICE, store, saved, result, final=True, token=None)
+            self.assertEqual(saved["verdict"]["status"], "failed")
+
+    def test_late_checkpoint_keeps_the_scheduled_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            result = self._result(candidate_minutes=18, checkpoint_minutes=15)
+            saved = rv.apply_result(SERVICE, store, record, result, final=False, token=None)
+            self.assertIn("window_15m", saved["checks"])
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "completed")
+            self.assertNotIn("window_18m", saved["checks"])
+
+    def _run_owned_watch(
+        self,
+        store,
+        record,
+        *,
+        result=None,
+        error=None,
+        history=None,
+        dd=None,
+        checkpoints="15,60",
+    ):
+        args = argparse.Namespace(
+            release_id=record["release_id"],
+            checkpoints=checkpoints,
+            extend_minutes=15,
+            max_window_minutes=180,
+            retry_completed=False,
+        )
+        with (
+            mock.patch.object(rv, "_datadog", return_value=(dd, None)),
+            mock.patch.object(rv, "_token", return_value=None),
+            mock.patch.object(rv, "wait_until_settled", return_value=None),
+            mock.patch.object(rv, "prod_state", return_value=(None, None)),
+            mock.patch.object(rv, "builds_since_rollback", return_value=history or []),
+            mock.patch.object(rv, "evaluate", side_effect=error, return_value=result or self._result()) as evaluate,
+            mock.patch.object(rv, "print_result"),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ):
+            outcome = rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock())
+            return outcome, evaluate.call_count
+
+    def test_missing_owner_runs_health_but_final_followup_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual(count, 2)
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            self.assertEqual(saved["followup"]["state"], "owner_missing")
+
+    def test_resumed_watch_preserves_completed_15m_and_only_checks_60m(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            rv.ro.merge_plan(record, [15, 60])
+            rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_15m")
+            record["checks"]["window_15m"] = {"at": "original", "result": "passed"}
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["checks"]["window_15m"]["at"], "original")
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["completed_at"], "original")
+            self.assertIn("window_60m", saved["checks"])
+
+    def test_final_checker_exception_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record, error=rr.RecordError("cluster unavailable"))
+            self.assertEqual((outcome, count), (rv.EXIT_FAILED, 2))
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "inconclusive")
+
+    def test_terminal_mutation_during_observation_never_rolls_back_the_old_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with mock.patch.object(rv, "on_failure") as rollback:
+                outcome, _ = self._run_owned_watch(store, record, history=["CANCELLED build that mutated prod"])
+                rollback.assert_not_called()
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "inconclusive")
+            self.assertIn("CANCELLED", saved["verdict"]["reason"])
+
+    def test_final_checker_and_receipt_outage_is_still_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with mock.patch.object(rv, "_record_checkpoint_error"):
+                outcome, _ = self._run_owned_watch(store, record, error=rr.RecordError("GCS unavailable"))
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "pending")
+
+    def test_failed_deploy_rolls_back_even_without_an_owner_but_returns_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"}, followup={})
+            _save(store, record)
+            with mock.patch.object(rv, "on_failure") as rollback:
+                outcome, count = self._run_owned_watch(store, record)
+                rollback.assert_called_once()
+            self.assertEqual((outcome, count), (rv.EXIT_FAILED, 0))
+            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["state"], "owner_missing")
+
+    def test_manual_final_health_pass_without_owner_is_red(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            args = argparse.Namespace(
+                release_id=record["release_id"],
+                phase="window",
+                no_metrics=True,
+                now=None,
+                wait_rollouts_seconds=0,
+                force_fail="",
+                final=True,
+                failed_marker="",
+            )
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "prod_state", return_value=(None, None)),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rv, "evaluate", return_value=self._result()),
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_FAILED)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            self.assertEqual(saved["followup"]["state"], "owner_missing")
+
+    def test_missing_owner_receipt_outage_cannot_grant_ownership(self):
+        with (
+            mock.patch.object(rr, "update_record", side_effect=rr.RecordError("GCS down")),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ):
+            self.assertFalse(rv.require_owner(mock.Mock(), _record(followup={})))
+
+    def test_reverse_resume_cannot_erase_a_completed_60m_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "passed", "phase": "window_60m"})
+            rv.ro.merge_plan(record, [15, 60])
+            rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_60m")
+            _save(store, record)
+            outcome, count = self._run_owned_watch(store, record)
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"], {"status": "passed", "phase": "window_60m"})
+            self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["completed_at"], "original")
+
+    def test_adaptive_checkpoint_survives_process_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_owned_watch(
+                    store,
+                    record,
+                    checkpoints="60",
+                    dd=object(),
+                    error=[
+                        self._result(judged=0),
+                        KeyboardInterrupt("simulated process stop"),
+                    ],
+                )
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "pending")
+            self.assertEqual(saved["followup"]["extensions_minutes"], [75])
+            self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+            outcome, count = self._run_owned_watch(store, saved, checkpoints="60")
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 1))
+            final = rr.read_record(store, record["release_id"])
+            self.assertEqual(
+                (final["verdict"]["status"], final["verdict"]["phase"]),
+                ("passed", "window_75m"),
+            )
+
+    def test_completed_manual_attempt_still_requires_a_final_decision(self):
+        for judged, expected in [(0, rv.EXIT_FAILED), (500, rv.EXIT_OK)]:
+            with self.subTest(judged=judged), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                record["checks"]["window_60m"] = self._result(judged=judged)
+                rv.ro.note_checkpoint(record, {"at": "manual", "result": "passed"}, "window_60m")
+                _save(store, record)
+                outcome, count = self._run_owned_watch(
+                    store, record, checkpoints="60", result=self._result(judged=judged)
+                )
+                self.assertEqual((outcome, count), (expected, 1))
+                saved = rr.read_record(store, record["release_id"])
+                self.assertNotEqual(saved["verdict"]["status"], "pending")
+                prior = saved["followup"]["checkpoints"]["window_60m"]["attempt_history"][0]
+                self.assertEqual(prior["completed_at"], "manual")
+                self.assertEqual(prior["check"]["judged"], judged)
+
+    def test_historical_manual_check_never_writes_current_recovery_or_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(
+                release_id=record["release_id"],
+                phase="window",
+                no_metrics=True,
+                now="2026-10-21T10:20:00Z",
+                wait_rollouts_seconds=0,
+                force_fail="",
+                final=True,
+                failed_marker="",
+            )
+            result = self._result(recovered_signals=["active-today"])
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "evaluate", return_value=result) as evaluate,
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rr, "update_record") as update,
+                mock.patch.object(rv, "note_recovered") as recovery,
+            ):
+                self.assertEqual(
+                    rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()),
+                    rv.EXIT_OK,
+                )
+            update.assert_not_called()
+            recovery.assert_not_called()
+            self.assertIsNone(evaluate.call_args.kwargs["observation_state"])
+
     def test_final(self) -> None:
         """Final."""
         self.assertEqual(rv.final_verdict(SERVICE, self._result())[0], "passed")
@@ -968,6 +1260,61 @@ class LogTest(unittest.TestCase):
         """Entry text."""
         self.assertEqual(rs.entry_text({"jsonPayload": {"msg": "x failed"}}), "x failed")
         self.assertEqual(rs.entry_text({"jsonPayload": {"error": {"message": "y"}}}), "y")
+
+    def test_structured_console_error_keeps_its_source(self) -> None:
+        """A dynamic database error retains the literal prefix used to find its handler."""
+        text = rs.entry_text(
+            {
+                "jsonPayload": {
+                    "message": "connection refused",
+                    "metadata": {"consoleArgs": ["[users] GET Error:", {"message": "connection refused"}]},
+                    "error": {
+                        "message": "connection refused",
+                        "stack": "Error: connection refused\n    at GET (src/users.ts:3:1)",
+                    },
+                    "request": {"method": "GET", "path": "/api/users"},
+                }
+            }
+        )
+        self.assertEqual(text.splitlines()[0], "[users] GET Error:")
+        self.assertIn("connection refused", text)
+        self.assertIn("at GET (src/users.ts:3:1)", text)
+        self.assertIn("GET /api/users", text)
+        site = rs.site_fragment(rs.log_pattern(text, "ERROR", "app"))
+        fragment = site.split(":", 2)[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / "src/users.ts").write_text(
+                'export async function GET() {\n  console.error("[users] GET Error:", error);\n}\n'
+            )
+            problem = rs.Problem(kind="log", key="log:x", text="error", literals=[fragment])
+            self.assertEqual(
+                [function.name for function in rs.origins(problem, rs.SourceTree(root, SERVICE.code))], ["GET"]
+            )
+        self.assertIn(f'jsonPayload.metadata.consoleArgs:"{fragment}"', rs.message_match(fragment))
+
+    def test_short_console_prefix_does_not_hide_the_message(self) -> None:
+        """A generic Error: prefix cannot suppress a searchable structured message."""
+        text = rs.entry_text(
+            {
+                "jsonPayload": {
+                    "message": "database connection failed",
+                    "metadata": {"consoleArgs": ["Error:", {"message": "database connection failed"}]},
+                }
+            }
+        )
+        self.assertEqual(text.splitlines()[0], "database connection failed")
+        sites = rs.count_sites(rs.count_patterns([("2026-10-21", "pod", "app", "ERROR", text)]))
+        self.assertTrue(any("database connection failed" in site for site in sites))
+
+    def test_unrelated_metadata_does_not_replace_the_message(self) -> None:
+        """Malformed or non-console metadata keeps the existing message reader."""
+        for metadata in (None, "other", {"consoleArgs": {}}, {"consoleArgs": [None, {}]}):
+            self.assertEqual(rs.entry_text({"jsonPayload": {"message": "original", "metadata": metadata}}), "original")
+        self.assertEqual(
+            rs.entry_text({"jsonPayload": {"error": {"stack": "Error: x"}, "request": {"path": "/x"}}}), ""
+        )
 
     def test_count_sites(self) -> None:
         """Count sites."""
@@ -1383,6 +1730,57 @@ class ReviewFixTest(unittest.TestCase):
             self.assertEqual(saved["auto_rollback"]["status"], "failed")
             self.assertFalse(rv.claim_blocks(saved, "other", datetime(2026, 10, 21, 11, tzinfo=rr.UTC)))
             self.assertIn("Roll back by hand", slack.call_args[0][0])
+
+    def test_red_cleanup_build_does_not_recommend_a_second_rollback(self) -> None:
+        """A restored, held rollback can end red for cleanup without reversing to the failed release."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+        ):
+            store = _store(tmp)
+            record = _record(auto_rollback={"status": "started", "claim": "c1", "build_id": "rb1"})
+            _save(store, record)
+            rollback = _record(
+                release_id="20261021T110000Z-bbbbbbbbb",
+                kind="rollback",
+                status="deploying",
+                build={"id": "rb1"},
+                rollback={"rolled_back_release": record["release_id"]},
+            )
+            _save(store, rollback, latest=False)
+            code = rb.finish_rollback(
+                SERVICE,
+                store,
+                argparse.Namespace(requested_by="test", reason="restore prod"),
+                rollback,
+                record,
+                {"commit": PREVIOUS},
+                {},
+                [],
+                [],
+                cleanup_failures=["failed candidate tag remains"],
+            )
+            self.assertEqual(code, 1)
+            written = rr.read_record(store, rollback["release_id"])
+            self.assertEqual(written["status"], "deployed")
+            self.assertEqual(written["promote_hold"]["status"], "held")
+            self.assertEqual(
+                written["checks"]["rollback"]["cleanup_failures"],
+                ["failed candidate tag remains"],
+            )
+            status = rv.follow_rollback(
+                SERVICE,
+                store,
+                record["release_id"],
+                "rb1",
+                "c1",
+                sleep=lambda _: None,
+                get_build=lambda _: mock.Mock(status="FAILURE"),
+            )
+            self.assertEqual(status, "FAILURE")
+            self.assertEqual(rr.read_record(store, record["release_id"])["auto_rollback"]["status"], "started")
+            self.assertIn("do not roll back again", slack.call_args.args[0])
+            self.assertNotIn("Roll back by hand", slack.call_args.args[0])
 
     def test_single_pod_spread(self) -> None:
         """Single pod spread."""
@@ -1942,6 +2340,139 @@ class PublicRetryTest(unittest.TestCase):
 
 
 class LightTest(unittest.TestCase):
+    def setUp(self):
+        history = mock.patch.object(rv, "builds_since_rollback", return_value=[])
+        history.start()
+        self.addCleanup(history.stop)
+
+    def test_light_terminal_verdict_and_receipt_are_atomic_on_resume(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                _save(store, record)
+                args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+                observed = {
+                    "problems": [{"clear": True, "text": "bad"}] if failed else [],
+                    "parts": {"logs": {"status": "checked"}},
+                    "scope": {},
+                }
+                real_update = rr.update_record
+
+                def outage(*args, **kwargs):
+                    event = args[3]
+                    details = args[4] if len(args) > 4 else {}
+                    if event == "verify_final" or failed and details.get("result") == "failed":
+                        raise rr.RecordError("terminal write down")
+                    return real_update(*args, **kwargs)
+
+                with (
+                    mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                    mock.patch.object(rl, "replaced_by", return_value=None),
+                    mock.patch.object(rl, "evaluate_window", return_value=observed) as evaluate,
+                    mock.patch.object(rl, "on_failed") as rollback,
+                    mock.patch.object(rl, "rr_token", return_value=None),
+                    mock.patch.object(rs, "rollback_target", return_value=None),
+                    mock.patch.object(rv, "suspected_prs", return_value=[]),
+                    mock.patch.object(
+                        rv, "new_error_regression", return_value={"kind": "new_error", "name": "bad", "text": "bad"}
+                    ),
+                    mock.patch.object(rr, "post_slack", return_value=True),
+                ):
+                    with mock.patch.object(rr, "update_record", side_effect=outage), self.assertRaises(rr.RecordError):
+                        rl.cmd_watch(args, service, store, mock.Mock())
+                    saved = rr.read_record(store, record["release_id"])
+                    self.assertNotEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+                    rl.cmd_watch(args, service, store, mock.Mock())
+                    self.assertEqual(evaluate.call_count, 2)
+                    saved = rr.read_record(store, record["release_id"])
+                    self.assertEqual(saved["verdict"]["status"], "failed" if failed else "passed")
+                    self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+                    self.assertEqual(rollback.call_count, int(failed))
+
+    def test_light_manual_final_attempt_gets_a_terminal_verdict(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            prior = {"at": "manual", "result": "passed", "evidence": "preserved"}
+            record["checks"]["window_60m"] = prior
+            rv.ro.note_checkpoint(record, prior, "window_60m")
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+            clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_OK)
+            self.assertEqual(evaluate.call_count, 1)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"]["status"], "passed")
+            receipt = saved["followup"]["checkpoints"]["window_60m"]
+            self.assertEqual(receipt["attempt_history"][0]["check"], prior)
+
+    def test_light_terminal_mutation_ends_at_15m_unchecked(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="15 60", retry_completed=False)
+            clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                mock.patch.object(rv, "builds_since_rollback", return_value=["CANCELLED mutating build"]),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertTrue(rr.read_record(store, record["release_id"])["verdict"]["unchecked"])
+
+    def test_owner_and_resumed_checkpoint_receipts(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        for owned in (True, False):
+            with self.subTest(owned=owned), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record() if owned else _record(followup={})
+                rv.ro.merge_plan(record, [15, 60])
+                rv.ro.note_checkpoint(record, {"at": "original", "result": "passed"}, "window_15m")
+                _save(store, record)
+                args = argparse.Namespace(release_id=record["release_id"], checkpoints="15 60", retry_completed=False)
+                clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+                with (
+                    mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                    mock.patch.object(rl, "replaced_by", return_value=None),
+                    mock.patch.object(rl, "evaluate_window", return_value=clean) as evaluate,
+                    mock.patch.object(rr, "post_slack", return_value=True),
+                ):
+                    outcome = rl.cmd_watch(args, service, store, mock.Mock())
+                self.assertEqual(outcome, rv.EXIT_OK if owned else rv.EXIT_FAILED)
+                self.assertEqual(evaluate.call_count, 1)
+                saved = rr.read_record(store, record["release_id"])
+                self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["completed_at"], "original")
+                self.assertEqual(saved["followup"]["checkpoints"]["window_60m"]["state"], "completed")
+
+    def test_final_light_checker_receipt_outage_still_exits_red(self):
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("provider down")),
+                mock.patch.object(rv, "_record_checkpoint_error"),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+
     def test_parse(self) -> None:
         """Parse."""
         run = rl.parse_light(light_data("cloud_run"))
@@ -2092,7 +2623,10 @@ class LightTest(unittest.TestCase):
             suggestion = saved["rollback_suggestion"]
             self.assertEqual(suggestion["target"]["rollback_to"], f"previous-of:{older['release_id']}")
             self.assertTrue(suggestion["how"][0].endswith(f"--sha={'e' * 40}"))
-            with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            with (
+                mock.patch.dict(os.environ, {"RELEASE_SLACK_DISABLED": "0"}),
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            ):
                 rl.alert(service, store, saved)
                 rl.alert(service, store, rr.read_record(store, newer["release_id"]))
             self.assertEqual(slack.call_count, 1)
@@ -2198,7 +2732,7 @@ class LightTest(unittest.TestCase):
                 mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("logs down")),
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
             ):
-                rl.cmd_watch(args, service, store, mock.Mock())
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("inconclusive", True))
             self.assertIn("inconclusive", slack.call_args[0][0])
@@ -2218,6 +2752,1689 @@ class LightTest(unittest.TestCase):
         record = _record(verdict={"status": "failed", "phase": "deploy", "reasons": ["x"]}, rollback_suggestion=None)
         _, blocks = rv.rollback_alert(service, record, None, "gs://x", command="gcloud run ...")
         self.assertIn("no hold for this service", json.dumps(blocks))
+
+
+# --------------------------------------------------------------------------- light kinds, tier full
+
+DIGEST_A = "sha256:" + "a" * 64
+DIGEST_B = "sha256:" + "b" * 64
+DIGEST_C = "sha256:" + "c" * 64
+
+
+def full_run_data(**overrides) -> dict:
+    """A tier full cloud_run config: two services, their base URLs, one smoke check each."""
+    data = {
+        "service": "demo-run",
+        "kind": "cloud_run",
+        "tier": "full",
+        "github_repo": "orbit-search/demo",
+        "connected_repository": "orbit-search-demo",
+        "cloud_run_services": ["demo-a", "demo-b"],
+        "cloud_run_urls": {"demo-a": "https://demo-a-xyz-uc.a.run.app", "demo-b": "https://demo-b-xyz-uc.a.run.app"},
+        "triggers": {
+            "dev": ["demo-run-deploy-dev"],
+            "prod": ["demo-run-prod", "demo-run-deploy"],
+            "rollback": "demo-run-rollback",
+        },
+        "smoke": [
+            {"type": "http_public", "name": "a health", "url": "https://demo-a-xyz-uc.a.run.app/health"},
+            {"type": "http_public", "name": "b health", "url": "https://demo-b-xyz-uc.a.run.app/health"},
+        ],
+        "verify": {"log_filter": 'resource.type="cloud_run_revision"'},
+        "code": {"source_prefixes": ["src/"], "extensions": [".ts"]},
+    }
+    data.update(overrides)
+    return data
+
+
+def full_composer_data(**overrides) -> dict:
+    """A tier full composer config."""
+    data = {
+        "service": "demo-flow",
+        "kind": "composer",
+        "tier": "full",
+        "github_repo": "orbit-search/demo",
+        "connected_repository": "orbit-search-demo",
+        "composer": {"environment": "env-v3", "bucket": "gs://demo-bucket"},
+        "triggers": {"dev": ["demo-flow-deploy-dev"], "prod": ["demo-flow-prod"], "rollback": "demo-flow-rollback"},
+        "verify": {"log_filter": 'resource.type="cloud_composer_environment"'},
+        "code": {"source_prefixes": ["dags/"], "extensions": [".py"]},
+    }
+    data.update(overrides)
+    return data
+
+
+RUN = rl.parse_light(full_run_data())
+FLOW = rl.parse_light(full_composer_data())
+
+
+class FakeGcloud:
+    """Answers the gcloud and gsutil calls of the light kinds; keeps Cloud Run traffic, tags and revisions."""
+
+    def __init__(self) -> None:
+        """Two services, each serving revision 1; revision 2 is the candidate."""
+        self.commands: list[list[str]] = []
+        self.revisions = {"demo-a-1": DIGEST_A, "demo-b-1": DIGEST_A, "demo-a-2": DIGEST_B, "demo-b-2": DIGEST_B}
+        self.not_ready: set[str] = set()
+        self.traffic = {"demo-a": {"demo-a-1": 100}, "demo-b": {"demo-b-1": 100}}
+        self.tags = {"demo-a": {"candidate": "demo-a-2"}, "demo-b": {"candidate": "demo-b-2"}}
+        self.fail: str = ""
+
+    def __call__(self, command: list[str]) -> str:
+        """Answer one recorded command."""
+        self.commands.append(command)
+        if self.fail and self.fail in " ".join(command):
+            raise rr.RecordError(f"{self.fail} failed")
+        if command[:4] == ["gcloud", "run", "services", "describe"]:
+            name = command[4]
+            traffic = [{"revisionName": rev, "percent": pct} for rev, pct in self.traffic[name].items()]
+            traffic += [{"revisionName": rev, "percent": 0, "tag": tag} for tag, rev in self.tags[name].items()]
+            return json.dumps(
+                {
+                    "spec": {"template": {"spec": {"containers": [{"image": "img"}]}}},
+                    "status": {
+                        "latestCreatedRevisionName": f"{name}-2",
+                        "latestReadyRevisionName": f"{name}-2",
+                        "traffic": traffic,
+                        "url": f"https://{name}-xyz-uc.a.run.app",
+                    },
+                }
+            )
+        if command[:4] == ["gcloud", "run", "revisions", "describe"]:
+            revision = command[4]
+            if revision not in self.revisions:
+                raise rr.RecordError(f"revision {revision} not found")
+            ready = "False" if revision in self.not_ready else "True"
+            return json.dumps(
+                {
+                    "spec": {"containers": [{"image": f"gcr.io/p/x@{self.revisions[revision]}"}]},
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": ready}],
+                        "imageDigest": f"gcr.io/p/x@{self.revisions[revision]}",
+                    },
+                }
+            )
+        if command[:4] == ["gcloud", "run", "services", "update-traffic"]:
+            split = command[-1].split("=", 1)[1]
+            self.traffic[command[4]] = {item.split("=")[0]: int(item.split("=")[1]) for item in split.split(",")}
+            return ""
+        if command[:4] == ["gcloud", "composer", "environments", "describe"]:
+            return "gs://demo-bucket/dags\n"
+        if command[0] == "gsutil":
+            return ""
+        raise AssertionError(f"unexpected command {command}")
+
+
+def _args(**values) -> argparse.Namespace:
+    """An argparse namespace with the defaults of the light commands."""
+    defaults = {
+        "env": "prod",
+        "build_id": "b1",
+        "commit": COMMIT,
+        "previous_commit": "",
+        "images_file": None,
+        "artifacts_file": None,
+        "release_id": "latest",
+        "release_id_file": None,
+        "status": "deployed",
+        "force_fail": "",
+        "failed_marker": "",
+        "parse_result": "",
+        "build_url": "https://build",
+        "wait": False,
+        "dry_run_dir": None,
+        "out_dir": "",
+        "poll_seconds": 0.0,
+        "older_timeout_seconds": 1,
+        "dev_timeout_seconds": 1,
+    }
+    defaults.update(values)
+    return argparse.Namespace(**defaults)
+
+
+class LightCandidateCleanupTest(unittest.TestCase):
+    def test_removes_only_matching_tag_with_etag_and_preserves_traffic(self) -> None:
+        """Cleanup is a traffic-only conditional update, preserving percentages and unrelated tags."""
+        traffic = [
+            {"revision": "demo-a-1", "percent": 100, "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"},
+            {"revision": "demo-a-2", "percent": 0, "tag": "candidate"},
+            {"revision": "demo-a-1", "percent": 0, "tag": "stable"},
+        ]
+        with mock.patch.object(rl, "GoogleApi"), mock.patch.object(rl, "_http_json") as request:
+            request.side_effect = [{"etag": "v1", "traffic": traffic}, {"done": True}, {"traffic": traffic[:1]}]
+            self.assertEqual(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"}), [])
+        patch = request.call_args_list[1].args[0]
+        self.assertEqual(patch.get_method(), "PATCH")
+        self.assertTrue(patch.full_url.endswith("?updateMask=traffic"))
+        body = json.loads(patch.data)
+        self.assertEqual(body["etag"], "v1")
+        self.assertEqual(body["traffic"], [traffic[0], {"revision": "demo-a-2", "percent": 0}, traffic[2]])
+
+    def test_leaves_a_newer_candidate_alone(self) -> None:
+        """An older build never removes a newer revision's tag."""
+        with mock.patch.object(rl, "GoogleApi"), mock.patch.object(rl, "_http_json") as request:
+            request.return_value = {"etag": "v2", "traffic": [{"revision": "demo-a-3", "tag": "candidate"}]}
+            self.assertEqual(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"}), [])
+            self.assertEqual(request.call_count, 1)
+
+    def test_conflict_and_missing_etag_refuse_unguarded_cleanup(self) -> None:
+        """A concurrent change or unavailable fingerprint cannot turn into unconditional tag removal."""
+        traffic = [{"revision": "demo-a-2", "tag": "candidate"}]
+        for current, responses in (
+            ({"traffic": traffic}, []),
+            ({"etag": "v1", "traffic": traffic}, [rl.GuardError("PATCH returned HTTP 409")]),
+        ):
+            with (
+                self.subTest(current=current),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rl, "_http_json") as request,
+            ):
+                request.side_effect = [current, *responses]
+                self.assertEqual(len(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"})), 1)
+                if responses:
+                    self.assertEqual(json.loads(request.call_args_list[1].args[0].data)["etag"], "v1")
+                self.assertEqual(request.call_count, 1 + len(responses))
+
+    def test_cleanup_must_finish_and_tag_must_disappear(self) -> None:
+        """A failed operation or a retained public tag makes cleanup fail visibly."""
+        current = {"etag": "v1", "traffic": [{"revision": "demo-a-2", "tag": "candidate"}]}
+        for responses in ([current, {"done": True, "error": "denied"}], [current, {"done": True}, current]):
+            with (
+                self.subTest(responses=responses),
+                mock.patch.object(rl, "GoogleApi"),
+                mock.patch.object(rl, "_http_json", side_effect=responses),
+            ):
+                self.assertEqual(len(rl.remove_candidate_tags(RUN, {"demo-a": "demo-a-2"})), 1)
+
+
+class LightFullConfigTest(unittest.TestCase):
+    def test_cloud_run_full_parse(self) -> None:
+        """Tier full reads the triggers and URLs; dev verify calls the smoke checks on the candidate tag."""
+        self.assertTrue(RUN.has_gate and RUN.auto_rollback and RUN.has_dev)
+        self.assertEqual(RUN.prod.deploy_triggers, ("demo-run-prod", "demo-run-deploy"))
+        self.assertEqual(RUN.dev.deploy_trigger, "demo-run-deploy-dev")
+        self.assertEqual(RUN.rollback_trigger, "demo-run-rollback")
+        self.assertEqual(RUN.rollback_build_tag, "demo-run-rollback")
+        self.assertEqual(
+            [check["url"] for check in RUN.dev.smoke],
+            [
+                "https://candidate---demo-a-xyz-uc.a.run.app/health",
+                "https://candidate---demo-b-xyz-uc.a.run.app/health",
+            ],
+        )
+        self.assertEqual(RUN.prod.smoke[0]["url"], "https://demo-a-xyz-uc.a.run.app/health")
+        self.assertEqual(set(RUN.environments), {"prod", "dev"})
+
+    def test_cloud_run_full_validation(self) -> None:
+        """Bad tier full cloud_run configs."""
+        bad = [
+            full_run_data(deploy_triggers=["x"]),
+            full_run_data(cloud_run_urls={"demo-a": "https://demo-a.example.com", "demo-b": "https://b.run.app"}),
+            full_run_data(smoke=[{"type": "http_public", "url": "https://demo-a-xyz-uc.a.run.app/health"}]),
+            full_run_data(smoke=[{"type": "http_public", "url": "https://other.example.com/health"}]),
+            full_run_data(triggers={"prod": ["p"]}),
+            full_run_data(tier="check_rollback"),
+        ]
+        for data in bad:
+            with self.assertRaises(rc.ConfigError, msg=json.dumps(data)[:200]):
+                rl.parse_light(data)
+
+    def test_composer_full_parse(self) -> None:
+        """Composer tier full: the bucket fallback, the candidate folder under data/."""
+        self.assertEqual(FLOW.bucket, "gs://demo-bucket")
+        self.assertEqual(FLOW.candidate_prefix, "data/release-candidate/")
+        self.assertEqual(
+            rl.candidate_uri(FLOW, "gs://demo-bucket/dags", COMMIT),
+            f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags",
+        )
+        self.assertEqual(FLOW.dev.smoke, ())
+        with self.assertRaises(rc.ConfigError):
+            rl.parse_light(full_composer_data(composer={"environment": "e", "candidate_prefix": "dags/candidates/"}))
+        with self.assertRaises(rc.ConfigError):
+            rl.parse_light(full_composer_data(composer={"environment": "e", "bucket": "demo-bucket"}))
+
+    def test_render_full(self) -> None:
+        """Tier full renders a window build that may roll back and a rollback build; check_only renders neither."""
+        files = kit.rendered(RUN)
+        window = files["release/services/demo-run.release-verify.yaml"]
+        self.assertIn('"RELEASE_AUTO_ROLLBACK=${_AUTO_ROLLBACK}"', window)
+        self.assertIn("demo-run-rollback trigger", window)
+        rollback = files["release/services/demo-run.rollback.yaml"]
+        self.assertIn("python3 release/release_rollback.py apply \\", rollback)
+        self.assertIn("--service demo-run \\", rollback)
+        self.assertIn('tags: ["demo-run-rollback"]', rollback)
+        self.assertNotIn("kubectl", rollback)
+        self.assertIn("candidate folder goes to dags/", kit.rendered(FLOW)["release/services/demo-flow.rollback.yaml"])
+        light = kit.rendered(rl.parse_light(light_data("cloud_run")))
+        self.assertEqual(list(light), ["release/services/demo-cloud-run.release-verify.yaml"])
+        self.assertNotIn("AUTO_ROLLBACK", light["release/services/demo-cloud-run.release-verify.yaml"])
+
+    def test_any_service_loader(self) -> None:
+        """release_config.load_any_service picks the GKE or the light loader by kind."""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "demo-run.json").write_text(json.dumps(full_run_data()))
+            (folder / "demo.json").write_text(json.dumps(service_data()))
+            with mock.patch.object(rc, "SERVICES_DIR", folder):
+                self.assertEqual(rc.config_kind("demo-run"), "cloud_run")
+                self.assertEqual(rc.config_kind("demo"), "gke")
+                self.assertIsInstance(rc.load_any_service("demo-run"), rl.LightService)
+                self.assertIsInstance(rc.load_any_service("demo"), rc.Service)
+                with self.assertRaises(rc.ConfigError):
+                    rc.load_service("demo-run")
+                with self.assertRaises(rc.ConfigError):
+                    rc.config_kind()
+
+
+class LightFullDevTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """A local dev store, a fake gcloud and no network."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = rr.LocalStore(Path(self.tmp.name) / "dev")
+        self.gcloud = FakeGcloud()
+        self.patches = [
+            mock.patch.object(rl, "GoogleApi"),
+            mock.patch.object(rr, "github_token", side_effect=guard.GuardError("no token")),
+            mock.patch.object(rr, "build_info", return_value={"id": "b1"}),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        """Remove what the test created."""
+        for patch in self.patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _record_dev(self, pushed: str = DIGEST_B) -> str:
+        """Begin and finish a dev release of the candidate revisions; return its release id."""
+        images = Path(self.tmp.name) / "images.json"
+        images.write_text(json.dumps({"demo-a": f"gcr.io/p/a@{pushed}", "demo-b": f"gcr.io/p/b@{pushed}"}))
+        id_file = Path(self.tmp.name) / "release_id"
+        args = _args(env="dev", images_file=str(images), release_id_file=str(id_file))
+        self.assertEqual(rl.cmd_begin(args, RUN, self.store, self.gcloud), 0)
+        release_id = id_file.read_text().strip()
+        self.assertEqual(rl.cmd_finish(_args(env="dev", release_id=release_id), RUN, self.store, self.gcloud), 0)
+        return release_id
+
+    def test_cloud_run_dev_verify_passes_and_indexes_the_revisions(self) -> None:
+        """The candidate revisions run the pushed digests and answer on the tag URLs: passed, indexed."""
+        release_id = self._record_dev()
+        record = rr.read_record(self.store, release_id)
+        self.assertEqual(record["artifacts"], {"demo-a": f"demo-a-2@{DIGEST_B}", "demo-b": f"demo-b-2@{DIGEST_B}"})
+        calls = []
+
+        def public(check, get=None):
+            """Record the URL and pass."""
+            calls.append(check["url"])
+            return rv.Check(check["name"], "passed", ["ok"])
+
+        with (
+            mock.patch.object(rv, "check_http_public", side_effect=public),
+            mock.patch.object(rv, "github_compare_status", return_value="behind"),
+            mock.patch.object(rr, "github_token", return_value="t"),
+        ):
+            code = rl.cmd_dev_verify(_args(env="dev", release_id=release_id), RUN, self.store, self.gcloud)
+        self.assertEqual(code, rv.EXIT_OK)
+        self.assertTrue(all(url.startswith("https://candidate---") for url in calls))
+        index, _ = self.store.read(rg.dev_commit_index(COMMIT))
+        self.assertEqual(index["verdict"]["status"], "passed")
+        self.assertEqual(index["artifacts"], record["artifacts"])
+        pointer, _ = self.store.read(rg.DEV_VERIFIED_POINTER)
+        self.assertEqual(pointer["commit"], COMMIT)
+
+    def test_cloud_run_dev_verify_fails_on_another_digest_or_a_moved_tag(self) -> None:
+        """A candidate that runs another image (the deploy failed silently) or a tag that moved fails dev verify."""
+        release_id = self._record_dev(pushed=DIGEST_C)
+        self.gcloud.tags["demo-b"]["candidate"] = "demo-b-1"
+        marker = Path(self.tmp.name) / "failed"
+        with (
+            mock.patch.object(rv, "check_http_public", return_value=rv.Check("x", "passed", ["ok"])),
+            mock.patch.object(rv, "newer_dev_build", return_value=None),
+        ):
+            args = _args(env="dev", release_id=release_id, failed_marker=str(marker))
+            self.assertEqual(rl.cmd_dev_verify(args, RUN, self.store, self.gcloud), rv.EXIT_FAILED)
+        self.assertTrue(marker.exists())
+        record = rr.read_record(self.store, release_id)
+        reasons = " ".join(record["verdict"]["reasons"])
+        self.assertIn(f"this build pushed {DIGEST_C}", reasons)
+        self.assertIn("tag moved to demo-b-1", reasons)
+        self.assertFalse(self.store.read(rg.DEV_VERIFIED_POINTER)[0])
+
+    def test_dev_verify_superseded_is_not_red(self) -> None:
+        """A failure while a newer dev build replaced this one is superseded: no alert, no red marker."""
+        release_id = self._record_dev()
+        marker = Path(self.tmp.name) / "failed"
+        with (
+            mock.patch.object(rv, "check_http_public", return_value=rv.Check("x", "failed", ["HTTP 503"])),
+            mock.patch.object(rv, "newer_dev_build", return_value="newer build b2"),
+        ):
+            args = _args(env="dev", release_id=release_id, failed_marker=str(marker))
+            self.assertEqual(rl.cmd_dev_verify(args, RUN, self.store, self.gcloud), rv.EXIT_OK)
+        self.assertFalse(marker.exists())
+        self.assertEqual(rr.read_record(self.store, release_id)["verdict"]["status"], "superseded")
+
+    def test_composer_dev_verify(self) -> None:
+        """Composer dev verify: the candidate folder is unchanged and the parse has no new import error."""
+        manifest = ("sha256:" + "d" * 64, 3)
+        with mock.patch.object(rl, "folder_manifest", return_value=manifest):
+            id_file = Path(self.tmp.name) / "release_id"
+            rl.cmd_begin(_args(env="dev", release_id_file=str(id_file)), FLOW, self.store, self.gcloud)
+            release_id = id_file.read_text().strip()
+            rl.cmd_finish(_args(env="dev", release_id=release_id), FLOW, self.store, self.gcloud)
+            record = rr.read_record(self.store, release_id)
+            uri = f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags"
+            self.assertEqual(record["artifacts"], {"dags": f"{uri} {manifest[0]}"})
+            parse = Path(self.tmp.name) / "parse.json"
+            parse.write_text(
+                json.dumps(
+                    {
+                        "candidate": {
+                            "airflow": "3.1.7",
+                            "files": 3,
+                            "dags": 2,
+                            "errors": {"a.py": "VARIABLE_NOT_FOUND: x"},
+                        },
+                        "baseline": {"airflow": "3.1.7", "files": 3, "dags": 2, "errors": {}},
+                    }
+                )
+            )
+            with mock.patch.object(rv, "github_compare_status", return_value="behind"):
+                args = _args(env="dev", release_id=release_id, parse_result=str(parse))
+                self.assertEqual(rl.cmd_dev_verify(args, FLOW, self.store, self.gcloud), rv.EXIT_OK)
+            checks = rr.read_record(self.store, release_id)["checks"]["deploy"]["checks"]
+            self.assertIn("not judged", " ".join(checks[1]["details"]))
+        # The folder changed after the record: fail.
+        with (
+            mock.patch.object(rl, "folder_manifest", return_value=("sha256:" + "e" * 64, 3)),
+            mock.patch.object(rv, "newer_dev_build", return_value=None),
+        ):
+            args = _args(env="dev", release_id=release_id, parse_result=str(parse))
+            self.assertEqual(rl.cmd_dev_verify(args, FLOW, self.store, self.gcloud), rv.EXIT_FAILED)
+
+    def test_dev_turn_uses_the_dev_triggers(self) -> None:
+        """turn --env dev is single flight among the dev triggers, with no branch check."""
+        with mock.patch.object(rl.guard, "Guard") as fake:
+            fake.return_value.wait_for_turn.side_effect = guard.Superseded("newer")
+            self.assertEqual(rl.cmd_turn(_args(env="dev"), RUN, self.store, self.gcloud), guard.EXIT_SUPERSEDED)
+        kwargs = fake.call_args.kwargs
+        self.assertEqual(
+            (kwargs["peer_triggers"], kwargs["promoting_trigger"]), (("demo-run-deploy-dev",), "demo-run-deploy-dev")
+        )
+        fake.return_value.check_on_branch.assert_not_called()
+        with self.assertRaises(rc.ConfigError):
+            rl.cmd_turn(_args(env="dev"), rl.parse_light(light_data("cloud_run")), self.store, self.gcloud)
+
+
+class LightFullParseTest(unittest.TestCase):
+    def test_compare_and_check(self) -> None:
+        """New import errors fail; errors prod's DAGs have, and environment-only errors, do not."""
+        result = {
+            "candidate": {
+                "airflow": "3.1.7",
+                "files": 3,
+                "dags": 2,
+                "errors": {
+                    "a.py": "ModuleNotFoundError: No module named 'x'",
+                    "b.py": "NameError: y",
+                    "c.py": "airflow.sdk.exceptions.AirflowRuntimeError: VARIABLE_NOT_FOUND: {'message': 'Variable V not found'}",
+                },
+            },
+            "baseline": {
+                "airflow": "3.1.7",
+                "files": 3,
+                "dags": 2,
+                "errors": {"a.py": "ModuleNotFoundError: No module named 'x'"},
+            },
+        }
+        new, environment = rl.compare_parse(result)
+        self.assertEqual((list(new), list(environment)), (["b.py"], ["c.py"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.json"
+            path.write_text(json.dumps(result))
+            check = rl.check_parse(FLOW, str(path))
+            self.assertEqual(check.status, "failed")
+            self.assertIn("dags/b.py: NameError: y", check.details)
+            path.write_text(json.dumps({"error": "candidate: pip failed"}))
+            self.assertEqual(rl.check_parse(FLOW, str(path)).status, "failed")
+            self.assertEqual(rl.check_parse(FLOW, str(Path(tmp) / "missing.json")).status, "failed")
+            self.assertEqual(rl.check_parse(FLOW, "").status, "failed")
+
+    def test_parse_requires_complete_results_from_both_folders(self) -> None:
+        """A missing child result or malformed metadata cannot authorize promotion."""
+        parsed = {"airflow": "3.1.7", "files": 0, "dags": 0, "errors": {}}
+        malformed = [{}, [], None]
+        for role in ("candidate", "baseline"):
+            malformed.append({other: parsed for other in ("candidate", "baseline") if other != role})
+            for field in parsed:
+                partial = {name: value for name, value in parsed.items() if name != field}
+                malformed.append({"candidate": parsed, "baseline": parsed, role: partial})
+            for field, value in (
+                ("airflow", ""),
+                ("files", True),
+                ("dags", -1),
+                ("files", "1"),
+                ("errors", []),
+                ("errors", {"a.py": None}),
+            ):
+                malformed.append({"candidate": parsed, "baseline": parsed, role: {**parsed, field: value}})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.json"
+            for result in malformed:
+                with self.subTest(result=result):
+                    path.write_text(json.dumps(result))
+                    self.assertEqual(rl.check_parse(FLOW, str(path)).status, "failed")
+            path.write_text(json.dumps({"candidate": parsed, "baseline": parsed}))
+            self.assertEqual(rl.check_parse(FLOW, str(path)).status, "passed")
+
+    def test_parse_dags_runs_each_folder_alone(self) -> None:
+        """parse-dags parses the candidate and the baseline in two processes, each with its own DAG folder."""
+        seen = []
+
+        def run(command, env, **_):
+            """Write a canned parse result where the child would."""
+            seen.append(env["AIRFLOW__CORE__DAGS_FOLDER"])
+            Path(command[command.index("--out") + 1]).write_text(json.dumps({"errors": {}, "files": 1}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "result.json"
+            with mock.patch.object(rl.subprocess, "run", side_effect=run):
+                self.assertEqual(rl.main(["parse-dags", "--candidate", tmp, "--baseline", "/", "--out", str(out)]), 0)
+            result = json.loads(out.read_text())
+            self.assertEqual(sorted(result), ["baseline", "candidate"])
+            self.assertEqual(seen, [str(Path(tmp).resolve()), "/"])
+            failing = mock.Mock(return_value=subprocess.CompletedProcess([], 1, "", "ImportError: airflow"))
+            with mock.patch.object(rl.subprocess, "run", failing):
+                rl.main(["parse-dags", "--candidate", tmp, "--baseline", tmp, "--out", str(out)])
+            self.assertIn("ImportError", json.loads(out.read_text())["error"])
+
+    def test_folder_manifest_pages(self) -> None:
+        """The manifest covers every page; the same objects give the same hash, a changed one another."""
+        pages = [
+            {"items": [{"name": "data/c/dags/a.py", "crc32c": "x", "size": "1"}], "nextPageToken": "p2"},
+            {"items": [{"name": "data/c/dags/b/c.py", "crc32c": "y", "size": "2"}]},
+        ]
+        with mock.patch.object(rl, "_http_json", side_effect=list(pages)):
+            first = rl.folder_manifest("gs://bkt/data/c/dags", lambda: "t")
+        with mock.patch.object(rl, "_http_json", side_effect=list(reversed(pages[:1])) + [pages[1]]):
+            again = rl.folder_manifest("gs://bkt/data/c/dags/", lambda: "t")
+        self.assertEqual(first, again)
+        self.assertEqual(first[1], 2)
+        changed = [pages[0], {"items": [{"name": "data/c/dags/b/c.py", "crc32c": "z", "size": "2"}]}]
+        with mock.patch.object(rl, "_http_json", side_effect=changed):
+            self.assertNotEqual(rl.folder_manifest("gs://bkt/data/c/dags", lambda: "t")[0], first[0])
+        with mock.patch.object(rl, "_http_json", return_value={}):
+            self.assertEqual(rl.folder_manifest("gs://bkt/none", lambda: "t"), ("", 0))
+
+    def test_downloaded_commit_manifest_matches_gcs_metadata(self) -> None:
+        """The standard CRC32C test vector and local bytes define the expected remote artifact."""
+        self.assertEqual(rl.crc32c(b"123456789"), "4waSgw==")
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "a.py").write_bytes(b"123456789")
+            expected = rl.local_dag_manifest(folder)
+        payload = {"items": [{"name": "dags/a.py", "crc32c": "4waSgw==", "size": "9"}]}
+        with mock.patch.object(rl, "_http_json", return_value=payload):
+            self.assertEqual(rl.folder_manifest("gs://bucket/dags", lambda: "t"), (expected, 1))
+
+
+class LightFullProdTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Local stores, a fake gcloud and no network."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.gcloud = FakeGcloud()
+        self.prod = rr.LocalStore(self.root / "prod")
+        self.patches = [
+            mock.patch.object(rl, "GoogleApi"),
+            mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rr, "build_info", return_value={"id": "b1"}),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        """Remove what the test created."""
+        for patch in self.patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def test_gate_compares_artifacts(self) -> None:
+        """The prod gate promotes only the artifacts that dev verify checked."""
+        stores = rg.Stores(service=RUN, prod=self.prod, dev=rr.LocalStore(self.root / "dev"))
+        verified = {"demo-a": f"demo-a-2@{DIGEST_B}", "demo-b": f"demo-b-2@{DIGEST_B}"}
+        stores.dev.write(
+            rg.dev_commit_index(COMMIT), {"commit": COMMIT, "verdict": {"status": "passed"}, "artifacts": verified}, 0
+        )
+        self.assertTrue(rg.decide(stores, COMMIT, "t", artifacts=dict(verified)).go)
+        moved = rg.decide(stores, COMMIT, "t", artifacts={**verified, "demo-b": f"demo-b-3@{DIGEST_C}"})
+        self.assertEqual(moved.status, "unverified")
+        self.assertIn("demo-b-3", moved.reason)
+        self.assertEqual(rg.decide(stores, COMMIT, "t", artifacts={}).status, "unverified")
+        artifacts_file = self.root / "artifacts.json"
+        artifacts_file.write_text(json.dumps(verified))
+        args = argparse.Namespace(
+            commit=COMMIT, build_id="", image_file=None, artifacts_file=str(artifacts_file), skip_reason_file=None
+        )
+        with mock.patch.object(rg, "wait_for_rollbacks"):
+            self.assertEqual(rg.cmd_check_prod(args, stores), rg.EXIT_GO)
+            artifacts_file.write_text(json.dumps({**verified, "demo-a": f"demo-a-9@{DIGEST_C}"}))
+            self.assertEqual(rg.cmd_check_prod(args, stores), rg.EXIT_ERROR)
+
+    def test_check_prod_takes_one_of_image_or_artifacts(self) -> None:
+        """check-prod needs --image-file (GKE) or --artifacts-file (light kinds), not both."""
+        for extra in ([], ["--image-file", "a", "--artifacts-file", "b"]):
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                rg.main(["check-prod", "--commit", COMMIT, *extra])
+
+    def test_gate_refuses_a_check_only_light_service(self) -> None:
+        """release_gate.py has nothing to gate for a check_only light service."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "demo-cloud-run.json").write_text(json.dumps(light_data("cloud_run")))
+            with mock.patch.object(rc, "SERVICES_DIR", Path(tmp)), mock.patch("sys.stderr"):
+                self.assertEqual(rg.main(["status"]), rg.EXIT_ERROR)
+
+    def test_preflight_and_still_current(self) -> None:
+        """Preflight writes the live artifacts of the verified revisions; still-current refuses a change."""
+        verified = {"demo-a": f"demo-a-2@{DIGEST_B}", "demo-b": f"demo-b-2@{DIGEST_B}"}
+        args = _args(out_dir=self.tmp.name)
+        with (
+            mock.patch.object(rl.guard, "Guard") as fake,
+            mock.patch.object(rl, "_verified_artifacts", return_value=verified),
+        ):
+            fake.return_value.check_superseded.return_value = []
+            self.assertEqual(rl.cmd_preflight(args, RUN, self.prod, self.gcloud), 0)
+            written = json.loads((self.root / rl.ARTIFACTS_FILE).read_text())
+            self.assertEqual(written, verified)
+            fake.return_value.wait_for_dev.assert_called_once()
+            self.assertTrue(fake.return_value.wait_for_dev.call_args.kwargs["allow_overlap"])
+            self.assertEqual(fake.call_args.kwargs["rollback_tag"], "demo-run-rollback")
+            self.assertEqual(rl.cmd_still_current(args, RUN, self.prod, self.gcloud), 0)
+            self.gcloud.not_ready.add("demo-b-2")
+            with self.assertRaises(rr.RecordError):
+                rl.cmd_still_current(args, RUN, self.prod, self.gcloud)
+            fake.return_value.check_superseded.side_effect = guard.Superseded("newer")
+            self.assertEqual(rl.cmd_still_current(args, RUN, self.prod, self.gcloud), guard.EXIT_SUPERSEDED)
+            fake.return_value.wait_for_turn.side_effect = guard.Superseded("newer")
+            self.assertEqual(rl.cmd_preflight(args, RUN, self.prod, self.gcloud), guard.EXIT_SUPERSEDED)
+
+    def test_promote_record_and_check(self) -> None:
+        """The promote moves 100% to the verified revisions; the record keeps what served before."""
+        _save(
+            self.prod,
+            _record(release_id="20261020T100000Z-bbbbbbbbb", commit=PREVIOUS, artifacts={"demo-a": "demo-a-1@x"}),
+        )
+        artifacts = {"demo-a": f"demo-a-2@{DIGEST_B}", "demo-b": f"demo-b-2@{DIGEST_B}"}
+        artifacts_file = self.root / "artifacts.json"
+        artifacts_file.write_text(json.dumps(artifacts))
+        id_file = self.root / "release_id"
+        begin = _args(artifacts_file=str(artifacts_file), release_id_file=str(id_file))
+        self.assertEqual(rl.cmd_begin(begin, RUN, self.prod, self.gcloud), 0)
+        release_id = id_file.read_text().strip()
+        record = rr.read_record(self.prod, release_id)
+        self.assertEqual(record["artifacts"], artifacts)
+        self.assertEqual(record["previous"]["artifacts"], {"demo-a": "demo-a-1@x"})
+        self.assertEqual(rl.serving_split(record["previous"]["workloads"]["cloud_run/demo-a"]), {"demo-a-1": 100})
+        self.assertEqual(rl.cmd_apply(_args(artifacts_file=str(artifacts_file)), RUN, self.prod, self.gcloud), 0)
+        moves = [command for command in self.gcloud.commands if command[3] == "update-traffic"]
+        self.assertEqual(
+            [command[-1] for command in moves], ["--to-revisions=demo-a-2=100", "--to-revisions=demo-b-2=100"]
+        )
+        rr.acquire_lock(self.prod, "b1", "deploy", lambda _: True, wait_seconds=1)
+        self.assertEqual(rl.cmd_finish(_args(release_id=release_id), RUN, self.prod, self.gcloud), 0)
+        self.assertEqual(self.prod.read(rr.LOCK_OBJECT)[0]["holder"], "")
+        saved = rr.read_record(self.prod, release_id)
+        self.assertEqual(rl.check_promoted_revisions(RUN, saved, saved["workloads"]).status, "passed")
+        self.gcloud.traffic["demo-b"] = {"demo-b-1": 50, "demo-b-2": 50}
+        after = rl.snapshot_cloud_run(RUN, self.gcloud)
+        failed = rl.check_promoted_revisions(RUN, saved, after)
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("demo-b-1=50,demo-b-2=50", failed.details[1])
+        self.gcloud.fail = "update-traffic demo-a"
+        self.assertEqual(
+            rl.cmd_apply(_args(artifacts_file=str(artifacts_file)), RUN, self.prod, self.gcloud), rv.EXIT_ERROR
+        )
+
+    def test_composer_promote_syncs_the_candidate(self) -> None:
+        """The composer promote syncs the verified candidate folder to dags/; the record needs artifacts."""
+        uri = f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags"
+        with mock.patch.object(rl, "folder_manifest", return_value=(DIGEST_A, 3)):
+            self.assertEqual(rl.promote_artifacts(FLOW, {"dags": f"{uri} {DIGEST_A}"}, self.gcloud), [])
+        self.assertEqual(self.gcloud.commands[-1], ["gsutil", "-m", "rsync", "-r", "-d", uri, "gs://demo-bucket/dags"])
+        self.assertEqual(len(rl.promote_artifacts(FLOW, {}, self.gcloud)), 1)
+        with self.assertRaises(rr.RecordError):
+            rl.cmd_begin(_args(release_id_file=str(self.root / "id")), FLOW, self.prod, self.gcloud)
+
+    def test_composer_promote_refuses_mutated_source_and_destination(self) -> None:
+        """A mutation after still-current or during rsync must fail the release."""
+        artifact = {"dags": f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags {DIGEST_A}"}
+        with mock.patch.object(rl, "folder_manifest", return_value=(DIGEST_B, 3)):
+            self.assertIn("changed after verification", rl.promote_artifacts(FLOW, artifact, self.gcloud)[0])
+        self.assertFalse(any(command[0] == "gsutil" for command in self.gcloud.commands))
+        with mock.patch.object(rl, "folder_manifest", side_effect=[(DIGEST_A, 3), (DIGEST_B, 3)]):
+            self.assertIn("live DAG manifest differs", rl.promote_artifacts(FLOW, artifact, self.gcloud)[0])
+
+    def test_stage_and_fetch(self) -> None:
+        """stage copies the repository's dags/ to the candidate folder; fetch-dags copies both folders down."""
+        source = self.root / "dags"
+        source.mkdir()
+        self.assertEqual(rl.cmd_stage(_args(source=str(source)), FLOW, self.prod, self.gcloud), 0)
+        uri = f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags"
+        self.assertEqual(self.gcloud.commands[-1][-2:], [str(source), uri])
+        out = self.root / "parse"
+        self.assertEqual(rl.cmd_fetch_dags(_args(out_dir=str(out)), FLOW, self.prod, self.gcloud), 0)
+        self.assertEqual(
+            [command[-1] for command in self.gcloud.commands[-2:]], [str(out / "candidate"), str(out / "baseline")]
+        )
+        self.assertEqual(oct(out.stat().st_mode & 0o777), "0o777")
+        self.assertEqual((out / "fetch-complete").read_text().strip(), COMMIT)
+        with self.assertRaises(rc.ConfigError):
+            rl.cmd_stage(_args(source=str(source)), RUN, self.prod, self.gcloud)
+        # Without the environment's DAG folder, the config's bucket.
+        self.gcloud.fail = "composer environments describe"
+        self.assertEqual(rl.dags_uri(FLOW, self.gcloud), "gs://demo-bucket/dags")
+
+    def test_failed_fetch_invalidates_a_previous_parse_and_completion_marker(self) -> None:
+        """Either failed rsync leaves no marker or reusable parse, even after a previous successful fetch."""
+        out = self.root / "parse"
+        out.mkdir()
+        for failed_source in ("data/release-candidate/", "gs://demo-bucket/dags"):
+            (out / "fetch-complete").write_text(COMMIT)
+            (out / "result.json").write_text("{}")
+            self.gcloud.fail = "rsync -r -d " + (
+                f"gs://demo-bucket/data/release-candidate/{COMMIT}/dags"
+                if "candidate" in failed_source
+                else failed_source
+            )
+            with self.subTest(source=failed_source), self.assertRaises(rr.RecordError):
+                rl.cmd_fetch_dags(_args(out_dir=str(out)), FLOW, self.prod, self.gcloud)
+            self.assertFalse((out / "fetch-complete").exists())
+            self.assertFalse((out / "result.json").exists())
+
+    def test_failed_full_release_starts_the_rollback(self) -> None:
+        """Tier full: a failed deploy check posts that a rollback follows; the window build starts it."""
+        record = _record(artifacts={"demo-a": "demo-a-2@x", "demo-b": "demo-b-2@x"})
+        _save(self.prod, record)
+        failed = rv.Check("revisions", "failed", ["2 services", "cloud_run/demo-a: traffic is demo-a-1=100"])
+        with (
+            mock.patch.object(rl, "deploy_checks", return_value=([failed], {})),
+            mock.patch.object(rv, "suspected_prs", return_value=[]),
+            mock.patch.object(rl, "alert") as alert,
+            mock.patch.object(rv, "start_rollback") as start,
+        ):
+            self.assertEqual(
+                rl.cmd_check(_args(release_id=record["release_id"]), RUN, self.prod, self.gcloud), rv.EXIT_FAILED
+            )
+            alert.assert_not_called()
+            self.assertIn("An automatic rollback follows", rr.post_slack.call_args[0][0])
+            saved = rr.read_record(self.prod, record["release_id"])
+            self.assertIn("release_rollback.py run", saved["rollback_suggestion"]["how"][0])
+            self.assertEqual(saved["rollback_suggestion"]["target"]["release_id"], record["previous"]["release_id"])
+            rl.cmd_watch(_args(release_id=record["release_id"], checkpoints="15"), RUN, self.prod, self.gcloud)
+            start.assert_called_once()
+        check_only = rl.parse_light(light_data("cloud_run"))
+        with mock.patch.object(rl, "alert") as alert, mock.patch.object(rv, "start_rollback") as start:
+            rl.on_failed(check_only, self.prod, record)
+            alert.assert_called_once()
+            start.assert_not_called()
+
+    def test_auto_rollback_triggers_the_light_rollback(self) -> None:
+        """release_verify.start_rollback works for a light service: its trigger, branch and _EXPECT_LATEST."""
+        record = _record(verdict={"status": "failed", "phase": "deploy"}, rollback_suggestion={"summary": "x"})
+        _save(self.prod, record)
+        commands = []
+        with (
+            mock.patch.dict(os.environ, {"RELEASE_AUTO_ROLLBACK": "1"}),
+            mock.patch.object(rr, "build_alive", return_value=lambda _: False),
+        ):
+            build = rv.start_rollback(
+                RUN,
+                self.prod,
+                record,
+                runner=lambda c: commands.append(c) or "rb1\n",
+                builds=lambda *_: (False, []),
+                follow=False,
+            )
+        self.assertEqual(build, "rb1")
+        self.assertIn("demo-run-rollback", commands[0])
+        self.assertIn(f"_EXPECT_LATEST={record['release_id']}", commands[0][-2])
+
+    def test_window_builds_and_schedule(self) -> None:
+        """A full-tier window waits only for prod builds past their first change and for rollbacks."""
+        waiting = guard.Build.from_api(
+            {
+                "id": "w",
+                "status": "WORKING",
+                "createTime": "2026-10-21T10:00:00Z",
+                "steps": [{"id": "release-record-begin", "status": "QUEUED"}],
+            }
+        )
+        changing = guard.Build.from_api(
+            {
+                "id": "c",
+                "status": "WORKING",
+                "createTime": "2026-10-21T10:00:00Z",
+                "steps": [{"id": "release-record-begin", "status": "SUCCESS"}],
+            }
+        )
+        rollback = guard.Build.from_api({"id": "r", "status": "WORKING", "createTime": "2026-10-21T10:00:00Z"})
+        api = rl.GoogleApi.return_value
+        api.list_builds.return_value = [waiting, changing]
+        api.ongoing_rollbacks.return_value = [rollback]
+        self.assertEqual([item.split(" ")[0] for item in rl.running_deploys(RUN, "own")], ["c", "r"])
+        light = rl.parse_light(light_data("cloud_run"))
+        self.assertEqual(len(rl.running_deploys(light, "own")), 2)
+        _save(self.prod, _record())
+        commands = []
+        with mock.patch.object(rr, "run_command", side_effect=lambda c, timeout=0: commands.append(c) or "wb1\n"):
+            args = _args(release_id=_record()["release_id"], source_dir=str(self.root / "src"), no_slack=False)
+            rl.cmd_schedule_window(args, RUN, self.prod, self.gcloud)
+            args.no_slack = True
+            rl.cmd_schedule_window(args, RUN, self.prod, self.gcloud)
+            rl.cmd_schedule_window(args, light, self.prod, self.gcloud)
+        subs = [next(part for part in command if part.startswith("--substitutions=")) for command in commands]
+        self.assertTrue(subs[0].endswith(",_AUTO_ROLLBACK=1"))
+        self.assertTrue(subs[1].endswith(",_AUTO_ROLLBACK="))
+        self.assertNotIn("_AUTO_ROLLBACK", subs[2])
+
+
+class LightFullRollbackTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """A prod store with a promoted release; no network."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = rr.LocalStore(Path(self.tmp.name))
+        self.gcloud = FakeGcloud()
+        self.gcloud.traffic = {"demo-a": {"demo-a-2": 100}, "demo-b": {"demo-b-2": 100}}
+        before = {
+            "cloud_run/demo-a": {"traffic": {"demo-a-1": 100, "demo-a-2": 0}},
+            "cloud_run/demo-b": {"traffic": {"demo-b-1": 100}},
+        }
+        self.record = _record(
+            artifacts={"demo-a": f"demo-a-2@{DIGEST_B}", "demo-b": f"demo-b-2@{DIGEST_B}"},
+            previous={"release_id": "20261020T100000Z-bbbbbbbbb", "commit": PREVIOUS, "workloads": before},
+        )
+        _save(self.store, self.record)
+        self.cleanup_tags = mock.Mock(return_value=[])
+        self.patches = [
+            mock.patch.object(rl, "remove_candidate_tags", self.cleanup_tags),
+            mock.patch.object(rb, "assert_alone"),
+            mock.patch.object(rr, "build_info", return_value={"id": "rb1"}),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        """Remove what the test created."""
+        for patch in self.patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def _apply_args(self, **values) -> argparse.Namespace:
+        """The arguments of release_rollback.py apply in the rollback build."""
+        defaults = dict(
+            dry_run=False,
+            reason="release-verify failed",
+            target="previous",
+            build_id="rb1",
+            expect_latest="",
+            requested_by="auto",
+        )
+        defaults.update(values)
+        return argparse.Namespace(**defaults)
+
+    def test_plan(self) -> None:
+        """The plan sets each service's traffic back to what served before; a missing revision blocks it."""
+        latest, target = rb.resolve_target(self.store, "previous")
+        plan = rl.rollback_plan(RUN, latest, target, self.gcloud)
+        self.assertEqual(
+            [(step.current, step.target, step.action) for step in plan.steps],
+            [
+                ("demo-a-2=100", "demo-a-1=100", "set"),
+                ("demo-b-2=100", "demo-b-1=100", "set"),
+            ],
+        )
+        self.assertEqual(plan.problems, [])
+        del self.gcloud.revisions["demo-b-1"]
+        self.assertIn("cannot be read", rl.rollback_plan(RUN, latest, target, self.gcloud).problems[0])
+        with mock.patch("builtins.print"):
+            args = argparse.Namespace(to="previous", json=None)
+            self.assertEqual(rl.cmd_rollback_plan(args, RUN, self.store, self.gcloud), 1)
+
+    def test_check_only_record_is_a_target(self) -> None:
+        """The first rollback after the move to tier full finds what served before in previous_snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = rr.LocalStore(Path(tmp))
+            snapshot = {
+                "cloud_run/demo-a": {"traffic": {"demo-a-1": 100}},
+                "cloud_run/demo-b": {"traffic": {"demo-b-1": 100}},
+            }
+            _save(store, _record(previous={"release_id": None, "commit": PREVIOUS}, previous_snapshot=snapshot))
+            latest, target = rl.resolve_target(store, "previous")
+            self.assertEqual(target["workloads"], snapshot)
+            plan = rl.rollback_plan(RUN, latest, target, self.gcloud)
+            self.assertEqual(plan.problems, [])
+            self.assertEqual([step.target for step in plan.steps], ["demo-a-1=100", "demo-b-1=100"])
+
+    def test_apply_records_and_holds(self) -> None:
+        """The apply moves the traffic, writes a rollback record with the hold and moves latest.json."""
+        with mock.patch("builtins.print"):
+            code = rl.cmd_rollback_apply(
+                self._apply_args(expect_latest=self.record["release_id"]),
+                RUN,
+                self.store,
+                self.gcloud,
+                alive=lambda _: False,
+            )
+        self.assertEqual(code, 0)
+        self.cleanup_tags.assert_called_once_with(RUN, {"demo-a": "demo-a-2", "demo-b": "demo-b-2"})
+        self.assertEqual(self.gcloud.traffic, {"demo-a": {"demo-a-1": 100}, "demo-b": {"demo-b-1": 100}})
+        latest = rr.read_record(self.store, "latest")
+        self.assertEqual((latest["kind"], latest["status"], latest["commit"]), ("rollback", "deployed", PREVIOUS))
+        self.assertEqual(latest["promote_hold"]["rolled_back_release"], self.record["release_id"])
+        self.assertRegex(latest["promote_hold"]["resume"], r"release_gate.py( --service demo-run)? resume")
+        self.assertEqual(rr.read_record(self.store, self.record["release_id"])["status"], "rolled_back")
+        self.assertEqual(self.store.read(rr.LOCK_OBJECT)[0]["holder"], "")
+        # The gate holds the next promote.
+        stores = rg.Stores(service=RUN, prod=self.store, dev=None)
+        with (
+            mock.patch.object(rg, "contains", return_value=True),
+            mock.patch.object(rg, "commit_messages", return_value=[]),
+        ):
+            self.assertEqual(rg._hold(stores, "d" * 40, "t", self.store.read("latest.json")[0]).status, "held")
+
+    def test_failed_tag_cleanup_does_not_mark_rollback_successful(self) -> None:
+        """Restored traffic alone cannot declare success while the failed candidate remains public."""
+        self.cleanup_tags.return_value = ["demo-a: failed candidate tag remains"]
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                rl.cmd_rollback_apply(self._apply_args(), RUN, self.store, self.gcloud, alive=lambda _: False), 1
+            )
+        latest = rr.read_record(self.store, "latest")
+        self.assertEqual(latest["kind"], "rollback")
+        self.assertEqual(latest["status"], "deployed")
+        self.assertEqual(latest["verdict"]["status"], "failed")
+        self.assertEqual(latest["promote_hold"]["status"], "held")
+        self.assertEqual(rr.read_record(self.store, self.record["release_id"])["rolled_back_by"], latest["release_id"])
+        stores = rg.Stores(service=RUN, prod=self.store, dev=None)
+        with (
+            mock.patch.object(rg, "contains", return_value=True),
+            mock.patch.object(rg, "commit_messages", return_value=[]),
+        ):
+            self.assertEqual(rg._hold(stores, "d" * 40, "t", self.store.read("latest.json")[0]).status, "held")
+
+    def test_apply_refuses_when_prod_moved_on_and_reports_a_failed_move(self) -> None:
+        """_EXPECT_LATEST refuses a stale rollback; a traffic move that fails leaves latest.json as it was."""
+        with self.assertRaises(rr.RecordError), mock.patch("builtins.print"):
+            rl.cmd_rollback_apply(
+                self._apply_args(expect_latest="other"), RUN, self.store, self.gcloud, alive=lambda _: False
+            )
+        self.gcloud.fail = "update-traffic demo-b"
+        with mock.patch("builtins.print"), mock.patch("sys.stderr"):
+            self.assertEqual(
+                rl.cmd_rollback_apply(self._apply_args(), RUN, self.store, self.gcloud, alive=lambda _: False), 1
+            )
+        self.assertEqual(rr.read_record(self.store, "latest")["release_id"], self.record["release_id"])
+        with mock.patch("builtins.print"):
+            self.assertEqual(rl.cmd_rollback_apply(self._apply_args(dry_run=True), RUN, self.store, self.gcloud), 0)
+
+    def test_composer_rollback_stages_a_missing_folder(self) -> None:
+        """A composer rollback syncs the target commit's folder; one from before the candidate folders comes from GitHub."""
+        latest, target = rb.resolve_target(self.store, "previous")
+        plan = rl.rollback_plan(FLOW, latest, target, self.gcloud)
+        self.assertEqual([(step.current, step.target) for step in plan.steps], [(COMMIT, PREVIOUS)])
+        uri = f"gs://demo-bucket/data/release-candidate/{PREVIOUS}/dags"
+        with (
+            mock.patch.object(rl, "GoogleApi"),
+            mock.patch.object(rl, "folder_manifest", return_value=(DIGEST_A, 3)),
+            mock.patch.object(rl, "stage_from_github", return_value=DIGEST_A) as stage,
+        ):
+            self.assertEqual(rl.apply_rollback(FLOW, plan, self.gcloud), [])
+        stage.assert_called_once_with(FLOW, PREVIOUS, uri, self.gcloud)
+        self.assertEqual(self.gcloud.commands[-1][-2:], [uri, "gs://demo-bucket/dags"])
+        no_target = rl.rollback_plan(FLOW, latest, {"commit": None}, self.gcloud)
+        self.assertIn("unknown", no_target.problems[0])
+
+    def test_composer_rollback_preserves_and_checks_recorded_artifacts(self) -> None:
+        """Corrupted target files cannot pass the rollback or disappear from its record."""
+        uri = f"gs://demo-bucket/data/release-candidate/{PREVIOUS}/dags"
+        artifact = {"dags": f"{uri} {DIGEST_A}"}
+        latest, target = rb.resolve_target(self.store, "previous")
+        target["artifacts"] = artifact
+        plan = rl.rollback_plan(FLOW, latest, target, self.gcloud)
+        self.assertEqual(plan.target_artifacts, artifact)
+        with (
+            mock.patch.object(rl, "GoogleApi"),
+            mock.patch.object(rl, "folder_manifest", return_value=(DIGEST_B, 2)),
+            mock.patch.object(rl, "stage_from_github", return_value=DIGEST_B) as stage,
+        ):
+            failures = rl.apply_rollback(FLOW, plan, self.gcloud)
+        self.assertIn("does not match", failures[0])
+        stage.assert_called_once_with(FLOW, PREVIOUS, uri, self.gcloud)
+        self.assertFalse(any(command[0] == "gsutil" for command in self.gcloud.commands))
+        check = rl.check_rollback(FLOW, plan, {"composer/dags": {"manifest": DIGEST_B}})
+        self.assertEqual(check.status, "failed")
+        self.assertEqual(rl.check_rollback(FLOW, plan, {"composer/dags": {"manifest": DIGEST_A}}).status, "passed")
+
+    def test_resolved_previous_retains_its_artifact_identity(self) -> None:
+        """The resolver and rollback records carry the exact target artifact across another rollback."""
+        artifact = {"dags": f"gs://demo-bucket/data/release-candidate/{PREVIOUS}/dags {DIGEST_A}"}
+        rr.update_record(
+            self.store,
+            self.record["release_id"],
+            lambda current: current["previous"].update(artifacts=artifact),
+            "test",
+            {},
+        )
+        latest, target = rb.resolve_target(self.store, "previous")
+        self.assertEqual(target["artifacts"], artifact)
+        plan = rl.rollback_plan(FLOW, latest, target, self.gcloud)
+        record = rb.create_rollback_record(FLOW, self.store, self._apply_args(), latest, target, ({}, {}), plan)
+        self.assertEqual(record["artifacts"], artifact)
+
+    def test_stage_from_github_takes_only_dag_files(self) -> None:
+        """The tarball gives only regular files under dags/: no links, no paths out of the folder."""
+        import io
+        import tarfile
+
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for name, data in (
+                ("o-r-sha/dags/a.py", b"A"),
+                ("o-r-sha/dags/sub/b.py", b"B"),
+                ("o-r-sha/src/x.ts", b"X"),
+                ("o-r-sha/dags/../../evil.py", b"E"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            link = tarfile.TarInfo("o-r-sha/dags/link.py")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            tar.addfile(link)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = buffer.getvalue()
+        seen = {}
+
+        def runner(command):
+            """Look at the folder that rsync would upload."""
+            folder = Path(command[-2])
+            seen["files"] = sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file())
+            return ""
+
+        with (
+            mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rl.urllib.request, "urlopen", return_value=response),
+            mock.patch("builtins.print"),
+        ):
+            rl.stage_from_github(FLOW, PREVIOUS, "gs://demo-bucket/data/release-candidate/x/dags", runner)
+        self.assertEqual(seen["files"], ["a.py", "sub/b.py"])
+
+    def test_release_rollback_main_dispatches_light_services(self) -> None:
+        """release_rollback.py plan, run and apply of a light config go to release_light; check_only is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "demo-run.json").write_text(json.dumps(full_run_data()))
+            (folder / "demo-cloud-run.json").write_text(json.dumps(light_data("cloud_run")))
+            with (
+                mock.patch.object(rc, "SERVICES_DIR", folder),
+                mock.patch.object(rl, "open_store", return_value=self.store),
+                mock.patch.object(rl, "cmd_rollback_plan", return_value=0) as plan,
+                mock.patch.object(rl, "cmd_rollback_apply", return_value=0) as apply,
+                mock.patch.object(rb, "cmd_run", return_value=0) as run,
+            ):
+                self.assertEqual(rb.main(["plan", "--service", "demo-run"]), 0)
+                self.assertEqual(rb.main(["apply", "--service", "demo-run", "--build-id", "x"]), 0)
+                self.assertEqual(rb.main(["run", "--service", "demo-run", "--reason", "why"]), 0)
+                with mock.patch("sys.stderr"):
+                    self.assertEqual(rb.main(["plan", "--service", "demo-cloud-run"]), 1)
+            self.assertEqual(plan.call_args[0][1].name, "demo-run")
+            self.assertEqual(apply.call_count, 1)
+            self.assertEqual(run.call_args[0][1].rollback_trigger, "demo-run-rollback")
+
+    def test_cmd_run_starts_the_light_rollback_trigger(self) -> None:
+        """release_rollback.py run starts <service>-rollback at the release branch."""
+        commands = []
+        with (
+            mock.patch.object(rr, "run_command", side_effect=lambda c, timeout=0: commands.append(c) or "rb9\n"),
+            mock.patch("builtins.print"),
+        ):
+            args = argparse.Namespace(reason="bad", requested_by="n", to="previous", dry_run=False, wait=False)
+            self.assertEqual(rb.cmd_run(args, RUN, self.store, None), 0)
+        self.assertEqual(commands[0][:5], ["gcloud", "builds", "triggers", "run", "demo-run-rollback"])
+        self.assertIn("--branch=main", commands[0])
+
+
+class GuardOverlapTest(unittest.TestCase):
+    def test_wait_for_dev_allows_overlap_for_light_kinds(self) -> None:
+        """Two overlapping dev builds of a commit block a GKE promote (the tag) but not a light one."""
+        older = _build(
+            "d1", "2026-10-21T10:00:00Z", start="2026-10-21T10:00:01Z", finish="2026-10-21T10:09:00Z", commit=COMMIT
+        )
+        newer = _build(
+            "d2", "2026-10-21T10:01:00Z", start="2026-10-21T10:01:01Z", finish="2026-10-21T10:08:00Z", commit=COMMIT
+        )
+        api = mock.Mock()
+        api.commit_builds.return_value = [older, newer]
+        api.trigger_builds_around.return_value = []
+        turn = guard.Guard(api=api, build_id="p1", commit=COMMIT)
+        own = _build("p1", "2026-10-21T10:10:00Z", commit=COMMIT)
+        with self.assertRaises(guard.GuardError):
+            turn.wait_for_dev(own, ("demo-dev",), 1, "main")
+        self.assertEqual(turn.wait_for_dev(own, ("demo-dev",), 1, "main", allow_overlap=True).id, "d2")
+
+
+# --------------------------------------------------------------------------- control by version, environmental signals
+
+VERSIONED_ERRORS = "sum:errors{x} by {resource_name,version}.as_count()"
+VERSIONED_HITS = "sum:hits{x} by {resource_name,version}.as_count()"
+
+
+def _versioned_service() -> rc.Service:
+    """The demo service with a versioned HTTP error rate."""
+    data = service_data()
+    data["verify"]["metrics"][0]["versioned"] = True
+    return rc.parse_service(data)
+
+
+class VersionTest(unittest.TestCase):
+    def test_versioned_query(self) -> None:
+        """version becomes the last group tag."""
+        self.assertEqual(rv.versioned_query(ERRORS), VERSIONED_ERRORS)
+        self.assertEqual(rv.versioned_query("sum:hits{x}.as_count()"), "sum:hits{x} by {version}.as_count()")
+        self.assertEqual(rv.versioned_query("sum:hits{x}"), "sum:hits{x} by {version}")
+        self.assertTrue(rv.is_release_version(COMMIT[:9], COMMIT))
+        self.assertFalse(rv.is_release_version("abc", "abcdef0"))
+        data = service_data()
+        data["verify"]["metrics"][1]["versioned"] = True
+        with self.assertRaises(rc.ConfigError):
+            rc.parse_service(data)
+
+    def _findings(self, versions: dict[str, tuple[float, float]]) -> list:
+        """The judged findings when GET /b serves these (errors, hits) per version in the window."""
+        base = {ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}}
+        cand = {
+            ERRORS: {"GET /b": sum(e for e, _ in versions.values())},
+            HITS: {"GET /b": sum(n for _, n in versions.values())},
+            VERSIONED_ERRORS: {f"GET /b|{v}": e for v, (e, _) in versions.items()},
+            VERSIONED_HITS: {f"GET /b|{v}": n for v, (_, n) in versions.items()},
+        }
+        with mock.patch.object(rv, "runtime_change", return_value=(True, "src")):
+            findings = rv.judge_metrics(
+                _versioned_service(), FakeDatadog(base, cand), _record(), BASELINE, WINDOW, None
+            )
+        return [f for f in findings if f.metric == "http_error_rate"]
+
+    def test_other_versions_fail_too(self) -> None:
+        """The previous version runs as bad in the same window: environmental, no rollback."""
+        [finding] = self._findings({COMMIT[:9]: (150, 500), PREVIOUS[:9]: (150, 500)})
+        self.assertEqual(finding.status, "environmental")
+        self.assertIn("not the release", finding.limit)
+
+    def test_only_the_release_fails(self) -> None:
+        """The other versions stay at the baseline: the release's regression stands."""
+        [finding] = self._findings({COMMIT[:9]: (290, 500), PREVIOUS[:9]: (1, 500)})
+        self.assertEqual(finding.status, "exceeded")
+        self.assertIn("other versions", finding.limit)
+
+    def test_each_control_must_support_the_environmental_verdict(self) -> None:
+        """A healthy or undersampled control contradicts even a heavily sampled failing control."""
+        for other in ((1, 1000), (3, 10)):
+            with self.subTest(other=other):
+                [finding] = self._findings({COMMIT[:9]: (300, 1000), PREVIOUS[:9]: other, "c" * 9: (6000, 10000)})
+                self.assertEqual(finding.status, "exceeded")
+
+    def test_multiple_supported_controls_allow_environmental_verdict(self) -> None:
+        """Every independently sampled control and the release show the same failure."""
+        [finding] = self._findings({COMMIT[:9]: (300, 1000), PREVIOUS[:9]: (300, 1000), "c" * 9: (400, 1000)})
+        self.assertEqual(finding.status, "environmental")
+
+    def test_unjudged_release_is_no_control(self) -> None:
+        """An earlier unjudged release judged with this one counts as the release, never as a control."""
+        base = {ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}}
+        cand = {
+            ERRORS: {"GET /b": 300},
+            HITS: {"GET /b": 1000},
+            VERSIONED_ERRORS: {f"GET /b|{COMMIT[:9]}": 150, f"GET /b|{PREVIOUS[:9]}": 150},
+            VERSIONED_HITS: {f"GET /b|{COMMIT[:9]}": 500, f"GET /b|{PREVIOUS[:9]}": 500},
+        }
+        with mock.patch.object(rv, "runtime_change", return_value=(True, "src")):
+            findings = rv.judge_metrics(
+                _versioned_service(),
+                FakeDatadog(base, cand),
+                _record(),
+                BASELINE,
+                WINDOW,
+                None,
+                judged_commits=(PREVIOUS,),
+            )
+        [finding] = [f for f in findings if f.metric == "http_error_rate"]
+        self.assertEqual(finding.status, "exceeded")
+        self.assertIn("no other version served", finding.limit)
+
+    def test_healthy_earlier_release_hides_nothing(self) -> None:
+        """A healthy earlier unjudged version does not dilute the newest one: each is judged on its own."""
+        base = {ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}}
+        older = "c" * 40
+        versions = {COMMIT[:9]: (150, 500), PREVIOUS[:9]: (5, 500), older[:9]: (50, 500)}
+        cand = {
+            ERRORS: {"GET /b": 205},
+            HITS: {"GET /b": 1500},
+            VERSIONED_ERRORS: {f"GET /b|{v}": e for v, (e, _) in versions.items()},
+            VERSIONED_HITS: {f"GET /b|{v}": n for v, (_, n) in versions.items()},
+        }
+        with mock.patch.object(rv, "runtime_change", return_value=(True, "src")):
+            findings = rv.judge_metrics(
+                _versioned_service(),
+                FakeDatadog(base, cand),
+                _record(),
+                BASELINE,
+                WINDOW,
+                None,
+                judged_commits=(PREVIOUS,),
+            )
+        [finding] = [f for f in findings if f.metric == "http_error_rate"]
+        self.assertEqual(finding.status, "exceeded")
+
+    def test_no_other_version(self) -> None:
+        """No other version served: the plain limit decides."""
+        [finding] = self._findings({COMMIT[:9]: (300, 1000)})
+        self.assertEqual(finding.status, "exceeded")
+        self.assertIn("no other version served", finding.limit)
+
+    def test_an_unjudged_earlier_version_cannot_clear_the_regression(self) -> None:
+        """Insufficient samples are not positive evidence that an earlier release was healthy."""
+        older = "c" * 40
+        versions = {COMMIT[:9]: (50, 1000), PREVIOUS[:9]: (10, 10), older[:9]: (50, 1000)}
+        cand = {
+            ERRORS: {"GET /b": 110},
+            HITS: {"GET /b": 2010},
+            VERSIONED_ERRORS: {f"GET /b|{v}": e for v, (e, _) in versions.items()},
+            VERSIONED_HITS: {f"GET /b|{v}": n for v, (_, n) in versions.items()},
+        }
+        with mock.patch.object(rv, "runtime_change", return_value=(True, "src")):
+            findings = rv.judge_metrics(
+                _versioned_service(),
+                FakeDatadog({ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}}, cand),
+                _record(),
+                BASELINE,
+                WINDOW,
+                None,
+                judged_commits=(PREVIOUS,),
+            )
+        self.assertEqual([f.status for f in findings if f.metric == "http_error_rate"], ["exceeded"])
+
+    def test_manifest_comparison_must_complete(self) -> None:
+        """Missing credentials, failed reads and truncated comparisons are unknown, not clean."""
+        latest, target = _record(), {"commit": PREVIOUS, "images": {"app": f"{REPO}@{OLD}"}}
+        for commit, known in (("unknown", False), ("abc", False), (COMMIT, True)):
+            with self.subTest(commit=commit):
+                self.assertEqual(
+                    rb.build_plan(
+                        SERVICE, {**latest, "commit": commit}, {**target, "commit": commit}, {}, None
+                    ).settings_compared,
+                    known,
+                )
+        self.assertFalse(rb.build_plan(SERVICE, latest, target, {}, None).settings_compared)
+        with mock.patch.object(rr, "github_json", side_effect=guard.GuardError("unavailable")):
+            self.assertFalse(rb.build_plan(SERVICE, latest, target, {}, "token").settings_compared)
+        for payload, expected in (
+            ({"files": []}, True),
+            ({}, False),
+            ({"files": [{"filename": "src/x.py"}] * 300}, False),
+        ):
+            with mock.patch.object(rr, "github_json", return_value=payload):
+                self.assertEqual(rb.build_plan(SERVICE, latest, target, {}, "token").settings_compared, expected)
+
+    def test_unknown_retained_settings_keep_the_hold(self) -> None:
+        """An older rollback record without positive comparison evidence cannot clear a release."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            rr.update_record(
+                store, "20261021T110000Z-bbbbbbbbb", lambda current: current.update(rollback={}), "test", {}
+            )
+            outcome = rv.watch_rollback(
+                SERVICE, store, FakeDatadog({}, {}), record, sleep=lambda _: None, prod_busy=lambda: []
+            )
+            self.assertIn("did not verify", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
+
+    def test_marked_and_recovered(self) -> None:
+        """A marked signal is a quiet warning; back within its old limit, it is recovered."""
+        metric = SERVICE.metrics[0]
+        marks = {
+            "http_error_rate demo GET /b": {
+                "baseline": 0.001,
+                "baseline_samples": 1000,
+                "since": "2026-10-21T09:00:00Z",
+                "rollback_id": "rb",
+            }
+        }
+        failing = rv.judge(metric, "demo GET /b", (0.001, 1000), (0.3, 1000))
+        rv.apply_environmental([failing], marks)
+        self.assertEqual(failing.status, "environmental_marked")
+        self.assertEqual(rv.recovered_signals(SERVICE, [failing], marks), [])
+        back = rv.judge(metric, "demo GET /b", (0.001, 1000), (0.001, 1000))
+        self.assertEqual(rv.recovered_signals(SERVICE, [back], marks), ["http_error_rate demo GET /b"])
+
+    def _rolled_back(self, store: rr.LocalStore) -> dict:
+        """A failed release on GET /b, rolled back by a rollback record that is now latest."""
+        regression = {
+            "kind": "metric",
+            "metric": "http_error_rate",
+            "scope": "demo GET /b",
+            "baseline": 0.001,
+            "baseline_samples": 1000,
+        }
+        record = _record(
+            verdict={"status": "failed", "phase": "window_15m"},
+            checks={"window_15m": {"regressions": [regression]}},
+            rolled_back_by="20261021T110000Z-bbbbbbbbb",
+        )
+        _save(store, record)
+        rollback = _record(
+            release_id="20261021T110000Z-bbbbbbbbb",
+            kind="rollback",
+            commit=PREVIOUS,
+            times={"deploy_started": "2026-10-21T10:58:00Z", "deploy_finished": "2026-10-21T11:00:00Z"},
+            promote_hold={"status": "holding", "prs": [12]},
+            rollback={"settings_compared": True, "not_rolled_back": []},
+        )
+        _save(store, rollback)
+        return record
+
+    def test_rollback_that_does_not_help(self) -> None:
+        """After the rollback the target fails the same limit: the signal is marked and the hold ends."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                dd,  # type: ignore[arg-type]
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+                prod_busy=lambda: [],
+            )
+            self.assertEqual(outcome, "environmental: http_error_rate demo GET /b")
+            marks = rv.environmental_signals(store)
+            self.assertEqual(list(marks), ["http_error_rate demo GET /b"])
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["cause"], "environmental")
+            hold = rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]
+            self.assertEqual(hold["status"], "released")
+            self.assertIn("did not help", slack.call_args_list[-1].args[0])
+            self.assertTrue(
+                json.loads((Path(tmp) / rv.ENVIRONMENTAL_OBJECT).read_text())["signals"]["http_error_rate demo GET /b"][
+                    "alerted"
+                ]
+            )
+
+    def test_rollback_that_left_settings(self) -> None:
+        """A rollback that left deployment changes in place proves nothing: no mark."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            rr.update_record(
+                store,
+                "20261021T110000Z-bbbbbbbbb",
+                lambda current: current.update(rollback={"not_rolled_back": ["k8/prod/deployment.yaml"]}),
+                "test",
+                {},
+            )
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
+            outcome = rv.watch_rollback(SERVICE, store, dd, record, sleep=lambda _: None, prod_busy=lambda: [])  # type: ignore[arg-type]
+            self.assertIn("left changes in place", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+
+    def test_mixed_failure_keeps_the_cause(self) -> None:
+        """One signal still fails, another regression recovered: marks, but no release-wide cause, hold stays."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            store = _store(tmp)
+            record = self._rolled_back(store)
+
+            def two(current: dict) -> None:
+                """Add a failed smoke check to the failed checkpoint."""
+                current["checks"]["window_15m"]["regressions"].append({"kind": "check", "name": "health"})
+
+            rr.update_record(store, record["release_id"], two, "test", {})
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
+            rv.watch_rollback(
+                SERVICE,
+                store,
+                dd,  # type: ignore[arg-type]
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+                prod_busy=lambda: [],
+            )
+            verdict = rr.read_record(store, record["release_id"])["verdict"]
+            self.assertNotIn("cause", verdict)
+            self.assertEqual(verdict["environmental_signals"], ["http_error_rate demo GET /b"])
+            self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
+            self.assertIn("keep the promote hold", slack.call_args_list[-1].args[0])
+
+    def test_rollback_check_skips_spread_and_busy_prod(self) -> None:
+        """A spread metric is not judged again, and nothing is judged while a build changes prod."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
+            when = lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC)  # noqa: E731
+            busy = rv.watch_rollback(
+                SERVICE,
+                store,
+                dd,
+                record,
+                sleep=lambda _: None,
+                now=when,
+                prod_busy=lambda: ["deploy build d1"],  # type: ignore[arg-type]
+            )
+            self.assertEqual(busy, "not judged: deploy build d1 changes prod")
+
+            def spread_only(current: dict) -> None:
+                """The checkpoint failed on the p95 only."""
+                current["checks"]["window_15m"]["regressions"] = [
+                    {
+                        "kind": "metric",
+                        "metric": "http_p95_seconds",
+                        "scope": "demo",
+                        "baseline": 1.0,
+                        "baseline_samples": 1000,
+                    }
+                ]
+
+            rr.update_record(store, record["release_id"], spread_only, "test", {})
+            outcome = rv.watch_rollback(
+                SERVICE, store, dd, record, sleep=lambda _: None, now=when, prod_busy=lambda: []
+            )  # type: ignore[arg-type]
+            self.assertEqual(outcome, "no metric without the spread rule regressed")
+            self.assertEqual(rv.environmental_signals(store), {})
+
+    def test_missing_rollback_samples_are_inconclusive(self) -> None:
+        """Missing version-tagged traffic proves no recovery and never releases the hold."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {}),
+                record,
+                sleep=lambda _: None,
+                prod_busy=lambda: [],
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("not enough samples", outcome)
+            self.assertNotIn("helped", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+
+    def test_ended_deploy_in_observation_keeps_the_hold(self) -> None:
+        """A cancelled deploy can contaminate the window without finishing a release record."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True),
+            mock.patch.object(rr, "lock_holder", return_value=None),
+            mock.patch.object(rv, "GoogleApi") as api,
+        ):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            cancelled = guard.Build.from_api(
+                {
+                    "id": "cancelled-fix",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T10:00:00Z",
+                    "finishTime": "2026-10-21T11:10:00Z",
+                    "steps": [{"id": "release-record-begin", "status": "SUCCESS"}],
+                }
+            )
+            api.return_value.list_builds.side_effect = [[cancelled], []]
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}}),
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("cancelled-fix", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+            query = api.return_value.list_builds.call_args_list[0].args[0]
+            self.assertIn("finish_time>=", query)
+            self.assertIn("2026-10-21T11:00:00.000000Z", query)
+
+    def test_cancelled_deploy_appearing_after_metric_reads_blocks_marks(self) -> None:
+        """A build that starts and ends between the two history reads still contaminates the evidence."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True),
+            mock.patch.object(rr, "lock_holder", return_value=None),
+            mock.patch.object(rv, "GoogleApi") as api,
+        ):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            cancelled = guard.Build.from_api(
+                {
+                    "id": "late-fix",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T11:10:00Z",
+                    "finishTime": "2026-10-21T11:15:00Z",
+                    "steps": [{"id": "release-record-begin", "status": "SUCCESS"}],
+                }
+            )
+            api.return_value.list_builds.side_effect = [[], [], [cancelled], []]
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}}),
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+            )
+            self.assertIn("late-fix", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertEqual(rr.read_record(store, record["rolled_back_by"])["promote_hold"]["status"], "holding")
+
+    def test_other_ended_rollback_contaminates_but_dry_run_does_not(self) -> None:
+        """All other actual rollback builds count, regardless of terminal status."""
+        real = guard.Build.from_api(
+            {
+                "id": "other",
+                "status": "FAILURE",
+                "createTime": "2026-10-21T11:01:00Z",
+                "substitutions": {"_DRY_RUN": "false"},
+            }
+        )
+        dry = guard.Build.from_api(
+            {
+                "id": "dry",
+                "status": "SUCCESS",
+                "createTime": "2026-10-21T11:01:00Z",
+                "substitutions": {"_DRY_RUN": "true"},
+            }
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[], [real, dry]]
+            changing = rv.builds_since_rollback(
+                SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}, "build": {"id": "own"}}
+            )
+            self.assertEqual(len(changing), 1)
+            self.assertIn("other", changing[0])
+
+    def test_build_history_ignores_pre_gate_cancel_and_own_rollback(self) -> None:
+        """A cancelled build that never reached mutation and this rollback do not contaminate the window."""
+        pending = guard.Build.from_api(
+            {
+                "id": "before-gate",
+                "status": "CANCELLED",
+                "createTime": "2026-10-21T11:01:00Z",
+                "steps": [{"id": "release-record-begin", "status": "QUEUED"}],
+            }
+        )
+        own = guard.Build.from_api(
+            {
+                "id": "rb",
+                "status": "SUCCESS",
+                "createTime": "2026-10-21T10:58:00Z",
+                "substitutions": {"_DRY_RUN": "false"},
+            }
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[pending], [own]]
+            self.assertEqual(
+                rv.builds_since_rollback(
+                    SERVICE,
+                    {
+                        "times": {"deploy_finished": "2026-10-21T11:00:00Z"},
+                        "build": {"id": "rb"},
+                    },
+                ),
+                [],
+            )
+
+    def test_active_unknown_marker_waits_before_mutation_but_terminal_unknown_is_conservative(
+        self,
+    ):
+        for marker in ("", "STATUS_UNKNOWN"):
+            active = guard.Build.from_api(
+                {
+                    "id": "building",
+                    "status": "WORKING",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [{"id": "release-record-begin", "status": marker}],
+                }
+            )
+            terminal = guard.Build.from_api(
+                {
+                    "id": "ended",
+                    "status": "CANCELLED",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [{"id": "release-record-begin", "status": marker}],
+                }
+            )
+            started = guard.Build.from_api(
+                {
+                    "id": "started",
+                    "status": "WORKING",
+                    "createTime": "2026-10-21T11:01:00Z",
+                    "steps": [
+                        {
+                            "id": "release-record-begin",
+                            "status": marker,
+                            "timing": {"startTime": "2026-10-21T11:02:00Z"},
+                        }
+                    ],
+                }
+            )
+            self.assertTrue(started.changing_cluster)
+            with mock.patch.object(rv, "GoogleApi") as api:
+                api.return_value.list_builds.side_effect = [
+                    [active, terminal, started],
+                    [],
+                ]
+                observed = rv.builds_since_rollback(SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}})
+            self.assertEqual(len(observed), 2)
+            self.assertIn("ended", observed[0])
+
+    def test_confirmed_skipped_history_does_not_contaminate_the_window(self):
+        skipped = guard.Build(
+            id="noop",
+            status="SUCCESS",
+            create_time="2026-10-21T11:01:00Z",
+            commit=COMMIT,
+            trigger_name="prod",
+            step_status=(("release-record-begin", "SUCCESS"),),
+            step_outputs=('{"release_deploy":"skipped_before_mutation"}',),
+        )
+        with mock.patch.object(rv, "GoogleApi") as api:
+            api.return_value.list_builds.side_effect = [[skipped], []]
+            self.assertEqual(
+                rv.builds_since_rollback(SERVICE, {"times": {"deploy_finished": "2026-10-21T11:00:00Z"}}),
+                [],
+            )
+
+    def test_one_off_window_persists_signal_recovery(self) -> None:
+        """The manual checkpoint re-enables rollback before a recovered signal can fail again."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            key = "http_error_rate demo GET /b"
+            store.write(rv.ENVIRONMENTAL_OBJECT, {"signals": {key: {"status": "active"}}}, 0)
+            saved = {**record, "verdict": {"status": "passed"}}
+            result = {"result": "passed", "recovered_signals": [key]}
+            args = argparse.Namespace(
+                phase="window",
+                no_metrics=True,
+                wait_rollouts_seconds=0,
+                release_id=record["release_id"],
+                failed_marker="",
+                force_fail="",
+                final=False,
+            )
+            with (
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "_now", return_value=datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC)),
+                mock.patch.object(rv, "evaluate", return_value=result),
+                mock.patch.object(rv, "apply_result", return_value=saved),
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rv, "slack_line", return_value="ok"),
+                mock.patch.object(rv, "prod_state", return_value=(None, None)),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+            ):
+                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_OK)
+            marks, _ = store.read(rv.ENVIRONMENTAL_OBJECT)
+            self.assertEqual(marks["signals"][key]["status"], "recovered")
+            failing = rv.judge(SERVICE.metrics[0], "demo GET /b", (0.001, 1000), (0.3, 1000))
+            rv.apply_environmental([failing], rv.environmental_signals(store))
+            self.assertEqual(failing.status, "exceeded")
+
+    def test_rollback_that_helps(self) -> None:
+        """After the rollback the target is back at the baseline: nothing is marked."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True):
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}})
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                dd,  # type: ignore[arg-type]
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+                prod_busy=lambda: [],
+            )
+            self.assertTrue(outcome.startswith("the rollback helped"))
+            self.assertEqual(rv.environmental_signals(store), {})
+
+    def test_a_deploy_started_during_the_rollback_metric_reads(self) -> None:
+        """A fix deploy contaminates the evidence even while latest still names the rollback."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            store = _store(tmp)
+            record = self._rolled_back(store)
+            dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
+            replies = iter([[], ["deploy build fix"]])
+            outcome = rv.watch_rollback(
+                SERVICE,
+                store,
+                dd,
+                record,
+                sleep=lambda _: None,
+                now=lambda: datetime(2026, 10, 21, 11, 20, tzinfo=rr.UTC),
+                prod_busy=lambda: next(replies),
+            )
+            self.assertIn("deploy build fix changes prod", outcome)
+            self.assertEqual(rv.environmental_signals(store), {})
+            self.assertNotIn("cause", rr.read_record(store, record["release_id"])["verdict"])
+            self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
+            slack.assert_not_called()
 
 
 if __name__ == "__main__":

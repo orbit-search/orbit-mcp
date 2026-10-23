@@ -241,6 +241,19 @@ def _pod_summary(pods: list[dict], container: str) -> dict:
             if reason in BAD_WAITING_REASONS:
                 bad.append(f"{pod['metadata']['name']}: {reason}")
     return {
+        "pod_observations": [
+            {
+                "name": pod["metadata"]["name"],
+                "created_at": pod["metadata"].get("creationTimestamp"),
+                "phase": (pod.get("status") or {}).get("phase"),
+                "reason": (pod.get("status") or {}).get("reason"),
+                "conditions": [
+                    {key: condition.get(key) for key in ("type", "status", "reason", "lastTransitionTime")}
+                    for condition in (pod.get("status") or {}).get("conditions") or []
+                ],
+            }
+            for pod in pods[:100]
+        ],
         "live_pods": live,
         "ready_pods": ready,
         "running_digests": sorted(digests),
@@ -260,16 +273,24 @@ def live_pods(clients: Clients, deployment: rc.Deployment) -> list[dict]:
     ]
 
 
-def snapshot_workloads(clients: Clients) -> dict[str, dict]:
+def snapshot_workloads(clients: Clients, *, missing_ok: bool = False, resolve_tags: bool = True) -> dict[str, dict]:
     """Read the image of every Deployment that the deploy build moves to the release image.
 
     Keys: deployment/<name>. "image" is the template reference and "digest"
     the digest that the Deployment is set to (the template digest, or for a
-    tag-only template the one digest its live pods run).
+    tag-only template the one digest its live pods run). missing_ok: a
+    Deployment that does not exist yet (the first deploy of a new environment)
+    is left out instead of failing.
     """
     workloads: dict[str, dict] = {}
     for item in clients.env.deployments:
-        deployment = clients.kubectl_json("get", "deployment", item.name)
+        try:
+            deployment = clients.kubectl_json("get", "deployment", item.name)
+        except RecordError as error:
+            if missing_ok and "NotFound" in str(error):
+                print(f"deployment/{item.name} does not exist yet (first deploy)", flush=True)
+                continue
+            raise
         pods = clients.kubectl_json("get", "pods", "-l", item.selector)["items"]
         replica_sets = clients.kubectl_json("get", "replicasets", "-l", item.selector)["items"]
         container = _container(deployment["spec"]["template"]["spec"], item.container)
@@ -280,7 +301,7 @@ def snapshot_workloads(clients: Clients) -> dict[str, dict]:
         digest = digest_of(container["image"])
         if digest is None and len(summary["running_digests"]) == 1:
             digest = summary["running_digests"][0]
-        if digest is None:
+        if digest is None and resolve_tags:
             digest = tag_digest(clients.env, container["image"])
         workloads[f"deployment/{item.name}"] = {
             "kind": "deployment",
@@ -771,7 +792,8 @@ def _read_text(path: str | None) -> str | None:
 def cmd_begin(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
     """Before the first change to the cluster: snapshot what runs now and write a "deploying" record."""
     started_at = utc_now()
-    before = snapshot_workloads(clients)
+    # The first deploy of a new environment creates its Deployments: before it, nothing runs.
+    before = snapshot_workloads(clients, missing_ok=True)
     previous = previous_release(store, env, before)
     image = _read_text(args.image_file)
     if not digest_of(image):
@@ -822,6 +844,12 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
         release_lock(store, (saved.get("build") or {}).get("id"))
     except (RecordError, GuardError, OSError) as error:
         print(f"WARNING: could not free the prod lock; it ends with this build: {error}", file=sys.stderr, flush=True)
+    return 0
+
+
+def cmd_unlock(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
+    """Release only this build's prod lock after a skipped or unrecorded deployment path ends."""
+    release_lock(store, args.build_id)
     return 0
 
 
@@ -984,6 +1012,10 @@ def main(argv: list[str] | None = None) -> int:
     finish.add_argument("--release-id")
     finish.add_argument("--status", required=True, choices=["deployed", "deploy_failed"])
 
+    unlock = commands.add_parser("unlock", help="free the prod lock only if this build holds it")
+    add_common_args(unlock)
+    unlock.add_argument("--build-id", required=True)
+
     show = commands.add_parser("show", help="print a record")
     add_common_args(show)
     show.add_argument("release_id", nargs="?", default="latest")
@@ -994,7 +1026,13 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument("--previous-build-id")
 
     args = parser.parse_args(argv)
-    handlers = {"begin": cmd_begin, "finish": cmd_finish, "show": cmd_show, "backfill": cmd_backfill}
+    handlers = {
+        "begin": cmd_begin,
+        "finish": cmd_finish,
+        "unlock": cmd_unlock,
+        "show": cmd_show,
+        "backfill": cmd_backfill,
+    }
     try:
         _, env, store, clients = open_from_args(args)
         return handlers[args.command](args, env, store, clients)
