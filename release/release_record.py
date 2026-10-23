@@ -1026,7 +1026,13 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument("--previous-build-id")
 
     args = parser.parse_args(argv)
-    handlers = {"begin": cmd_begin, "finish": cmd_finish, "unlock": cmd_unlock, "show": cmd_show, "backfill": cmd_backfill}
+    handlers = {
+        "begin": cmd_begin,
+        "finish": cmd_finish,
+        "unlock": cmd_unlock,
+        "show": cmd_show,
+        "backfill": cmd_backfill,
+    }
     try:
         _, env, store, clients = open_from_args(args)
         return handlers[args.command](args, env, store, clients)
