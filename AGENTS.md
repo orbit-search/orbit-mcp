@@ -18,16 +18,53 @@ gates below.
 
 ### Setup (once per machine)
 
-1. `gh auth status` shows your own GitHub login, and `git config user.name`
-   is your real name. Commits, pushes and PRs are always yours.
-2. `infisical login` (the shared Orbit project). The bot's key lives in
-   Infisical prod `/orbit-agent`; you never need to read it.
-3. Install the wrapper from a checkout of `orbit-search/orbit-infrastructure`:
-   `mkdir -p ~/.local/bin && ln -sf "$PWD/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
-   Make sure `~/.local/bin` is on your `PATH`, then check `orbit-agent-gh whoami`.
-4. Connect Slack, so your agent can send approval requests itself: in
-   Claude, add the Slack connector (claude.ai Settings > Connectors); in Codex,
-   add a Slack MCP server to `~/.codex/config.toml`.
+Your human does two things once, both in a browser. Your agent does the rest.
+
+**Your human:**
+
+1. `infisical login` (the shared Orbit project). The bot's key lives in
+   Infisical prod `/orbit-agent`; nobody reads it. The wrapper mints a
+   one-hour token from it.
+2. Connect Slack, so the agent can DM owners for approvals itself. Every tool
+   uses Slack's MCP server (`https://mcp.slack.com/mcp`) and the person's own
+   Slack login (OAuth). If Slack asks for approval, ask a Slack workspace
+   admin to approve the app.
+   - Claude app: sidebar > **Customize** > **Connectors** > **+** > **Slack**,
+     then sign in. Claude Code sessions in the app use it too.
+   - Claude Code CLI: `/plugin install slack` in a session (or
+     `claude plugin install slack`), then sign in.
+   - Codex app: **Settings** > **MCP servers** > **Add server**, name `slack`,
+     **Streamable HTTP**, URL `https://mcp.slack.com/mcp`. **Save**,
+     **Restart**, then **Authenticate**.
+   - Codex CLI: add this to `~/.codex/config.toml`, then run
+     `codex mcp login slack`. The CLI, the app and the IDE extension share
+     this file.
+
+     ```toml
+     [mcp_servers.slack]
+     url = "https://mcp.slack.com/mcp"
+     auth = "oauth"
+
+     [mcp_servers.slack.oauth]
+     client_id = "<client ID of Orbit's Slack app>"
+     ```
+
+   Codex (app and CLI) needs the `[mcp_servers.slack.oauth]` client ID:
+   Slack's server accepts only a registered Slack app, not Codex's automatic
+   client registration. A Slack workspace admin gives you the client ID of
+   Orbit's Slack app, and its secret if it has one (then run
+   `codex mcp add slack --url https://mcp.slack.com/mcp --oauth-client-id <id> --oauth-client-secret <secret>`
+   instead of editing the file).
+
+**Your agent**, itself, never asking its human:
+
+3. When `orbit-agent-gh` is missing, install the wrapper from a checkout of
+   `orbit-search/orbit-infrastructure` (clone it first if there is none):
+   `mkdir -p ~/.local/bin && ln -sf "<orbit-infrastructure checkout>/scripts/orbit-agent-gh" ~/.local/bin/orbit-agent-gh`.
+   Make sure `~/.local/bin` is on `PATH`, then check `orbit-agent-gh whoami`.
+4. When `orbit-agent-gh` cannot mint a token because the Infisical login is
+   missing or expired, ask the human for `infisical login` (a browser login),
+   and only that.
 
 ### Rules
 
@@ -64,6 +101,13 @@ gates below.
   `agent-policy` passes. Rollbacks are started by a human: a release that
   fails its release check posts an alert with the rollback command
   (`docs/RELEASE_PIPELINE.md`).
+- **When to ask your human.** Finish on your own when you can verify the goal
+  yourself: bug fixes, backend features, optimizations, infra and CI changes
+  get a goal you can check (tests, a replay, a metric), and they merge when
+  every check passes. Ask one short question only at a gate (UI ready, taste,
+  billing, an API contract, migrations, spend, owner clearance), when your
+  human said to wait, or when no check can tell you the task is done. Never
+  ask "may I merge?" on a change that passed every check.
 - **Do not ask your human before merging.** A PR that passes every check
   merges; the merge bot does it on the server, and you may merge it yourself
   too. The bot (`agent-merge-sweep` in orbit-infrastructure, every 5 minutes,
