@@ -550,6 +550,18 @@ class RollbackTest(unittest.TestCase):
 
 
 class LockTest(unittest.TestCase):
+    def test_unlock_cli_is_idempotent_and_preserves_other_builds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            with mock.patch.object(rr, "open_from_args", return_value=(SERVICE, SERVICE.prod, store, mock.Mock())):
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "own"]), 0)
+                rr.acquire_lock(store, "other", "deploy", lambda _: True, wait_seconds=1)
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "own"]), 0)
+                self.assertEqual(store.read(rr.LOCK_OBJECT)[0]["holder"], "other")
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "other"]), 0)
+                self.assertEqual(rr.main(["unlock", "--env", "prod", "--build-id", "other"]), 0)
+                self.assertFalse(store.read(rr.LOCK_OBJECT)[0]["holder"])
+
     """One build at a time changes prod: deploys from the gate to `finish`, rollbacks during apply."""
 
     def test_acquire_wait_take_over_release(self) -> None:

@@ -892,7 +892,9 @@ class Check:
 MIN_AVAILABLE_SHARE = 0.8
 
 
-def check_images(record: dict, snapshot: dict[str, dict], targets: dict[str, str] | None = None) -> Check:
+def check_images(
+    record: dict, snapshot: dict[str, dict], targets: dict[str, str] | None = None, *, window: bool = False
+) -> Check:
     """Every Deployment runs its target digest, rollouts are complete and enough pods are available.
 
     The target is the release image, or, when targets is given (a rollback to
@@ -900,11 +902,14 @@ def check_images(record: dict, snapshot: dict[str, dict], targets: dict[str, str
     """
     expected = rr.digest_of((record.get("images") or {}).get(rr.IMAGE_ROLE))
     problems = []
+    uncertain = []
     for name, workload in sorted(snapshot.items()):
         if targets is not None and name not in targets:
             continue
         want = targets[name] if targets is not None else expected
-        if workload.get("digest") != want:
+        if window and not workload.get("digest"):
+            uncertain.append(f"{name}: image digest unresolved; no running pod proves the image is wrong")
+        elif workload.get("digest") != want:
             problems.append(f"{name}: set to {workload.get('digest') or workload.get('image')}, release is {want}")
             continue
         if not workload["rollout_current"] or workload["updated_replicas"] < workload["replicas"]:
@@ -923,7 +928,12 @@ def check_images(record: dict, snapshot: dict[str, dict], targets: dict[str, str
         ):
             problems.append(f"{name}: {workload['available_replicas']}/{replicas} replicas available")
     checked = len(snapshot) if targets is None else len([name for name in snapshot if name in targets])
-    return Check("images", "failed" if problems else "passed", [f"{checked} Deployments checked", *problems])
+    checked_result = Check("images", "failed" if problems else "passed", [f"{checked} Deployments checked", *problems])
+    if uncertain:
+        if not problems or ro.availability_only(asdict(checked_result)):
+            checked_result.status = "inconclusive"
+        checked_result.details.extend(uncertain)
+    return checked_result
 
 
 HttpGet = Callable[[urllib.request.Request], tuple[int, bytes]]
@@ -1417,7 +1427,7 @@ def evaluate(
                 fresh = rr.snapshot_workloads(replace(clients, runner=bounded), resolve_tags=False)
             except (rr.RecordError, GuardError) as error:
                 raise RuntimeError(str(error)) from error
-            return asdict(check_images(record, fresh)), fresh
+            return asdict(check_images(record, fresh, window=True)), fresh
 
         checked, availability = ro.confirm_images(read_fresh, state=observation_state or (lambda: (None, None)))
         checks = [Check(**checked) if check.name == "images" else check for check in checks]

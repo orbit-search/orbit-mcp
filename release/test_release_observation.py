@@ -201,3 +201,33 @@ class ObservationTest(unittest.TestCase):
             restored["followup"]["checkpoints"]["window_75m"]["due_at"],
             "2026-10-23T21:15:00Z",
         )
+
+
+class WindowDigestTest(unittest.TestCase):
+    def test_unresolved_tag_digest_is_uncertain_but_confirmed_failures_still_fail(self):
+        import release_verify as rv
+        from dataclasses import asdict
+
+        digest = "sha256:" + "1" * 64
+        images = {role: "registry/app@" + digest for role in ("app", "api", "face")}
+        workload = dict(
+            kind="deployment",
+            role="app",
+            digest=None,
+            image="registry/app:prod",
+            rollout_current=True,
+            replicas=2,
+            updated_replicas=2,
+            available_replicas=0,
+            running_digests=[],
+            bad_pods=[],
+        )
+        snapshot = {"deployment/test": workload}
+        check = rv.check_images({"images": images}, snapshot, window=True)
+        self.assertEqual(check.status, "inconclusive")
+        confirmed, evidence = ro.confirm_images(lambda deadline: (asdict(check), snapshot), budget=0)
+        self.assertEqual((confirmed["status"], evidence["status"]), ("inconclusive", "unconfirmed"))
+        workload["bad_pods"] = ["pod: CrashLoopBackOff"]
+        self.assertEqual(rv.check_images({"images": images}, snapshot, window=True).status, "failed")
+        workload.update(bad_pods=[], digest="sha256:" + "2" * 64)
+        self.assertEqual(rv.check_images({"images": images}, snapshot, window=True).status, "failed")

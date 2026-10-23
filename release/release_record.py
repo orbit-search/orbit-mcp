@@ -847,6 +847,12 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     return 0
 
 
+def cmd_unlock(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
+    """Release only this build's prod lock after a skipped or unrecorded deployment path ends."""
+    release_lock(store, args.build_id)
+    return 0
+
+
 def cmd_show(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
     """Print a release record as JSON."""
     print(json.dumps(read_record(store, args.release_id), indent=2, sort_keys=True))
@@ -1006,6 +1012,10 @@ def main(argv: list[str] | None = None) -> int:
     finish.add_argument("--release-id")
     finish.add_argument("--status", required=True, choices=["deployed", "deploy_failed"])
 
+    unlock = commands.add_parser("unlock", help="free the prod lock only if this build holds it")
+    add_common_args(unlock)
+    unlock.add_argument("--build-id", required=True)
+
     show = commands.add_parser("show", help="print a record")
     add_common_args(show)
     show.add_argument("release_id", nargs="?", default="latest")
@@ -1016,7 +1026,7 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument("--previous-build-id")
 
     args = parser.parse_args(argv)
-    handlers = {"begin": cmd_begin, "finish": cmd_finish, "show": cmd_show, "backfill": cmd_backfill}
+    handlers = {"begin": cmd_begin, "finish": cmd_finish, "unlock": cmd_unlock, "show": cmd_show, "backfill": cmd_backfill}
     try:
         _, env, store, clients = open_from_args(args)
         return handlers[args.command](args, env, store, clients)
