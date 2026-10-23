@@ -43,6 +43,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -161,7 +162,9 @@ def build_plan(service: rc.Service, latest: dict, target: dict, live: dict[str, 
         steps.append(Step(key, item.name, item.container, current, reference, "none" if current == digest else "set"))
     notes = []
     not_rolled_back: list[str] = []
-    settings_compared = bool(target.get("commit") and target["commit"] == latest.get("commit"))
+    settings_compared = bool(
+        re.fullmatch(r"[0-9a-f]{40}", str(target.get("commit") or "")) and target["commit"] == latest.get("commit")
+    )
     if target.get("commit") and latest.get("commit") and token and target["commit"] != latest["commit"]:
         try:
             payload = rr.github_json(f"repos/{env.github_repo}/compare/{target['commit']}...{latest['commit']}", token)

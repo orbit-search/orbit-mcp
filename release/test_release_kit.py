@@ -3486,6 +3486,14 @@ class VersionTest(unittest.TestCase):
     def test_manifest_comparison_must_complete(self) -> None:
         """Missing credentials, failed reads and truncated comparisons are unknown, not clean."""
         latest, target = _record(), {"commit": PREVIOUS, "images": {"app": f"{REPO}@{OLD}"}}
+        for commit, known in (("unknown", False), ("abc", False), (COMMIT, True)):
+            with self.subTest(commit=commit):
+                self.assertEqual(
+                    rb.build_plan(
+                        SERVICE, {**latest, "commit": commit}, {**target, "commit": commit}, {}, None
+                    ).settings_compared,
+                    known,
+                )
         self.assertFalse(rb.build_plan(SERVICE, latest, target, {}, None).settings_compared)
         with mock.patch.object(rr, "github_json", side_effect=guard.GuardError("unavailable")):
             self.assertFalse(rb.build_plan(SERVICE, latest, target, {}, "token").settings_compared)
