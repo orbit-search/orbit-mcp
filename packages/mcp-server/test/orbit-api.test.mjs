@@ -167,7 +167,44 @@ test("a population start without a request id makes one, and a size left out is 
   assert.equal(body.profile_depth, "partial");
 });
 
-test("phone and address signals always disable candidate discovery", async () => {
+test("a quick phone search keeps discovery on and sends the owner cap", async () => {
+  const calls = [];
+  const client = clientWithResponses(
+    [jsonResponse({ search_id: "search-quick", request_id: "quick-1", status: "completed", profile_depth: "quick", results: [] })],
+    calls,
+  );
+  await client.searchAndWait({
+    signals: { phone: "+14155550123" },
+    candidate_discovery: true,
+    candidate_discovery_limit: 5,
+    profile_depth: "quick",
+    request_id: "quick-1",
+  });
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.profile_depth, "quick");
+  assert.equal(body.candidate_discovery, true);
+  assert.equal(body.candidate_discovery_limit, 5);
+});
+
+test("candidate_discovery_limit is sent only with discovery on", async () => {
+  const calls = [];
+  const client = clientWithResponses(
+    [
+      jsonResponse({ search_id: "search-a", request_id: "a", status: "completed", results: [] }),
+      jsonResponse({ search_id: "search-b", request_id: "b", status: "completed", results: [] }),
+    ],
+    calls,
+  );
+  await client.searchAndWait({ request_id: "a", query: "Ada Lovelace", candidate_discovery: false, candidate_discovery_limit: 5 });
+  await client.searchAndWait({ request_id: "b", signals: { address: "1 Main St, Springfield" }, candidate_discovery: true, candidate_discovery_limit: 5 });
+  for (const call of calls) {
+    const body = JSON.parse(call.init.body);
+    assert.equal(body.candidate_discovery, false);
+    assert.equal("candidate_discovery_limit" in body, false);
+  }
+});
+
+test("phone and address signals disable candidate discovery below quick depth", async () => {
   const calls = [];
   const client = clientWithResponses(
     [jsonResponse({ search_id: "search-2", request_id: "signal-1", status: "completed", results: [] })],

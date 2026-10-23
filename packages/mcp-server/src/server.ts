@@ -76,15 +76,16 @@ export function createOrbitServer(apiKey: string): McpServer {
       inputSchema: {
         query: z.string().min(1).max(2_000).optional().describe("Plain-English people search query."),
         signals: signalsSchema.optional().describe("Exact identity signals such as email, LinkedIn URL, username, URL, address, or phone."),
-        candidate_discovery: z.boolean().default(false).describe("Allow Orbit to discover people beyond known matches. Address and phone always disable discovery."),
-        profile_depth: z.enum(["partial", "full"]).default("partial").describe("Minimum profile depth to build for selected results."),
-        limit: z.number().int().min(1).max(20).default(10).describe("Maximum results; v3 supports up to 20."),
+        candidate_discovery: z.boolean().default(false).describe("Allow Orbit to find and build people beyond known matches. Address and phone disable discovery, except with profile_depth quick: a quick search needs discovery on to build the owners of a phone, email or address; with discovery off it returns only profiles Orbit already has."),
+        candidate_discovery_limit: z.number().int().min(1).max(50).optional().describe("Most people discovery adds (Orbit default 10, maximum 50). For a quick phone, email or address search, this caps the owners returned. Sent only when discovery is on."),
+        profile_depth: z.enum(["quick", "partial", "full"]).default("partial").describe("Minimum profile depth to build for selected results: quick (level 1), partial (level 2) or full (level 3). Quick never upgrades a known profile; it builds new level 1 profiles only through candidate_discovery."),
+        limit: z.number().int().min(1).max(20).default(10).describe("Maximum known-profile results; v3 supports up to 20. People that discovery adds are capped by candidate_discovery_limit."),
         request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical search."),
       },
     },
-    async ({ query, signals, candidate_discovery, profile_depth, limit, request_id }) => {
+    async ({ query, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id }) => {
       try {
-        const result = await client.searchAndWait({ query, signals, candidate_discovery, profile_depth, limit, request_id });
+        const result = await client.searchAndWait({ query, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id });
         return toolResult(result, result.status !== "completed");
       } catch (error) {
         return toolError(error);
@@ -99,7 +100,7 @@ export function createOrbitServer(apiKey: string): McpServer {
       name: z.string().min(1).max(200).describe("The company or school name."),
     }).strict(),
     size: z.number().int().min(0).optional().describe("How many people the population has, when known."),
-    profile_depth: z.enum(["partial", "full"]).default("partial").describe("The depth every person in the population is built to. A full population costs more than a partial one."),
+    profile_depth: z.enum(["quick", "partial", "full"]).default("partial").describe("The depth every person in the population is built to. A deeper population costs more: quick costs least, full costs most."),
   };
 
   server.registerTool(
@@ -192,13 +193,13 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool(
     "enrich_profile",
     {
-      description: "Ensure an existing Orbit profile is partial or full, or regenerate a full profile. The tool waits for terminal v3 Enrich status.",
+      description: "Ensure an existing Orbit profile is quick, partial or full, or regenerate a full profile. The tool waits for terminal v3 Enrich status.",
       outputSchema: enrichOutputSchema,
       // Regeneration can replace existing context, and request_id remains optional.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
       inputSchema: {
         profile_id: z.string().min(1).max(500).describe("Canonical Orbit profile ID. Identity signals belong in search_people instead."),
-        operation: z.enum(["partial", "full", "regenerate"]).describe("Desired level-aware enrichment operation."),
+        operation: z.enum(["quick", "partial", "full", "regenerate"]).describe("Desired level-aware enrichment operation."),
         request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical enrichment."),
       },
     },

@@ -9,7 +9,7 @@ export interface OperationBilling {
   status: "open" | "settled";
 }
 
-export type ProfileDepth = "partial" | "full";
+export type ProfileDepth = "quick" | "partial" | "full";
 export type EnrichOperation = ProfileDepth | "regenerate";
 
 export interface SearchSignals {
@@ -26,6 +26,7 @@ export interface SearchInput {
   query?: string;
   signals?: SearchSignals;
   candidate_discovery?: boolean;
+  candidate_discovery_limit?: number;
   profile_depth?: ProfileDepth;
   limit?: number;
 }
