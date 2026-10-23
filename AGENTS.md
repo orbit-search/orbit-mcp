@@ -25,10 +25,12 @@ Your human does two things once, both in a browser. Your agent does the rest.
 1. `infisical login` (the shared Orbit project). The bot's key lives in
    Infisical prod `/orbit-agent`; nobody reads it. The wrapper mints a
    one-hour token from it.
-2. Connect Slack, so the agent can DM owners for approvals itself. Every tool
-   uses Slack's MCP server (`https://mcp.slack.com/mcp`) and the person's own
-   Slack login (OAuth). If Slack asks for approval, ask a Slack workspace
-   admin to approve the app.
+2. Connect Slack, so the agent can DM owners for approvals itself. Reuse a
+   working Slack connector in your tool. If one is not available, use the
+   per-tool setup below. Every tool uses Slack's MCP server (`https://mcp.slack.com/mcp`) and the person's own
+   Slack login (OAuth). Each person signs in once in their own tool, because
+   the agent sends approval DMs as that person (Slack gives each user their
+   own token).
    - Claude app: sidebar > **Customize** > **Connectors** > **+** > **Slack**,
      then sign in. Claude Code sessions in the app use it too.
    - Claude Code CLI: `/plugin install slack` in a session (or
@@ -49,12 +51,11 @@ Your human does two things once, both in a browser. Your agent does the rest.
      client_id = "<client ID of Orbit's Slack app>"
      ```
 
-   Codex (app and CLI) needs the `[mcp_servers.slack.oauth]` client ID:
+   Manual Codex MCP setup needs the `[mcp_servers.slack.oauth]` client ID:
    Slack's server accepts only a registered Slack app, not Codex's automatic
-   client registration. A Slack workspace admin gives you the client ID of
-   Orbit's Slack app, and its secret if it has one (then run
+   client registration. If Orbit's Slack app also has a client secret, run
    `codex mcp add slack --url https://mcp.slack.com/mcp --oauth-client-id <id> --oauth-client-secret <secret>`
-   instead of editing the file).
+   instead of editing the file.
 
 **Your agent**, itself, never asking its human:
 
