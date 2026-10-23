@@ -26,6 +26,7 @@ export interface SearchInput {
   query?: string;
   signals?: SearchSignals;
   candidate_discovery?: boolean;
+  candidate_discovery_limit?: number;
   profile_depth?: ProfileDepth;
   limit?: number;
 }

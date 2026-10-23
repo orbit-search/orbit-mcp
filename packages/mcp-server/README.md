@@ -194,21 +194,27 @@ Identity resolution:
 }
 ```
 
-Phone and address signals always disable candidate discovery, even if the caller requests it.
+Phone and address signals disable candidate discovery, even if the caller
+requests it, except with `profile_depth: "quick"`.
 
 `profile_depth` sets the lightest profile each result is built to: `quick`
-(level 1), `partial` (level 2) or `full` (level 3). A quick search with only a phone,
-email or address returns up to `limit` owners of that signal as level 1 profiles.
+(level 1), `partial` (level 2) or `full` (level 3). With `candidate_discovery: true`,
+a quick search with only a phone, email or address builds the owners of that signal
+as level 1 profiles, up to `candidate_discovery_limit` owners (Orbit default 10,
+maximum 50). `limit` caps only the profiles Orbit already has. With discovery off, a
+quick search returns known profiles only and builds no new owners. Quick never
+upgrades a known profile.
 
-Quick profile from a phone number:
+Quick profiles for the owners of a phone number:
 
 ```json
 {
   "signals": {
     "phone": "+14155550123"
   },
-  "profile_depth": "quick",
-  "limit": 5
+  "candidate_discovery": true,
+  "candidate_discovery_limit": 5,
+  "profile_depth": "quick"
 }
 ```
 

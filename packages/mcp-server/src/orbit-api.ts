@@ -149,12 +149,21 @@ export class OrbitV3Client {
     const signals = cleanSignals(input.signals);
     if (!query && !signals) throw new Error("search_people requires a query or at least one identity signal");
 
+    const profileDepth = input.profile_depth ?? "partial";
+    // Phone and address searches read known profiles only, except at quick depth: there discovery is
+    // the provider lookup that builds every owner of the signal as a level 1 profile.
+    const candidateDiscovery =
+      (signals?.address || signals?.phone) && profileDepth !== "quick" ? false : (input.candidate_discovery ?? false);
     const request: JsonObject = {
       request_id: input.request_id?.trim() || randomUUID(),
       ...(query ? { query } : {}),
       ...(signals ? { signals } : {}),
-      candidate_discovery: signals?.address || signals?.phone ? false : (input.candidate_discovery ?? false),
-      profile_depth: input.profile_depth ?? "partial",
+      candidate_discovery: candidateDiscovery,
+      // Orbit accepts candidate_discovery_limit only with discovery on.
+      ...(candidateDiscovery && input.candidate_discovery_limit !== undefined
+        ? { candidate_discovery_limit: input.candidate_discovery_limit }
+        : {}),
+      profile_depth: profileDepth,
       include_profile: true,
       limit: input.limit ?? 10,
     };
