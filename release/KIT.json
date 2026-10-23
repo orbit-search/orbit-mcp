@@ -11,9 +11,9 @@
     "release_record.py": "8e386a8ae3853f8a5abc4e16f8a47535eeeefde21a0a6b295a638550bd855af5",
     "release_rollback.py": "5d190947830e39c97b9adbf78e41963e7fa3dcc44ccfc23e262d3187c5f6b4d5",
     "release_signals.py": "d582e5f5ca6f5bdde98ab5e4b47ac610f0f6f44024ce672c22bac5afa5139099",
-    "release_verify.py": "d5cd701486901c3d94486f99feac0c092007c06b8bb863c3ba153a367c014ba8",
-    "test_release_kit.py": "7dd09ebffaf93995c6448ea5c5494bfc79b27ce1f9ae4c65a745b0e9b1279c90"
+    "release_verify.py": "bebb6beb9452d126060780ee1160608635b537f5ec9efdb277725e5adc7863d2",
+    "test_release_kit.py": "503e914749a8b21f0875358885c632582906413e0b97ebc30be0626124db0cc9"
   },
   "source": "orbit-search/orbit-infrastructure release-kit/release",
-  "version": "kit-5342d4310db8"
+  "version": "kit-d0bf1e2944e9"
 }

@@ -391,8 +391,8 @@ def control_by_version(
 
     The window runs from the deploy start to the checkpoint, so it holds the rollout overlap (the
     previous version's pods) and any older pod that still serves, the rollback target among them.
-    Environmental when the other versions, pooled, also exceed the limit over the baseline and the
-    release does not exceed the limit over them. With too few samples on the other versions the plain
+    Environmental only when every other version independently exceeds the limit over the baseline
+    and every judged release version stays within its limit over each control. With too few samples the plain
     limit decides. judged_commits: the commits of the earlier unjudged releases judged with this one;
     their versions count as the release, never as controls (the error may have started in them).
     """
@@ -427,15 +427,19 @@ def control_by_version(
             f"in the same window ({start:%H:%M}-{end:%H:%M} UTC) the other versions ({names}) ran "
             f"{control:.2%} (n={control_n:,.0f}), the release {rate:.2%} (n={newest_n:,.0f})"
         )
-        rise = judge(metric, finding.scope, (finding.baseline, finding.baseline_samples), (control, control_n))
-        # Each release version on its own, the newest first: pooled, a healthy earlier one could hide it.
-        versus = [judge(metric, finding.scope, (control, control_n), (rate, newest_n))]
-        versus += [
-            judge(metric, finding.scope, (control, control_n), (errors / n, n))
-            for version, (errors, n) in own.items()
-            if n and not is_release_version(version, record["commit"])
-        ]
-        if rise.status == "exceeded" and versus[0].status == "ok" and all(v.status == "ok" for v in versus):
+        # The pooled rate above is diagnostic only. Neither healthy controls nor
+        # undersampled versions may be hidden by another version's requests.
+        controls_support = all(
+            n > 0
+            and judge(metric, finding.scope, (finding.baseline, finding.baseline_samples), (errors / n, n)).status
+            == "exceeded"
+            and all(
+                own_n > 0 and judge(metric, finding.scope, (errors / n, n), (own_errors / own_n, own_n)).status == "ok"
+                for own_errors, own_n in own.values()
+            )
+            for errors, n in others.values()
+        )
+        if controls_support:
             finding.status = "environmental"
             finding.limit += f"; not the release: {same_window}"
         else:

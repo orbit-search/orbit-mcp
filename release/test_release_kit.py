@@ -3396,6 +3396,18 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(finding.status, "exceeded")
         self.assertIn("other versions", finding.limit)
 
+    def test_each_control_must_support_the_environmental_verdict(self) -> None:
+        """A healthy or undersampled control contradicts even a heavily sampled failing control."""
+        for other in ((1, 1000), (3, 10)):
+            with self.subTest(other=other):
+                [finding] = self._findings({COMMIT[:9]: (300, 1000), PREVIOUS[:9]: other, "c" * 9: (6000, 10000)})
+                self.assertEqual(finding.status, "exceeded")
+
+    def test_multiple_supported_controls_allow_environmental_verdict(self) -> None:
+        """Every independently sampled control and the release show the same failure."""
+        [finding] = self._findings({COMMIT[:9]: (300, 1000), PREVIOUS[:9]: (300, 1000), "c" * 9: (400, 1000)})
+        self.assertEqual(finding.status, "environmental")
+
     def test_unjudged_release_is_no_control(self) -> None:
         """An earlier unjudged release judged with this one counts as the release, never as a control."""
         base = {ERRORS: {"GET /b": 1}, HITS: {"GET /b": 1000}}
