@@ -65,6 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import release_capacity as rcap  # noqa: E402
 import release_config as rc  # noqa: E402
 import release_gate as rg  # noqa: E402
 import release_observation as ro  # noqa: E402
@@ -882,7 +883,7 @@ def judge_metrics(
 @dataclass
 class Check:
     name: str
-    status: str  # passed, failed, skipped
+    status: str  # passed, failed, skipped, inconclusive, environmental (capacity: not the release's)
     details: list[str] = field(default_factory=list)
 
 
@@ -1165,6 +1166,204 @@ def smoke_checks(
     return out
 
 
+# --------------------------------------------------------------------------- capacity (Rule 1) and deploy incomplete (Rule 2)
+
+# The capacity re-judge waits at least this long, also when the rollout's budget (Rule 3 timeout x2,
+# counted from the deploy start) is spent.
+CAPACITY_MIN_WAIT_SECONDS = 120
+
+
+def never_updated(record: dict, snapshot: dict[str, dict]) -> list[str]:
+    """Rule 2: after a failed deploy step, the Deployments that still run the previous release's digest."""
+    if record.get("status") != "deploy_failed" and not record.get("failed_step"):
+        return []
+    expected = rr.digest_of((record.get("images") or {}).get(rr.IMAGE_ROLE))
+    before = (record.get("previous") or {}).get("workloads") or {}
+    names = []
+    for key, workload in sorted(snapshot.items()):
+        old = (before.get(key) or {}).get("digest")
+        if old and old != expected and workload.get("digest") == old:
+            names.append(workload["name"])
+    return names
+
+
+def incomplete_line(record: dict, names: list[str]) -> str:
+    """The one Rule 2 finding: "deploy incomplete at step <id>: N workloads not updated (names)"."""
+    step = (record.get("failed_step") or {}).get("id") or "unrecorded"
+    shown = ", ".join(names[:8]) + (", ..." if len(names) > 8 else "")
+    return f"deploy incomplete at step {step}: {len(names)} workloads not updated ({shown})"
+
+
+def without_workloads(check: Check, names: list[str]) -> Check:
+    """The images check without the lines of these Deployments; passed when nothing else is wrong."""
+    if not names or not check.details:
+        return check
+    prefixes = tuple(f"deployment/{name}:" for name in names)
+    details = [line for line in check.details[1:] if not line.startswith(prefixes)]
+    status = "passed" if check.status == "failed" and not details else check.status
+    return Check(check.name, status, [check.details[0], *details])
+
+
+def rollout_names(check: Check) -> list[str]:
+    """The Deployments named by a failed rollouts check ("deployment/<name> rollout ...")."""
+    return [
+        match.group(1) for line in check.details for match in [re.match(r"deployment/(\S+) rollout", line)] if match
+    ]
+
+
+def capacity_candidates(record: dict, snapshot: dict[str, dict], checks: list[Check]) -> list[str]:
+    """Deployments on the release digest whose rollout did not finish or whose new pods are not Ready,
+    those of a failed rollouts check, and those of the recorded failed step."""
+    expected = rr.digest_of((record.get("images") or {}).get(rr.IMAGE_ROLE))
+    names = set()
+    for workload in snapshot.values():
+        if workload.get("digest") != expected:
+            continue
+        replicas = workload["replicas"]
+        if (
+            not workload["rollout_current"]
+            or workload["updated_replicas"] < replicas
+            or workload["bad_pods"]
+            or any(digest != expected for digest in workload["running_digests"])
+            or (replicas > 0 and workload["available_replicas"] < math.ceil(replicas * MIN_AVAILABLE_SHARE))
+            or workload.get("ready_pods", 0) < workload.get("live_pods", 0)
+        ):
+            names.add(workload["name"])
+    for check in checks:
+        if check.name == "rollouts" and check.status == "failed":
+            names.update(rollout_names(check))
+    names.update((record.get("failed_step") or {}).get("deployments") or [])
+    known = {f"deployment/{name}" for name in names} & set(snapshot)
+    return sorted(key.split("/", 1)[1] for key in known)
+
+
+def mark_environmental(env: rc.Environment, checks: list[Check], names: list[str]) -> list[str]:
+    """Capacity: the failed availability checks of these Deployments become "environmental"; return their names.
+
+    The rollouts and deploy checks, the pods_ready smoke checks of these Deployments, and the images
+    check when every problem in it belongs to them. Every other failed check stays failed.
+    """
+    pods_ready = {
+        str(item.get("name") or f"{item['deployment']} ready")
+        for item in env.smoke
+        if item.get("type") == "pods_ready" and item.get("deployment") in names
+    }
+    prefixes = tuple(f"deployment/{name}:" for name in names)
+    marked = []
+    for check in checks:
+        if check.status != "failed":
+            continue
+        if (
+            check.name in ("rollouts", "deploy")
+            or check.name in pods_ready
+            or (check.name == "images" and all(line.startswith(prefixes) for line in check.details[1:]))
+        ):
+            check.status = "environmental"
+            check.details.append("environmental: capacity, not the release (no rollback)")
+            marked.append(check.name)
+    return marked
+
+
+def deploy_capacity(
+    record: dict,
+    clients: rr.Clients,
+    checks: list[Check],
+    snapshot: dict[str, dict],
+    *,
+    rebuild: Callable[[dict[str, dict], Check], list[Check]],
+    now: datetime,
+    judge: Callable[..., dict] = rcap.judge,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[list[Check], dict | None]:
+    """Rule 1 in the deploy phase: judge the Deployments whose rollout did not finish.
+
+    Not capacity: the checks stay as they are (rollback with suspects, as before). Capacity: wait once
+    more (Rule 3 timeout x2 from the deploy start, at least CAPACITY_MIN_WAIT_SECONDS), read again and
+    re-judge once. Finished: the checks pass. Still incomplete with capacity evidence: the availability
+    checks are "environmental" and the result is inconclusive with cause capacity (no rollback).
+    """
+    if not any(check.status == "failed" for check in checks):
+        return checks, None
+    names = capacity_candidates(record, snapshot, checks)
+    release = rr.digest_of((record.get("images") or {}).get(rr.IMAGE_ROLE))
+    step = (record.get("failed_step") or {}).get("id")
+    if step:
+        # A named failed step failed for a cause other than capacity: rollout-wait names a step only when
+        # its verdict was not capacity, and a failed apply or script names its own. Another workload's
+        # capacity never excuses what that step left behind (deep-search #2379).
+        return checks, {
+            "verdict": "not_capacity",
+            "status": "failed",
+            "blockers": [f"deploy step {step} failed (not a capacity wait)"],
+            "indicators": [],
+            "deployments": names,
+            "summary": f"not capacity: deploy step {step} failed (not a capacity wait)",
+        }
+    if not names and record.get("status") == "deploy_failed":
+        # An older build failed a step without naming it: judge every Deployment on the release.
+        names = sorted(item["name"] for item in snapshot.values() if item.get("digest") == release)
+    if not names:
+        return checks, None
+    verdict = judge(clients, names, release, now)
+    print(f"capacity verdict ({', '.join(names)}): {verdict['summary']}", flush=True)
+    if verdict["verdict"] != "capacity":
+        return checks, {**verdict, "deployments": names}
+    started = rr.parse_utc(record["times"]["deploy_started"])
+    elapsed = max(0.0, (now - started).total_seconds())
+    timeouts = rr.scaled_rollout_timeouts(
+        clients, names, minimum=CAPACITY_MIN_WAIT_SECONDS, factor=rcap.EXTENDED_WAIT_FACTOR, elapsed=elapsed
+    )
+    print(f"Capacity, not the release: waiting once more ({timeouts})", flush=True)
+    begun = clock()
+    # Polled, not `kubectl rollout status`: that fails at once after the progress deadline (deep-search #2379).
+    again = rcap.poll_rollouts(clients, timeouts)
+    fresh = rr.snapshot_workloads(clients)
+    rollouts = Check(
+        "rollouts", "failed" if again else "passed", [f"{len(names)} Deployments after the capacity wait", *again]
+    )
+    rechecked = rebuild(fresh, rollouts)
+    info = {**verdict, "deployments": names, "extended_wait_seconds": timeouts}
+    remaining = capacity_candidates(record, fresh, rechecked)
+    if not remaining:
+        # Rolled out. A failed deploy step (its rollout timed out) was the capacity; anything else that
+        # still fails (a smoke check on Ready pods) is the release's, as before.
+        marked = mark_environmental(clients.env, rechecked, names)
+        return rechecked, {**info, "finished": not marked, **({"environmental_checks": marked} if marked else {})}
+    second = judge(clients, remaining, release, now + timedelta(seconds=clock() - begun))
+    print(f"capacity re-judge ({', '.join(remaining)}): {second['summary']}", flush=True)
+    result = {**second, "deployments": remaining, "extended_wait_seconds": timeouts, "first": verdict["summary"]}
+    if second["verdict"] == "capacity":
+        result["environmental_checks"] = mark_environmental(clients.env, rechecked, remaining)
+        result["finished"] = False
+    return rechecked, result
+
+
+def deploy_checks(
+    record: dict,
+    clients: rr.Clients,
+    snapshot: dict[str, dict],
+    rollouts: Check | None,
+    *,
+    pod_get: PodGet | None,
+    get: HttpGet,
+    force_fail: str,
+) -> list[Check]:
+    """The checks of the deploy phase: images (Rule 2 applied), rollouts, deploy, smoke, forced failure."""
+    stale = never_updated(record, snapshot)
+    checks = [without_workloads(check_images(record, snapshot), stale)]
+    if rollouts is not None:
+        checks.append(rollouts)
+    if stale:
+        checks.append(Check("deploy", "failed", [incomplete_line(record, stale)]))
+    elif record.get("status") == "deploy_failed":
+        # The old pods can pass every check while the release never fully deployed.
+        checks.append(Check("deploy", "failed", ["the deploy step failed (status deploy_failed)"]))
+    checks += smoke_checks(clients, snapshot, pod_get=pod_get, get=get)
+    if force_fail:
+        checks.append(Check("forced_failure", "failed", [f"forced failure (test run): {force_fail}"]))
+    return checks
+
+
 # --------------------------------------------------------------------------- windows and verdict
 
 
@@ -1342,21 +1541,45 @@ def evaluate(
     force_fail (test runs) adds a failed check, to prove that a failure stops the promote.
     """
     checks = []
+    rollouts = None
     if wait_rollouts_seconds > 0:
         names = [item.name for item in clients.env.deployments]
-        failures = rr.wait_rollouts(clients, names, wait_rollouts_seconds)
-        checks.append(Check("rollouts", "failed" if failures else "passed", [f"{len(names)} Deployments", *failures]))
+        started = (record.get("times") or {}).get("deploy_started")
+        elapsed = max(0.0, (now - rr.parse_utc(started)).total_seconds()) if started else 0.0
+        # Rule 3: each Deployment's own rollout timeout, less the time the deploy already spent.
+        timeouts = rr.scaled_rollout_timeouts(clients, names, minimum=wait_rollouts_seconds, elapsed=elapsed)
+        begun = time.monotonic()
+        failures = rr.wait_rollouts(clients, names, timeouts=timeouts)
+        # Later budgets (the capacity wait) count the time this wait took.
+        now = now + timedelta(seconds=max(0.0, time.monotonic() - begun))
+        rollouts = Check("rollouts", "failed" if failures else "passed", [f"{len(names)} Deployments", *failures])
     snapshot = rr.snapshot_workloads(clients)
-    checks.insert(0, check_images(record, snapshot))
+    capacity = None
+    stale = never_updated(record, snapshot)
     if phase == "deploy":
-        if record.get("status") == "deploy_failed":
-            # The old pods can pass every check while the release never fully deployed.
-            checks.append(Check("deploy", "failed", ["the deploy step failed (status deploy_failed)"]))
-        checks += smoke_checks(clients, snapshot, pod_get=pod_get, get=get)
-        if force_fail:
-            checks.append(Check("forced_failure", "failed", [f"forced failure (test run): {force_fail}"]))
-    elif metrics_error and service.metrics:
-        checks.append(Check("metrics", "skipped", [metrics_error]))
+
+        def rebuild(fresh: dict[str, dict], rolled: Check | None) -> list[Check]:
+            """The deploy checks of one workload snapshot."""
+            return deploy_checks(record, clients, fresh, rolled, pod_get=pod_get, get=get, force_fail=force_fail)
+
+        checks = rebuild(snapshot, rollouts)
+        checks, capacity = deploy_capacity(record, clients, checks, snapshot, rebuild=rebuild, now=now)
+    else:
+        checks = [without_workloads(check_images(record, snapshot), stale)]
+        if rollouts is not None:
+            checks.append(rollouts)
+        if stale:
+            # Rule 2 in the window: one finding; environmental when the deploy phase judged capacity.
+            deploy_cause = ((record.get("checks") or {}).get("deploy") or {}).get("cause")
+            checks.append(
+                Check(
+                    "deploy",
+                    "environmental" if deploy_cause == "capacity" else "failed",
+                    [incomplete_line(record, stale)],
+                )
+            )
+        if metrics_error and service.metrics:
+            checks.append(Check("metrics", "skipped", [metrics_error]))
     findings: list[Finding] = []
     recovered: list[str] = []
     new_errors: dict | None = None
@@ -1427,7 +1650,7 @@ def evaluate(
                 fresh = rr.snapshot_workloads(replace(clients, runner=bounded), resolve_tags=False)
             except (rr.RecordError, GuardError) as error:
                 raise RuntimeError(str(error)) from error
-            return asdict(check_images(record, fresh, window=True)), fresh
+            return asdict(without_workloads(check_images(record, fresh, window=True), stale)), fresh
 
         checked, availability = ro.confirm_images(read_fresh, state=observation_state or (lambda: (None, None)))
         checks = [Check(**checked) if check.name == "images" else check for check in checks]
@@ -1486,7 +1709,10 @@ def evaluate(
     )
     parts = (new_errors or {}).get("parts") or {}
     signals_checked = [name for name, part in parts.items() if part.get("status") == "checked"]
+    unresolved = bool(capacity and capacity.get("verdict") == "capacity" and not capacity.get("finished"))
     return {
+        "capacity": capacity,
+        **({"cause": "capacity"} if unresolved else {}),
         "availability": availability,
         "phase": phase,
         "at": rr.utc_now(),
@@ -1507,7 +1733,7 @@ def evaluate(
         "result": "failed"
         if regressions
         else "inconclusive"
-        if availability and availability["status"] != "confirmed"
+        if unresolved or (availability and availability["status"] != "confirmed")
         else "passed",
     }
 
@@ -1538,9 +1764,12 @@ def apply_result(
     The change applies to the record as stored at write time, so fields that
     another writer set meanwhile (a rollback's status) stay.
     """
+    early = bool(result.get("early"))
     key = (
         result["phase"]
         if result["phase"] == "deploy"
+        else f"early_{result['candidate_minutes']:.0f}m"
+        if early
         else f"window_{result.get('checkpoint_minutes', result['candidate_minutes']):.0f}m"
     )
     suggestion = None
@@ -1579,8 +1808,12 @@ def apply_result(
 
     def change(current: dict) -> None:
         """Save the result, collect the fresh warnings and set the verdict (a failed verdict stays)."""
-        current.setdefault("checks", {})[key] = result
-        ro.note_checkpoint(current, result, key)
+        if early:
+            # Before any checkpoint is due: kept apart, so the watch still runs +15 and the rest.
+            ro.note_early_check(current, result, key)
+        else:
+            current.setdefault("checks", {})[key] = result
+            ro.note_checkpoint(current, result, key)
         # Each warning goes to Slack once per release; one whose post failed is sent again at the next checkpoint.
         known = current.setdefault("warnings", {})
         fresh.clear()
@@ -1600,8 +1833,22 @@ def apply_result(
             }
             current["rollback_suggestion"] = suggestion
         elif verdict.get("status") != "failed":
-            if not final and result["result"] == "passed" and ro.later_terminal(verdict, key):
-                pass  # retain a later completed observation; a new failure above still wins
+            if early or ro.later_terminal(verdict, key):
+                # An early check decides nothing but a failure. An older checkpoint (also with --final)
+                # never replaces a later terminal verdict; a new failure above still wins.
+                pass
+            elif result.get("cause") == "capacity" and result["result"] == "inconclusive":
+                # Rule 1: capacity, not the release. No rollback, no suspects, no hold; the +15/+60 checks
+                # judge the running release as usual.
+                verdict = {
+                    "status": "inconclusive",
+                    "at": result["at"],
+                    "phase": key,
+                    "cause": "capacity",
+                    "reason": "capacity: "
+                    + ", ".join((result.get("capacity") or {}).get("deployments") or [])
+                    + " did not finish rolling out after the extended wait; environmental, no rollback",
+                }
             elif (result.get("availability") or {}).get("status") in ("unconfirmed", "superseded"):
                 verdict = {
                     "status": "inconclusive",
@@ -1697,13 +1944,29 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
         judged = f" ({result['judged']:,.0f} samples judged)" if result.get("judged") else ""
         return f":white_check_mark: {title} release-verify {short} passed{judged}.{inconclusive_parts(result)} Record {where}"
     if status == "inconclusive":
+        if verdict.get("cause") == "capacity":
+            return (
+                f":grey_question: {title} release-verify {short} deploy incomplete for capacity (environmental: no "
+                f"rollback, no hold): {str((result.get('capacity') or {}).get('summary'))[:300]}. The +15/+60 checks "
+                f"judge the running release. Record {where}"
+            )
         return (
             f":grey_question: {title} release-verify {short} inconclusive: {str(verdict.get('reason'))[:160]}."
             f"{inconclusive_parts(result)} Record {where}"
         )
     if result["phase"] == "deploy":
         minutes = " and ".join(f"+{value}" for value in service.checkpoints)
-        return f":mag: {title} release-verify {short} deploy checks passed; window checks follow at {minutes} min. Record {where}"
+        capacity = result.get("capacity") or {}
+        note = (
+            f" Capacity (environmental, no rollback): the rollout finished after an extended wait; "
+            f"{str(capacity.get('summary'))[:200]}."
+            if capacity.get("verdict") == "capacity"
+            else ""
+        )
+        return (
+            f":mag: {title} release-verify {short} deploy checks passed;{note} window checks follow at {minutes} min. "
+            f"Record {where}"
+        )
     return f":mag: {title} release-verify {short} window checks at +{result['candidate_minutes']:.0f} min passed. Record {where}"
 
 
@@ -1814,15 +2077,21 @@ def cmd_check(
     checkpoint = None
     if args.phase == "window" and not historical:
         finished = rr.parse_utc(record["times"].get("deploy_finished") or record["times"]["deploy_started"])
-        checkpoint = ro.scheduled_minute(
-            record, (_now(args) - finished).total_seconds() / 60, getattr(args, "checkpoint_minutes", None)
-        )
-        rr.update_record(
-            store,
-            record["release_id"],
-            lambda current: ro.begin_checkpoint(current, f"window_{checkpoint}m"),
-            "checkpoint_started",
-        )
+        elapsed = (_now(args) - finished).total_seconds() / 60
+        checkpoint = ro.scheduled_minute(record, elapsed, getattr(args, "checkpoint_minutes", None))
+        if checkpoint is None:
+            print(
+                f"Early check at +{elapsed:.0f} min: no scheduled checkpoint is due yet. The result is kept "
+                "apart and completes no checkpoint; the watch still runs every scheduled one.",
+                flush=True,
+            )
+        else:
+            rr.update_record(
+                store,
+                record["release_id"],
+                lambda current: ro.begin_checkpoint(current, f"window_{checkpoint}m"),
+                "checkpoint_started",
+            )
     try:
         result = evaluate(
             service,
@@ -1851,28 +2120,44 @@ def cmd_check(
             return EXIT_OK if result["result"] == "passed" else EXIT_FAILED
         if checkpoint is not None:
             result["checkpoint_minutes"] = checkpoint
+        elif args.phase == "window":
+            result["early"] = True
         if args.phase == "window" and env.name == "prod":
             ended, busy = prod_state(service, store, record)
-            if ended or busy:
+            if ended:
+                # Only a replaced release closes its open checkpoints.
                 rr.update_record(
                     store,
                     record["release_id"],
-                    lambda current: ro.supersede(current, ended or busy),
+                    lambda current: ro.supersede(current, ended),
                     "verify_superseded",
                 )
-                print(f"Workload observation superseded: {ended or busy}; result not recorded", flush=True)
+                print(f"Workload observation superseded: {ended}; result not recorded", flush=True)
+                return EXIT_ERROR
+            if busy:
+                # Another build only runs: it may never deploy, so every checkpoint stays open.
+                if checkpoint is not None:
+                    _record_checkpoint_error(
+                        store, record, checkpoint, f"{busy}; result not recorded, checkpoint stays open", final=False
+                    )
+                print(f"Workload observation interrupted: {busy}; result not recorded", flush=True)
                 return EXIT_ERROR
         if args.phase == "window" and env.name == "prod":
             history = builds_since_rollback(service, record)
             if history:
-                _record_checkpoint_error(
-                    store, record, checkpoint, f"another build changed prod: {history[0]}", final=True
-                )
+                if checkpoint is not None:
+                    _record_checkpoint_error(
+                        store, record, checkpoint, f"another build changed prod: {history[0]}", final=True
+                    )
+                print(f"Another build changed prod: {history[0]}; result not recorded", flush=True)
                 return EXIT_FAILED
         print_result(result)
         # The marker comes from the result itself, so a failed record write cannot hide a failed check.
         if args.failed_marker and result["result"] == "failed":
             Path(args.failed_marker).write_text("true\n", encoding="utf-8")
+        if result.get("early") and args.final:
+            print("--final is ignored: an early check cannot set the final verdict", flush=True)
+            args.final = False
         saved = apply_result(service, store, record, result, final=args.final, token=token)
         owner_ok = require_owner(store, saved) if args.phase == "window" and env.name == "prod" else True
         if args.phase == "window":
@@ -2057,12 +2342,47 @@ def finish_dev_verify(
     return saved
 
 
+def _valid_people(people: object) -> bool:
+    """{"fallback": [str, ...], "slack_ids": {str: str}}; both keys optional."""
+    if not isinstance(people, dict):
+        return False
+    slack_ids = people.get("slack_ids") or {}
+    fallback = people.get("fallback") or []
+    return (
+        isinstance(slack_ids, dict)
+        and all(isinstance(key, str) and isinstance(value, str) for key, value in slack_ids.items())
+        and isinstance(fallback, list)
+        and all(isinstance(value, str) for value in fallback)
+    )
+
+
 def load_people(path: Path | None = None) -> dict:
-    """GitHub login -> Slack id map and fallback mentions; empty when the file is missing or broken."""
+    """GitHub login -> Slack id map and fallback mentions.
+
+    The vendored release_people.json (private repositories), else the RELEASE_PEOPLE_JSON
+    environment variable (public repositories: the builds read it from Secret Manager). Missing,
+    unreadable or wrongly shaped: a warning and an empty map, so the alert still goes out."""
+    empty = {"slack_ids": {}, "fallback": []}
+    path = path or PEOPLE_FILE
+    if path.is_file():
+        source = str(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            print(f"WARNING: cannot read {source}: {error}; the alert mentions nobody", file=sys.stderr, flush=True)
+            return empty
+    elif os.environ.get("RELEASE_PEOPLE_JSON", "").strip():
+        source, text = "RELEASE_PEOPLE_JSON", os.environ["RELEASE_PEOPLE_JSON"]
+    else:
+        return empty
     try:
-        people = json.loads((path or PEOPLE_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"slack_ids": {}, "fallback": []}
+        people = json.loads(text)
+    except ValueError:
+        print(f"WARNING: {source} is not valid JSON; the alert mentions nobody", file=sys.stderr, flush=True)
+        return empty
+    if not _valid_people(people):
+        print(f"WARNING: {source} has the wrong shape; the alert mentions nobody", file=sys.stderr, flush=True)
+        return empty
     return {"slack_ids": dict(people.get("slack_ids") or {}), "fallback": list(people.get("fallback") or [])}
 
 
@@ -2600,11 +2920,12 @@ def _record_checkpoint_error(store: rr.Store, record: dict, minutes: int, error:
     """Record that a checkpoint could not run; the final one makes the verdict inconclusive."""
 
     def change(current: dict) -> None:
-        """On the final checkpoint, set the inconclusive verdict unless the record has failed already."""
+        """On the final checkpoint, set the inconclusive verdict unless the record failed or a later one decided."""
         current.setdefault("followup", {}).setdefault("checkpoints", {}).setdefault(f"window_{minutes}m", {}).update(
             state="error", last_error=error[:500], heartbeat_at=rr.utc_now()
         )
-        if final and (current.get("verdict") or {}).get("status") != "failed":
+        verdict = current.get("verdict") or {}
+        if final and verdict.get("status") != "failed" and not ro.later_terminal(verdict, f"window_{minutes}m"):
             current["verdict"] = {
                 "status": "inconclusive",
                 "unchecked": True,
@@ -2815,7 +3136,7 @@ def start_rollback(
     *,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
-    runner: Callable[[list[str]], str] | None = None,
+    runner: rr.Runner | None = None,
     builds: Callable[[rc.Service, str | None], tuple[bool, list[str]]] | None = None,
     follow: bool = True,
     followed: Callable[[str], bool] | None = None,

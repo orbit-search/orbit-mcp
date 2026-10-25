@@ -35,6 +35,34 @@ release_gate.py, automatic rollback, the hold):
   in prod do not have (Airflow 3.1 has no `dags list-import-errors --subdir`).
   The prod build syncs that folder to dags/. Rollback: the target commit's
   folder goes to dags/.
+- vercel (tier full only): Vercel builds the production deployment of a merge;
+  a required Deployment Check (the commit status orbit-release/<project>) keeps
+  the domains on the old deployment. The dev build waits for that deployment
+  and verifies it on its own URL with the Protection Bypass for Automation
+  header (smoke checks, no error log lines, no 5xx). The prod build posts the
+  status `success`, so Vercel assigns the domains to exactly that deployment
+  (it promotes by API when Vercel holds the project after a rollback).
+  Rollback: the domains go back to the target release's deployment
+  (POST /v9/projects/<id>/rollback/<dpl>). The window reads Vercel's request
+  logs by deployment id: new error log lines and the 5xx share against the
+  previous deployment. See release_vercel.py.
+- railway (tiers full and check_rollback): Railway builds and runs the
+  service; its own GitHub auto deploy is off. Tier full: the dev build deploys
+  the commit to the Railway environment that is the dev stage (staging) through
+  the GraphQL API and verifies it there; the prod build deploys the same commit
+  to production (Railway builds it again: the same source, not the same bytes).
+  Tier check_rollback (no dev environment yet): the merge build deploys the
+  commit to production after the freeze and hold gate. The window reads
+  Railway: the deployment status, its error log lines and the 5xx share of its
+  HTTP logs. Rollback: Railway redeploys the deployment that served before with
+  its image. A release that adds a database migration never rolls back by
+  itself: it holds and pings (forward-only). See release_railway.py.
+- static_site (tier check_only): a site that a hosted publisher (Mintlify)
+  builds and publishes on merge. The kit waits for the publisher's GitHub check
+  run of the commit, then checks the live site's pages and links at +0, +15
+  and +60 min (read-only). A failed check pings the PR author with the exact
+  revert command and a fix prompt; nothing reverts by itself. See
+  release_static.py.
 
 Both tiers get the watch window of the GKE services: new warning and error log
 lines (the config's Cloud Logging filter) compared with the 24 h before the
@@ -56,6 +84,14 @@ release starts the rollback trigger (_EXPECT_LATEST) and pings the author.
     python3 release/release_light.py preflight --commit <sha> --build-id <id>   # prod: turn, branch, dev, artifacts
     python3 release/release_light.py still-current --commit <sha> --build-id <id>
     python3 release/release_light.py apply --artifacts-file <file>              # prod: the promote itself
+    # kind vercel only
+    python3 release/release_light.py vercel-wait --commit <sha> --out-dir <dir>   # exit 5: Vercel skipped the app
+    python3 release/release_light.py vercel-status --commit <sha> --state pending --description <text>
+    python3 release/release_light.py vercel-status --commit <sha> --from-dev-index | --from-skip-file <file>
+    # kind railway only
+    python3 release/release_light.py railway-deploy --env dev --commit <sha> --out-dir <dir>
+    # kind static_site only
+    python3 release/release_light.py static-wait --commit <sha> --out-dir <dir>   # exit 5: nothing was published
 
 `release_gate.py` and `release_rollback.py` take these services too.
 
@@ -89,13 +125,25 @@ import promote_release_guard as guard  # noqa: E402
 import release_config as rc  # noqa: E402
 import release_gate as rg  # noqa: E402
 import release_record as rr  # noqa: E402
+import release_railway as rwy  # noqa: E402
 import release_rollback as rb  # noqa: E402
 import release_signals as rs  # noqa: E402
+import release_static as rst  # noqa: E402
+import release_vercel as rvc  # noqa: E402
 import release_verify as rv  # noqa: E402
 from promote_release_guard import GoogleApi, GuardError, _http_json  # noqa: E402
 
-KINDS = ("cloud_run", "composer")
-LIGHT_TIERS = ("check_only", "full")
+KINDS = ("cloud_run", "composer", "vercel", "railway", "static_site")
+LIGHT_TIERS = ("check_only", "check_rollback", "full")
+# The tiers of each kind; check_rollback (no dev stage, automatic rollback) is for a Railway service without
+# a dev environment.
+KIND_TIERS = {
+    "cloud_run": ("check_only", "full"),
+    "composer": ("check_only", "full"),
+    "vercel": ("full",),
+    "railway": ("full", "check_rollback"),
+    "static_site": ("check_only",),
+}
 # The file the prod build's preflight writes: what it promotes (release_gate.py check-prod --artifacts-file).
 ARTIFACTS_FILE = "release_artifacts.json"
 KIT_DIR = Path(__file__).resolve().parent
@@ -140,19 +188,50 @@ class LightService:
     # Tier full, composer: the environment's bucket when it cannot be read; the candidate folder.
     bucket: str = ""
     candidate_prefix: str = "data/release-candidate/"
+    # The identity of the rendered window and rollback builds (and of the triggers that run them).
+    build_service_account: str = "cloud-build@orbit-search.iam.gserviceaccount.com"
+    # Kind vercel: the team id, the project (name or id), the production domains (the first is the primary),
+    # the commit status context of the Deployment Check and the Secret Manager secret of the token.
+    vercel_team: str = ""
+    vercel_project: str = ""
+    vercel_domains: tuple[str, ...] = ()
+    check_context: str = ""
+    token_secret: str = rvc.DEFAULT_TOKEN_SECRET
+    github_token_secret: str = rvc.DEFAULT_GITHUB_SECRET
+    deployment_wait_minutes: int = 30
+    assign_wait_seconds: int = 180
+    log_settle_seconds: int = 30
+    log_min_count: int = 3
+    share_limit: rvc.ShareLimit = rvc.ShareLimit()
+    # Kind railway: the project and service ids; per environment (dev, prod): the Railway environment's
+    # name and id, the Secret Manager secret of its project token and its public URL. Optional: the
+    # migration files that make a release forward-only, and the JSON field of a URL path that names the
+    # commit the deployment runs.
+    railway_project_id: str = ""
+    railway_service_id: str = ""
+    railway_environments: tuple[tuple[str, str], ...] = ()
+    railway_environment_ids: tuple[tuple[str, str], ...] = ()
+    railway_tokens: tuple[tuple[str, str], ...] = ()
+    railway_urls: tuple[tuple[str, str], ...] = ()
+    migrations_prefix: tuple[str, ...] = ()
+    migrations_suffix: str = ""
+    version_path: str = ""
+    version_field: str = ""
+    # Kind static_site: the live site, the publisher's GitHub check run, the pages that must answer.
+    site: rst.Site | None = None
 
     metrics: tuple = ()
     signals = rc.Signals()
 
     @property
     def auto_rollback(self) -> bool:
-        """Whether a failed release rolls back by itself (tier full)."""
-        return self.tier == "full"
+        """Whether a failed release rolls back by itself (tiers full and check_rollback)."""
+        return self.tier in ("full", "check_rollback")
 
     @property
     def has_gate(self) -> bool:
-        """Whether deploys pass release_gate.py (the freeze, the hold, dev verify): tier full."""
-        return self.tier == "full"
+        """Whether deploys pass release_gate.py (the freeze, the hold; tier full also dev verify)."""
+        return self.tier in ("full", "check_rollback")
 
     @property
     def has_dev(self) -> bool:
@@ -168,6 +247,16 @@ class LightService:
     def rollback_config(self) -> str:
         """The repository path of the rollback build config (tier full)."""
         return f"release/services/{self.name}.rollback.yaml"
+
+    @property
+    def release_build_config(self) -> str:
+        """Kinds vercel, railway, static_site: the merge build config (the push trigger, rendered by release_kit.py)."""
+        return f"release/services/{self.name}.release.yaml"
+
+    @property
+    def promote_build_config(self) -> str:
+        """Kinds vercel and railway (tier full): the prod build config (the manual promote trigger, rendered)."""
+        return f"release/services/{self.name}.promote.yaml"
 
     @property
     def rollback_trigger(self) -> str:
@@ -237,8 +326,8 @@ def parse_light(data: dict, path: Path | None = None) -> LightService:
     if kind not in KINDS:
         raise rc.ConfigError(f"{where}: kind {kind!r} is not one of {KINDS}")
     tier = str(data.get("tier") or "")
-    if tier not in LIGHT_TIERS:
-        raise rc.ConfigError(f"{where}: kind {kind} supports tiers {LIGHT_TIERS}, not {tier!r}")
+    if tier not in KIND_TIERS[kind]:
+        raise rc.ConfigError(f"{where}: kind {kind} supports tiers {KIND_TIERS[kind]}, not {tier!r}")
     name = str(rc._require(data, "service", where))
     smoke = tuple(data.get("smoke") or ())
     for check in smoke:
@@ -265,16 +354,28 @@ def parse_light(data: dict, path: Path | None = None) -> LightService:
         release_branch=str(data.get("release_branch") or "main"),
         project=str(data.get("project") or "orbit-search"),
         region=str(data.get("region") or "us-central1"),
+        build_service_account=build_service_account(data, where),
         store=str(data.get("store") or f"gs://orbit-search-release-records/{name}"),
         docs=str(data.get("docs") or "docs/RELEASE_PIPELINE.md"),
         code=code,
         checkpoints=tuple(int(value) for value in verify.get("checkpoints") or (15, 60)),
         smoke=smoke,
-        log_filter=str(rc._require(verify, "log_filter", f"{where} verify")),
+        # Kinds vercel and railway read their platform's logs; a static site has none.
+        log_filter=""
+        if kind in ("vercel", "railway", "static_site")
+        else str(rc._require(verify, "log_filter", f"{where} verify")),
         log_min_spread=int(verify.get("log_min_spread") or 1),
         path=path,
         tier=tier,
     )
+    if kind == "vercel":
+        if tier != "full":
+            raise rc.ConfigError(f"{where}: kind vercel supports tier full only")
+        return parse_vercel(data, where, common, verify)
+    if kind == "railway":
+        return parse_railway(data, where, common, verify)
+    if kind == "static_site":
+        return parse_static(data, where, common)
     if tier == "full":
         return parse_full(data, where, common)
     if kind == "cloud_run":
@@ -293,16 +394,190 @@ def parse_light(data: dict, path: Path | None = None) -> LightService:
     )
 
 
-def parse_full(data: dict, where: str, common: dict) -> LightService:
-    """The tier full parts of a cloud_run or composer config: triggers, URLs, the candidate folder."""
+BUILD_SERVICE_ACCOUNT_RE = re.compile(
+    r"^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$"
+)
+
+
+def build_service_account(data: dict, where: str) -> str:
+    """The build identity of the rendered window and rollback builds: cloud-build@<project> unless the config names one.
+
+    A service with its own least-privilege build identity names it here, so the window build that the prod build
+    submits and the rollback build run as that identity, not as the shared cloud-build@.
+    """
+    project = str(data.get("project") or "orbit-search")
+    account = str(data.get("build_service_account") or f"cloud-build@{project}.iam.gserviceaccount.com")
+    if not BUILD_SERVICE_ACCOUNT_RE.fullmatch(account) or not account.endswith(f"@{project}.iam.gserviceaccount.com"):
+        raise rc.ConfigError(f"{where}: build_service_account must be <name>@{project}.iam.gserviceaccount.com")
+    return account
+
+
+def full_triggers(data: dict, where: str, common: dict) -> dict:
+    """The triggers of a tier full config: triggers.dev, triggers.prod and triggers.rollback."""
     if "deploy_triggers" in data:
         raise rc.ConfigError(f"{where}: tier full names its triggers in triggers.dev, triggers.prod, triggers.rollback")
     triggers = dict(rc._require(data, "triggers", where))  # type: ignore[arg-type]
-    full = dict(
+    return dict(
         deploy_triggers=rc._names(triggers.get("prod"), f"{where} triggers.prod"),
         dev_triggers=rc._names(triggers.get("dev"), f"{where} triggers.dev"),
         rollback_trigger_name=str(triggers.get("rollback") or f"{common['name']}-rollback"),
     )
+
+
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+
+
+def parse_vercel(data: dict, where: str, common: dict, verify: dict) -> LightService:
+    """The parts of a kind vercel config: the triggers, the team, project and domains, the window limits."""
+    full = full_triggers(data, where, common)
+    vercel = dict(rc._require(data, "vercel", where))  # type: ignore[arg-type]
+    team = str(rc._require(vercel, "team", f"{where} vercel"))
+    if not re.fullmatch(r"team_[A-Za-z0-9]+", team):
+        raise rc.ConfigError(f"{where}: vercel.team must be the team id (team_...)")
+    project = str(rc._require(vercel, "project", f"{where} vercel"))
+    if not re.fullmatch(r"prj_[A-Za-z0-9]+|[a-z0-9][a-z0-9._-]{0,99}", project):
+        raise rc.ConfigError(f"{where}: vercel.project must be the project name or id")
+    domains = rc._names(vercel.get("domains"), f"{where} vercel.domains")
+    for domain in domains:
+        if not DOMAIN_RE.fullmatch(domain):
+            raise rc.ConfigError(f"{where}: vercel.domains: {domain!r} is not a host name")
+    if not common["smoke"]:
+        raise rc.ConfigError(f"{where}: kind vercel needs a smoke check (dev verify calls it on the deployment URL)")
+    for check in common["smoke"]:
+        host = urllib.parse.urlsplit(str(check["url"])).hostname or ""
+        if host not in domains or not str(check["url"]).startswith(f"https://{host}/"):
+            raise rc.ConfigError(
+                f"{where}: smoke url {check['url']} is not https://<a vercel.domains host>/..., so dev verify cannot "
+                "call it on the deployment URL"
+            )
+    limit = rvc.ShareLimit(
+        ratio=float(verify.get("max_5xx_ratio") or 3.0),
+        absolute=float(verify.get("max_5xx_absolute") or 0.02),
+        min_requests=int(verify.get("min_requests") or 50),
+        min_errors=int(verify.get("min_5xx") or 5),
+    )
+    return LightService(
+        **common,
+        **full,
+        vercel_team=team,
+        vercel_project=project,
+        vercel_domains=domains,
+        check_context=str(vercel.get("check_context") or f"orbit-release/{common['name']}"),
+        token_secret=str(vercel.get("token_secret") or rvc.DEFAULT_TOKEN_SECRET),
+        github_token_secret=str(vercel.get("github_token_secret") or rvc.DEFAULT_GITHUB_SECRET),
+        deployment_wait_minutes=int(vercel.get("deployment_wait_minutes", 30)),
+        assign_wait_seconds=int(vercel.get("assign_wait_seconds", 180)),
+        log_settle_seconds=int(vercel.get("log_settle_seconds", 30)),
+        log_min_count=int(verify.get("log_min_count") or 3),
+        share_limit=limit,
+    )
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+BASE_URL_RE = re.compile(r"^https://[a-z0-9.-]+$")
+
+
+def parse_railway(data: dict, where: str, common: dict, verify: dict) -> LightService:
+    """The parts of a kind railway config: triggers, the project, service and environments, migrations, limits."""
+    full = common["tier"] == "full"
+    if "deploy_triggers" in data:
+        raise rc.ConfigError(f"{where}: kind railway names its triggers in triggers.prod (and triggers.dev, tier full)")
+    triggers = dict(rc._require(data, "triggers", where))  # type: ignore[arg-type]
+    if not full and triggers.get("dev"):
+        raise rc.ConfigError(f"{where}: tier check_rollback has no dev stage; set tier full to use triggers.dev")
+    railway = dict(rc._require(data, "railway", where))  # type: ignore[arg-type]
+    ids = {}
+    for field in ("project_id", "service_id"):
+        ids[field] = str(rc._require(railway, field, f"{where} railway"))
+        if not UUID_RE.fullmatch(ids[field]):
+            raise rc.ConfigError(f"{where}: railway.{field} must be a Railway id (a UUID)")
+    environments = dict(rc._require(railway, "environments", f"{where} railway"))  # type: ignore[arg-type]
+    needed = ("prod", "dev") if full else ("prod",)
+    if sorted(environments) != sorted(needed):
+        raise rc.ConfigError(
+            f"{where}: tier {common['tier']} needs railway.environments {list(needed)}, not {sorted(environments)}"
+        )
+    names, env_ids, tokens, urls = [], [], [], []
+    for env in needed:
+        entry = dict(rc._require(environments, env, f"{where} railway.environments"))  # type: ignore[arg-type]
+        at = f"{where} railway.environments.{env}"
+        environment_id = str(rc._require(entry, "environment_id", at))
+        secret = str(rc._require(entry, "token_secret", at))
+        url = str(rc._require(entry, "url", at)).rstrip("/")
+        if not UUID_RE.fullmatch(environment_id):
+            raise rc.ConfigError(f"{at}: environment_id must be a Railway id (a UUID)")
+        if not SECRET_NAME_RE.fullmatch(secret):
+            raise rc.ConfigError(f"{at}: token_secret must be a Secret Manager secret name")
+        if not BASE_URL_RE.fullmatch(url):
+            raise rc.ConfigError(f"{at}: url must be https://<host> with no path")
+        names.append((env, str(entry.get("name") or env)))
+        env_ids.append((env, environment_id))
+        tokens.append((env, secret))
+        urls.append((env, url))
+    if full and (len({value for _, value in env_ids}) < 2 or len({value for _, value in tokens}) < 2):
+        raise rc.ConfigError(f"{where}: the dev and prod environments need their own environment id and token secret")
+    prod_url = dict(urls)["prod"]
+    if not common["smoke"]:
+        raise rc.ConfigError(f"{where}: kind railway needs a smoke check")
+    for check in common["smoke"]:
+        if not str(check["url"]).startswith(prod_url + "/"):
+            raise rc.ConfigError(
+                f"{where}: smoke url {check['url']} is not under {prod_url}/, so dev verify cannot call it on the dev URL"
+            )
+    migrations = dict(railway.get("migrations") or {})
+    # prefix: a folder (backend/migrations/) or a list of folders and files whose changes change the stored schema.
+    prefixes = migrations.get("prefix") or ()
+    prefixes = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+    if migrations and (
+        not prefixes or not all(isinstance(item, str) and item and not item.startswith("/") for item in prefixes)
+    ):
+        raise rc.ConfigError(f"{where}: railway.migrations.prefix must be a repository path or a list of them")
+    version = dict(railway.get("version") or {})
+    if version and (not str(version.get("path") or "").startswith("/") or not version.get("field")):
+        raise rc.ConfigError(f"{where}: railway.version needs a path that starts with / and a JSON field")
+    return LightService(
+        **common,
+        deploy_triggers=rc._names(triggers.get("prod"), f"{where} triggers.prod"),
+        dev_triggers=rc._names(triggers.get("dev"), f"{where} triggers.dev") if full else (),
+        rollback_trigger_name=str(triggers.get("rollback") or f"{common['name']}-rollback"),
+        railway_project_id=ids["project_id"],
+        railway_service_id=ids["service_id"],
+        railway_environments=tuple(names),
+        railway_environment_ids=tuple(env_ids),
+        railway_tokens=tuple(tokens),
+        railway_urls=tuple(urls),
+        migrations_prefix=prefixes,
+        migrations_suffix=str(migrations.get("suffix") or ""),
+        version_path=str(version.get("path") or ""),
+        version_field=str(version.get("field") or ""),
+        deployment_wait_minutes=int(railway.get("deploy_wait_minutes", 20)),
+        log_settle_seconds=int(railway.get("log_settle_seconds", 30)),
+        log_min_count=int(verify.get("log_min_count") or 3),
+        share_limit=rvc.ShareLimit(
+            ratio=float(verify.get("max_5xx_ratio") or 3.0),
+            absolute=float(verify.get("max_5xx_absolute") or 0.02),
+            min_requests=int(verify.get("min_requests") or 50),
+            min_errors=int(verify.get("min_5xx") or 5),
+        ),
+    )
+
+
+def parse_static(data: dict, where: str, common: dict) -> LightService:
+    """The parts of a kind static_site config: the merge trigger and the site (release_static.parse_site)."""
+    triggers = rc._names(rc._require(data, "deploy_triggers", where), f"{where} deploy_triggers")
+    site = rst.parse_site(dict(rc._require(data, "static_site", where)), where)  # type: ignore[arg-type]
+    for check in common["smoke"]:
+        if not str(check["url"]).startswith(site.url + "/"):
+            raise rc.ConfigError(f"{where}: smoke url {check['url']} is not under {site.url}/")
+    return LightService(**common, deploy_triggers=triggers, site=site)
+
+
+def parse_full(data: dict, where: str, common: dict) -> LightService:
+    """The tier full parts of a cloud_run or composer config: triggers, URLs, the candidate folder."""
+    full = full_triggers(data, where, common)
     if common["kind"] == "cloud_run":
         services = rc._names(rc._require(data, "cloud_run_services", where), f"{where} cloud_run_services")
         urls = dict(rc._require(data, "cloud_run_urls", where))  # type: ignore[arg-type]
@@ -370,7 +645,7 @@ def load_light(name: str | None = None) -> LightService:
 
 # --------------------------------------------------------------------------- snapshots
 
-Runner = Callable[[list[str]], str]
+Runner = rr.Runner
 
 
 def gcloud_json(runner: Runner, *args: str) -> dict:
@@ -431,7 +706,18 @@ def candidate_url(service: LightService, name: str, url: str | None = None) -> s
 
 
 def dev_smoke(service: LightService) -> list[dict]:
-    """The smoke checks of dev verify: cloud_run calls the prod checks on the candidate tag URLs."""
+    """The smoke checks of dev verify: cloud_run calls the prod checks on the candidate tag URLs, railway on the
+    dev environment's URL."""
+    if service.kind == "railway" and service.has_dev:
+        urls = dict(service.railway_urls)
+        return [
+            {
+                **check,
+                "name": f"{check.get('name') or check['url']} ({dict(service.railway_environments)['dev']})",
+                "url": urls["dev"] + str(check["url"])[len(urls["prod"]) :],
+            }
+            for check in service.smoke
+        ]
     if service.kind != "cloud_run" or not service.service_urls:
         return []
     out = []
@@ -682,7 +968,13 @@ def composer_artifacts(service: LightService, runner: Runner, token: Callable[[]
 def live_artifacts(
     service: LightService, runner: Runner, token: Callable[[], str], commit: str, recorded: dict[str, str]
 ) -> dict[str, str]:
-    """What prod would promote now, read live: the recorded revisions (cloud_run) or the candidate folder (composer)."""
+    """What prod would promote now, read live: the recorded revisions (cloud_run), the verified deployment (vercel),
+    or the candidate folder (composer)."""
+    if service.kind == "vercel":
+        return vercel_live_artifacts(service, vercel_api(service), commit, recorded)
+    if service.kind == "railway":
+        # The artifact is the commit: Railway builds it again for production (the same source, not the same bytes).
+        return {service.name: commit}
     if service.kind == "cloud_run":
         return revision_artifacts(service, runner, {name: value.split("@", 1)[0] for name, value in recorded.items()})
     return composer_artifacts(service, runner, token, commit)
@@ -845,9 +1137,15 @@ class Airflow:
 
 
 def snapshot(service: LightService, runner: Runner, token: Callable[[], str]) -> dict[str, dict]:
-    """What runs now: the Cloud Run revisions, or the Composer DAG import errors."""
+    """What runs now: the Cloud Run revisions, the Vercel deployment on the domains, or the Composer import errors."""
     if service.kind == "cloud_run":
         return snapshot_cloud_run(service, runner)
+    if service.kind == "vercel":
+        return snapshot_vercel(service, vercel_api(service))
+    if service.kind == "railway":
+        return snapshot_railway(service, railway_api(service, "prod"))
+    if service.kind == "static_site":
+        return snapshot_static(service)
     try:
         errors: dict[str, str] | None = Airflow(service, runner, token).import_errors()
         problem = ""
@@ -855,6 +1153,1182 @@ def snapshot(service: LightService, runner: Runner, token: Callable[[], str]) ->
         # The build identity needs roles/composer.user to read the Airflow API; the log checks still run.
         errors, problem = None, f"the Airflow API cannot be read: {str(error)[:300]}"
     return {"composer/import_errors": {"kind": "composer", "errors": errors, "error": problem}}
+
+
+# --------------------------------------------------------------------------- kind vercel
+
+
+def vercel_api(service: LightService) -> rvc.VercelApi:
+    """The Vercel API of the service's team; the token is VERCEL_RELEASE_TOKEN or the Secret Manager secret."""
+    google = GoogleApi(service.project, service.region)
+    return rvc.VercelApi(
+        service.vercel_team, rvc.token_source(service.project, service.token_secret, google.access_token)
+    )
+
+
+def vercel_key(service: LightService) -> str:
+    """The workload key of a Vercel project in snapshots and rollback plans."""
+    return f"vercel/{service.name}"
+
+
+def snapshot_vercel(service: LightService, api: rvc.VercelApi) -> dict[str, dict]:
+    """The deployment each production domain points at, the commit of the primary one, and Vercel's hold state."""
+    project = api.project(service.vercel_project)
+    now = rvc.aliases(api, service.vercel_domains)
+    primary = now.get(service.vercel_domains[0]) or ""
+    commit = ""
+    if primary:
+        try:
+            commit = rvc.deployment_commit(api.deployment(primary))
+        except rvc.VercelError as error:
+            print(f"WARNING: cannot read deployment {primary}: {str(error)[:200]}", file=sys.stderr, flush=True)
+    return {
+        vercel_key(service): {
+            "kind": "vercel",
+            "project_id": project.get("id"),
+            "deployment": primary,
+            "commit": commit,
+            "aliases": now,
+            "auto_assign": not rvc.in_rollback_state(project),
+            "last_rollback_target": project.get("lastRollbackTarget"),
+        }
+    }
+
+
+def status_token(service: LightService) -> str:
+    """The kit's GitHub token (GITHUB_TOKEN in the builds); a read-only connection token cannot set a status."""
+    return rr.github_token(service.env)
+
+
+def post_commit_status(service: LightService, commit: str, state: str, description: str, target_url: str = "") -> None:
+    """Set the Deployment Check's commit status (service.check_context) with the kit's GitHub token."""
+    rvc.post_status(
+        service.github_repo,
+        commit,
+        service.check_context,
+        state,
+        description,
+        status_token(service),
+        target_url=target_url,
+    )
+
+
+def vercel_deployment_artifacts(service: LightService, api: rvc.VercelApi, commit: str, wanted: str) -> dict[str, str]:
+    """{service: deployment id} of a READY production deployment of the commit; raise RecordError otherwise."""
+    deployment = api.deployment(wanted) if wanted else None
+    if deployment is None:
+        project = api.project(service.vercel_project)
+        deployment = rvc.commit_deployment(api, str(project["id"]), commit)
+    if not deployment:
+        raise rr.RecordError(f"no Vercel production deployment of {commit[:9]}")
+    found = rvc.deployment_id(deployment)
+    if rvc.deployment_state(deployment) != rvc.READY:
+        raise rr.RecordError(f"deployment {found} is {rvc.deployment_state(deployment)}, not READY")
+    if rvc.deployment_commit(deployment) != commit:
+        raise rr.RecordError(
+            f"deployment {found} was built from {rvc.deployment_commit(deployment)[:9] or 'no commit'}"
+        )
+    if deployment.get("target") != "production":
+        raise rr.RecordError(f"deployment {found} is not a production deployment")
+    return {service.name: found}
+
+
+def vercel_live_artifacts(service: LightService, api: rvc.VercelApi, commit: str, recorded: dict) -> dict[str, str]:
+    """What the prod build lets go live: the verified deployment, still READY and the newest one of the branch.
+
+    A newer production deployment of another commit on the release branch supersedes this one (exit 3):
+    Vercel gives the domains to the newest deployment whose check passed, so an older one must not pass.
+    """
+    wanted = str(recorded.get(service.name) or "")
+    if not wanted:
+        raise rr.RecordError("dev verify recorded no Vercel deployment")
+    artifacts = vercel_deployment_artifacts(service, api, commit, wanted)
+    project = api.project(service.vercel_project)
+    newer = rvc.newer_deployment(api, str(project["id"]), api.deployment(wanted), service.release_branch)
+    if newer:
+        raise guard.Superseded(
+            f"a newer production deployment {rvc.deployment_id(newer)} of "
+            f"{rvc.deployment_commit(newer)[:9]} ({rvc.deployment_state(newer)}) releases instead"
+        )
+    return artifacts
+
+
+def vercel_hold_guard(service: LightService, store: rr.Store, api: rvc.VercelApi, project: dict | None = None) -> None:
+    """Refuse a promote while Vercel holds the project after a rollback that the kit did not record.
+
+    After any rollback Vercel turns auto-assignment off. A kit rollback is the newest prod record, and its
+    hold (release_gate.py) decides. A rollback in the dashboard has no record: promoting would undo it.
+    """
+    if not rvc.in_rollback_state(project if project is not None else api.project(service.vercel_project)):
+        return
+    pointer, _ = store.read("latest.json")
+    if pointer and pointer.get("kind") == "rollback":
+        return
+    raise GuardError(
+        f"Vercel holds {service.vercel_project} after a rollback that the release kit did not record (the "
+        "dashboard?). A human decides: undo it in Vercel ('Undo Rollback'), or record it with "
+        f"`{rv.rollback_cli(service, 'run')} --reason '<why>'`; nothing was promoted"
+    )
+
+
+def vercel_dev_checks(
+    service: LightService,
+    record: dict,
+    api: rvc.VercelApi,
+    *,
+    get: rv.HttpGet | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> list[rv.Check]:
+    """Dev verify of kind vercel: the deployment of the commit is READY and staged, the smoke checks pass on its own
+    URL (with the Protection Bypass for Automation header), and its request logs show no error line and no 5xx."""
+    deployment_id = str((record.get("artifacts") or {}).get(service.name) or "")
+    if not deployment_id:
+        return [rv.Check("artifacts", "failed", [record.get("artifacts_error") or "the dev record has no deployment"])]
+    try:
+        vercel_deployment_artifacts(service, api, record["commit"], deployment_id)
+        deployment = api.deployment(deployment_id)
+        project = api.project(service.vercel_project)
+    except (rr.RecordError, GuardError) as error:
+        return [rv.Check("deployment", "failed", [str(error)[:300]])]
+    url = rvc.deployment_url(deployment)
+    checks = [
+        rv.Check(
+            "deployment",
+            "passed",
+            [
+                f"{deployment_id} {url} {rvc.deployment_state(deployment)} {deployment.get('readySubstate') or ''}".strip()
+            ],
+        )
+    ]
+    secret = rvc.bypass_secret(project)
+    if not secret:
+        checks.append(
+            rv.Check(
+                "protection_bypass",
+                "failed",
+                [
+                    f"{service.vercel_project} has no Protection Bypass for Automation secret, so dev verify cannot "
+                    "call the deployment URL; create one in Settings > Deployment Protection"
+                ],
+            )
+        )
+        return checks
+
+    def bypass_get(request: urllib.request.Request) -> tuple[int, bytes]:
+        """GET with the bypass header (the secret is never printed)."""
+        request.add_header(rvc.BYPASS_HEADER, secret)
+        return (get or rv.http_get)(request)
+
+    started = datetime.now(rr.UTC)
+    for check in service.smoke:
+        parts = urllib.parse.urlsplit(str(check["url"]))
+        target = url + parts.path + (f"?{parts.query}" if parts.query else "")
+        name = f"{check.get('name') or parts.path} (deployment URL)"
+        checks.append(rv.check_http_public({**check, "name": name, "url": target}, bypass_get))
+    # Vercel shows a request's log lines some seconds after the request.
+    (sleep or time.sleep)(service.log_settle_seconds)
+    try:
+        span = (started - timedelta(minutes=1), datetime.now(rr.UTC))
+        rows, _ = api.request_logs(str(project["id"]), *span, deployment=deployment_id, levels=rvc.ERROR_LEVELS)
+        errors, _ = api.request_logs(str(project["id"]), *span, deployment=deployment_id, status_code="5xx")
+    except (rr.RecordError, GuardError) as error:
+        checks.append(rv.Check("deployment_logs", "failed", [f"the request logs cannot be read: {str(error)[:300]}"]))
+        return checks
+    lines = rvc.log_lines(rows, rvc.ERROR_LEVELS)
+    details = [f"{len(lines)} error log lines and {len(errors)} 5xx responses on {deployment_id} during dev verify"]
+    details += [f"{severity}: {text.splitlines()[0][:200]}" for _, _, _, severity, text in lines[:5]]
+    details += [f"{row.get('statusCode')} {row.get('requestPath')}" for row in errors[:5]]
+    checks.append(rv.Check("deployment_logs", "failed" if lines or errors else "passed", details))
+    return checks
+
+
+def check_vercel_domains(service: LightService, record: dict, after: dict[str, dict]) -> rv.Check:
+    """Every production domain points at the deployment this release let go live."""
+    wanted = (record.get("artifacts") or {}).get(service.name)
+    now = (after.get(vercel_key(service)) or {}).get("aliases") or {}
+    problems = [
+        f"{domain} serves {value or 'nothing'}, not {wanted}"
+        for domain, value in sorted(now.items())
+        if value != wanted
+    ]
+    if not wanted:
+        problems = ["the release record names no deployment"]
+    return rv.Check("domains", "failed" if problems else "passed", [f"{len(now)} domains checked", *problems])
+
+
+def vercel_promote(
+    service: LightService,
+    api: rvc.VercelApi,
+    artifacts: dict[str, str],
+    store: rr.Store,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[str]:
+    """Let the verified deployment go live: the commit status success, then Vercel assigns the domains.
+
+    When Vercel holds the project after a rollback (auto-assignment off), or the domains did not move
+    within assign_wait_seconds, the kit promotes the deployment by API (no rebuild). A refused commit
+    status stops here: the kit never promotes around the Deployment Check. The hold guard runs
+    again first: a rollback in the dashboard after preflight must not be undone.
+    """
+    key = vercel_key(service)
+    wanted = str(artifacts.get(service.name) or "")
+    try:
+        if not wanted:
+            raise rr.RecordError("no deployment to promote")
+        deployment = api.deployment(wanted)
+        project = api.project(service.vercel_project)
+        vercel_hold_guard(service, store, api, project)
+        post_commit_status(
+            service, rvc.deployment_commit(deployment), "success", f"release verified; {wanted} goes live"
+        )
+        promoted = False
+        if rvc.in_rollback_state(project):
+            print("Vercel holds the project after a rollback: promote by API (this ends Vercel's hold)", flush=True)
+            api.promote(str(project["id"]), wanted)
+            promoted = True
+        now = rvc.wait_for_aliases(
+            api, service.vercel_domains, wanted, service.assign_wait_seconds, sleep=sleep, clock=clock
+        )
+        if any(value != wanted for value in now.values()) and not promoted:
+            print(f"The domains did not move within {service.assign_wait_seconds} s: promote by API", flush=True)
+            api.promote(str(project["id"]), wanted)
+            now = rvc.wait_for_aliases(
+                api, service.vercel_domains, wanted, service.assign_wait_seconds, sleep=sleep, clock=clock
+            )
+    except (rr.RecordError, GuardError) as error:
+        return [f"{key}: {str(error)[:300]}"]
+    failures = [
+        f"{key}: {domain} serves {value or 'nothing'}, not {wanted}" for domain, value in now.items() if value != wanted
+    ]
+    if not failures:
+        print(f"{key}: {', '.join(service.vercel_domains)} serve {wanted}", flush=True)
+    return failures
+
+
+def evaluate_vercel_window(service: LightService, store: rr.Store, record: dict, now: datetime) -> dict:
+    """The window checks of kind vercel: new error log lines, the 5xx share, the smoke checks and the domains.
+
+    The reads filter by deployment id, so a request served by another deployment (Skew Protection keeps old
+    ones reachable) never counts against the release: control by version.
+    """
+    api = vercel_api(service)
+    scope = rs.release_scope(store, record, now)
+    tree = rs.SourceTree(REPO_ROOT, service.code)
+    token = rr_token(service)
+    parts: dict[str, dict] = {}
+    problems: list[rs.Problem] = []
+    regressions: list[dict] = []
+    warnings: list[dict] = []
+    newest = str((record.get("artifacts") or {}).get(service.name) or "")
+    deployments = [
+        str(value) for release in scope.releases if (value := (release.get("artifacts") or {}).get(service.name))
+    ]
+    oldest = scope.releases[-1]
+    previous = (((oldest.get("previous") or {}).get("workloads") or {}).get(vercel_key(service)) or {}).get(
+        "deployment"
+    )
+    try:
+        project_id = str(api.project(service.vercel_project)["id"])
+    except (rr.RecordError, GuardError, KeyError) as error:
+        detail = f"the Vercel project cannot be read: {str(error)[:300]}"
+        return {
+            "scope": scope.summary(),
+            "parts": {"logs": {"status": "inconclusive", "detail": detail}},
+            "problems": [],
+            "complete": False,
+        }
+    try:
+        found, notes, judged = rvc.new_error_problems(
+            api, project_id, deployments, scope, now, min_count=service.log_min_count
+        )
+        parts["logs"] = {
+            "status": "checked" if judged else "inconclusive",
+            "found": len(found),
+            "detail": "; ".join(notes),
+        }
+        problems += found
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        parts["logs"] = {"status": "inconclusive", "detail": str(error)[:300]}
+    rs.trace_suspects(problems, scope, token=token, repo=service.github_repo, tree=tree, code=service.code)
+    try:
+        length = min(now - scope.window[0], rs.BASELINE)
+        new = rvc.request_counts(api, project_id, newest, scope.window[0], now)
+        old = None
+        if previous and previous not in deployments:
+            old = rvc.request_counts(api, project_id, previous, scope.release_start - length, scope.release_start)
+        status, line = rvc.judge_share(new, old, service.share_limit)
+        # A read that stopped at its page limit leaves the check unfinished (the verdict stays unchecked),
+        # except a capped new total whose upper bound already passes.
+        capped = not new.errors_complete or (old is not None and not (old.complete and old.errors_complete))
+        parts["5xx"] = {"status": "inconclusive" if capped and status != "ok" else status, "detail": line}
+        if status == "exceeded":
+            runtime, why = rv.runtime_change(service, record, token, (oldest.get("previous") or {}).get("commit"))
+            item = {"kind": "metric", "name": "vercel_5xx_share", "text": f"5xx share above the limit: {line}"}
+            if runtime:
+                regressions.append(item)
+            else:
+                item["text"] += f"; {why}, so it does not roll back"
+                warnings.append(item)
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        parts["5xx"] = {"status": "inconclusive", "detail": str(error)[:300]}
+    try:
+        serving = rvc.aliases(api, service.vercel_domains)
+        moved = {domain: value for domain, value in serving.items() if value != newest}
+        domains_detail = "; ".join(
+            f"{domain} serves {value or 'nothing'}, not {newest}" for domain, value in moved.items()
+        )
+    except (rr.RecordError, GuardError) as error:
+        moved, domains_detail = {"?": ""}, f"the domains cannot be read: {str(error)[:300]}"
+    parts["domains"] = {"status": "inconclusive" if moved else "checked", "detail": domains_detail}
+    if moved:
+        # The domains serve another deployment (a rollback in the dashboard, or they cannot be read): the
+        # public smoke checks do not test this release, and an automatic rollback could replace what a
+        # human chose. Nothing fails; the findings are warnings and the checkpoint is inconclusive.
+        parts["smoke"] = {"status": "inconclusive", "detail": "not judged: the domains do not serve this release"}
+    else:
+        failed = [c for c in (rv.check_http_public(check) for check in service.smoke) if c.status == "failed"]
+        parts["smoke"] = {"status": "checked", "found": len(failed), "detail": "; ".join(c.details[0] for c in failed)}
+        regressions += [{"kind": "check", "name": c.name, "text": f"{c.name}: {'; '.join(c.details)}"} for c in failed]
+    complete = all(part.get("status") != "inconclusive" for part in parts.values())
+    return {
+        "scope": scope.summary(),
+        "parts": parts,
+        "problems": [problem.summary() for problem in problems],
+        "regressions": regressions,
+        "warnings": warnings,
+        # cmd_watch: every part, not only the logs, decides "checked"; judge False turns failures into warnings.
+        "complete": complete,
+        "judge": not moved,
+    }
+
+
+def cmd_vercel_wait(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Dev build: wait for Vercel's production deployment of the commit and write it to the out dir.
+
+    0: READY (vercel_deployment.json holds {service: deployment id}); 5: Vercel skipped the build (the
+    app is not affected: the status is success, nothing to release); 1: failed, cancelled for another
+    reason or never built (the status is failure).
+    """
+    _vercel(service)
+    api = vercel_api(service)
+    project_id = str(api.project(service.vercel_project)["id"])
+    deployment = rvc.wait_for_deployment(api, project_id, args.commit, service.deployment_wait_minutes * 60)
+    if deployment is None:
+        post_commit_status(service, args.commit, "failure", "Vercel built no production deployment of this commit")
+        print(f"No Vercel production deployment of {args.commit[:9]} in {service.deployment_wait_minutes} min")
+        return rv.EXIT_ERROR
+    found, state = rvc.deployment_id(deployment), rvc.deployment_state(deployment)
+    if state == "CANCELED" and rvc.skipped_by_ignored_build_step(api.deployment(found)):
+        post_commit_status(service, args.commit, "success", f"not affected: Vercel skipped the build ({found})")
+        print(f"Vercel cancelled {found} (Ignored Build Step: the app is not affected); nothing to release")
+        return rvc.EXIT_NOT_AFFECTED
+    if state != rvc.READY:
+        post_commit_status(service, args.commit, "failure", f"Vercel deployment {found} is {state}")
+        print(f"Vercel deployment {found} of {args.commit[:9]} is {state}", flush=True)
+        return rv.EXIT_ERROR
+    out = Path(args.out_dir) / "vercel_deployment.json"
+    out.write_text(json.dumps({service.name: found}, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Vercel deployment {found} {rvc.deployment_url(deployment)} is READY", flush=True)
+    return rv.EXIT_OK
+
+
+def cmd_vercel_status(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Set the Deployment Check's commit status: given, from the dev index of the commit, or from a gate skip."""
+    _vercel(service)
+    if args.from_dev_index:
+        index, _ = open_store(service, args.dry_run_dir, env="dev").read(rg.dev_commit_index(args.commit))
+        state, description = rvc.gate_status(index or {})
+    elif args.from_skip_file:
+        path = Path(args.from_skip_file)
+        state, description = rvc.skip_status(path.read_text(encoding="utf-8") if path.exists() else "")
+    else:
+        state, description = args.state, args.description
+    if (
+        state == "failure"
+        and description.startswith("stale:")
+        and (live := serving_release(service, store, vercel_api(service), args.commit))
+    ):
+        # A retry of the commit prod already serves: the gate says stale, but the commit passed and is live.
+        state, description = "success", f"already live in prod release {live}"
+    if not state:
+        print(f"Commit status {service.check_context} unchanged: {description}", flush=True)
+        return rv.EXIT_OK
+    post_commit_status(service, args.commit, state, description, args.target_url)
+    return rv.EXIT_OK
+
+
+def serving_release(service: LightService, store: rr.Store, api: rvc.VercelApi, commit: str) -> str:
+    """The prod release id when this exact commit is live, else "".
+
+    Live means: the newest prod record is a deployed promote of the commit, and every configured domain
+    serves its deployment now. A rollback in the dashboard leaves the record as it was, so the domains
+    decide.
+    """
+    pointer, _ = store.read("latest.json")
+    if not pointer or pointer.get("kind") != "promote" or pointer.get("commit") != commit:
+        return ""
+    record = rr.read_record(store, pointer["release_id"])
+    wanted = str((record.get("artifacts") or {}).get(service.name) or "")
+    if record.get("status") != "deployed" or not wanted:
+        return ""
+    if any(value != wanted for value in rvc.aliases(api, service.vercel_domains).values()):
+        return ""
+    return str(record["release_id"])
+
+
+def _vercel(service: LightService) -> None:
+    """Raise ConfigError unless the service is kind vercel."""
+    if service.kind != "vercel":
+        raise rc.ConfigError(f"{service.name} is kind {service.kind}; this command is for kind vercel")
+
+
+# --------------------------------------------------------------------------- kind railway
+
+
+def railway_api(service: LightService, env: str) -> rwy.RailwayApi:
+    """The Railway API with the project token of one environment (RAILWAY_TOKEN_<ENV> or its Secret Manager secret)."""
+    google = GoogleApi(service.project, service.region)
+    secret = dict(service.railway_tokens)[env]
+    return rwy.RailwayApi(rwy.token_source(env, service.project, secret, google.access_token))
+
+
+def railway_key(service: LightService) -> str:
+    """The workload key of a Railway service in snapshots and rollback plans."""
+    return f"railway/{service.name}"
+
+
+def railway_env_id(service: LightService, env: str) -> str:
+    """The Railway environment id of the kit environment (dev or prod)."""
+    return dict(service.railway_environment_ids)[env]
+
+
+def railway_label(service: LightService, env: str) -> str:
+    """The Railway environment's name, for messages."""
+    return dict(service.railway_environments)[env]
+
+
+def snapshot_railway(service: LightService, api: rwy.RailwayApi, env: str = "prod") -> dict[str, dict]:
+    """The deployment that serves the environment now: its id, status, commit and image digest."""
+    live = rwy.serving(api, service.railway_service_id, railway_env_id(service, env)) or {}
+    return {
+        railway_key(service): {
+            "kind": "railway",
+            "environment": railway_label(service, env),
+            "deployment": str(live.get("id") or ""),
+            "status": str(live.get("status") or "none"),
+            "commit": rwy.commit_of(live),
+            "image_digest": rwy.image_of(live),
+            "created_at": str(live.get("createdAt") or ""),
+        }
+    }
+
+
+def railway_deploy(
+    service: LightService,
+    api: rwy.RailwayApi,
+    env: str,
+    commit: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[dict | None, list[str]]:
+    """Deploy the commit to the environment and wait; (the deployment, problems). No problem: it is SUCCESS."""
+    env_id = railway_env_id(service, env)
+    label = railway_label(service, env)
+    try:
+        rwy.check_token_scope(api, service.railway_project_id, env_id, f"{env} ({label})")
+        deployment_id = api.deploy(service.railway_service_id, env_id, commit)
+        print(f"Railway {label}: deployment {deployment_id} of {commit[:9]} started", flush=True)
+        deployment = rwy.wait_for_deployment(
+            api, deployment_id, service.deployment_wait_minutes * 60, sleep=sleep, clock=clock
+        )
+    except (rr.RecordError, GuardError) as error:
+        return None, [str(error)[:300]]
+    problems = []
+    status = str(deployment.get("status") or "")
+    if status in rwy.BUILDING:
+        # It must not go live later, unchecked and after a rollback: cancel the kit's own deployment.
+        try:
+            api.cancel(str(deployment["id"]))
+            status = f"{status}, cancelled after {service.deployment_wait_minutes} min"
+        except (rr.RecordError, GuardError) as error:
+            status = f"{status} after {service.deployment_wait_minutes} min, and the cancel failed: {str(error)[:160]}"
+    if status != rwy.SUCCESS:
+        problems.append(f"Railway {label} deployment {deployment.get('id')} is {status}")
+    if rwy.commit_of(deployment) != commit:
+        problems.append(
+            f"Railway {label} deployment {deployment.get('id')} runs {rwy.commit_of(deployment)[:9] or 'no commit'}"
+        )
+    print(f"Railway {label}: {rwy.describe(deployment)}", flush=True)
+    return deployment, problems
+
+
+def cmd_railway_deploy(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Dev build: deploy the commit to the dev environment and write {service: deployment id} to the out dir."""
+    _railway(service)
+    if args.env != "dev":
+        raise rc.ConfigError("railway-deploy is the dev stage's deploy; the prod build deploys with apply")
+    deployment, problems = railway_deploy(service, railway_api(service, "dev"), "dev", args.commit)
+    if deployment:
+        out = Path(args.out_dir) / "railway_deployment.json"
+        out.write_text(json.dumps({service.name: deployment["id"]}, sort_keys=True) + "\n", encoding="utf-8")
+    for problem in problems:
+        print(f"FAILED: {problem}", file=sys.stderr, flush=True)
+    return rv.EXIT_ERROR if problems else rv.EXIT_OK
+
+
+def railway_dev_artifacts(service: LightService, api: rwy.RailwayApi, record: dict) -> dict[str, str]:
+    """{service: commit} when the dev deployment this build made is SUCCESS, of the commit, in the dev environment.
+
+    The artifact is the commit: the prod build deploys the same source, and Railway builds it again.
+    """
+    wanted = str((record.get("images") or {}).get(service.name) or "")
+    if not wanted:
+        raise rr.RecordError("the dev record names no Railway deployment")
+    deployment = api.deployment(wanted)
+    if deployment.get("environmentId") and deployment["environmentId"] != railway_env_id(service, "dev"):
+        raise rr.RecordError(f"deployment {wanted} is not in {railway_label(service, 'dev')}")
+    if str(deployment.get("status")) not in rwy.SERVING:
+        raise rr.RecordError(f"deployment {wanted} is {deployment.get('status')}")
+    if rwy.commit_of(deployment) != record["commit"]:
+        raise rr.RecordError(f"deployment {wanted} runs {rwy.commit_of(deployment)[:9] or 'no commit'}")
+    return {service.name: record["commit"]}
+
+
+def check_railway_version(
+    service: LightService,
+    env: str,
+    commit: str,
+    get: rv.HttpGet | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> rv.Check | None:
+    """The environment's URL names the commit it runs (railway.version: a JSON field of a path); None when unset."""
+    if not service.version_path:
+        return None
+    url = dict(service.railway_urls)[env] + service.version_path
+    line = ""
+    for attempt in range(3):
+        try:
+            status, body = (get or rv.http_get)(urllib.request.Request(url, headers={"User-Agent": rv.USER_AGENT}))
+            value = json.loads(body.decode("utf-8", "replace")).get(service.version_field) if status == 200 else None
+        except (OSError, ValueError, AttributeError) as error:
+            status, value = 0, None
+            line = f"error: {error}"
+        if isinstance(value, str) and len(value) >= 7 and commit.startswith(value):
+            return rv.Check("version", "passed", [f"GET {url}: {service.version_field} {value}"])
+        line = line or f"HTTP {status}, {service.version_field} {value!r}"
+        if attempt < 2:
+            sleep(10)
+    return rv.Check("version", "failed", [f"GET {url}: {line}, not {commit[:9]}"])
+
+
+def railway_dev_checks(
+    service: LightService,
+    record: dict,
+    api: rwy.RailwayApi,
+    *,
+    get: rv.HttpGet | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> list[rv.Check]:
+    """Dev verify of kind railway: the deployment of the commit serves the dev environment, Railway's auto deploy is
+    off there, the smoke checks pass on the dev URL, and its logs show no error line and no 5xx while they run."""
+    label = railway_label(service, "dev")
+    env_id = railway_env_id(service, "dev")
+    deployment_id = str((record.get("images") or {}).get(service.name) or "")
+    try:
+        deployment = api.deployment(deployment_id)
+        live = rwy.serving(api, service.railway_service_id, env_id)
+    except (rr.RecordError, GuardError) as error:
+        return [rv.Check("deployment", "failed", [str(error)[:300]])]
+    problems = []
+    if str(deployment.get("status")) != rwy.SUCCESS:
+        problems.append(f"{deployment_id} is {deployment.get('status')}")
+    if rwy.commit_of(deployment) != record["commit"]:
+        problems.append(f"{deployment_id} runs {rwy.commit_of(deployment)[:9] or 'no commit'}")
+    if not live or live.get("id") != deployment_id:
+        problems.append(f"{label} serves {(live or {}).get('id') or 'nothing'}, not {deployment_id} (a newer deploy?)")
+    checks = [rv.Check("deployment", "failed" if problems else "passed", [rwy.describe(deployment), *problems])]
+    try:
+        auto = api.auto_deploy(service.railway_project_id, service.railway_service_id, env_id)
+        on = bool(auto.get("enabled"))
+        checks.append(
+            rv.Check(
+                "auto_deploy",
+                "failed" if on else "passed",
+                [
+                    f"Railway auto deploy is ON in {label}: Railway deploys {service.release_branch} by itself, around "
+                    "the release kit. Turn it off (Service > Settings > Source)."
+                    if on
+                    else f"Railway auto deploy is off in {label}"
+                ],
+            )
+        )
+    except (rr.RecordError, GuardError) as error:
+        checks.append(rv.Check("auto_deploy", "skipped", [f"cannot read: {str(error)[:200]}"]))
+    started = datetime.now(rr.UTC)
+    checks += [rv.check_http_public(check, get or rv.http_get) for check in dev_smoke(service)]
+    version = check_railway_version(service, "dev", record["commit"], get, sleep or time.sleep)
+    if version:
+        checks.append(version)
+    # Railway shows a request's log lines some seconds after the request.
+    (sleep or time.sleep)(service.log_settle_seconds)
+    span = (started - timedelta(minutes=1), datetime.now(rr.UTC))
+    try:
+        rows, _ = api.logs(deployment_id, *span, filter_text="@level:error")
+        counts = rwy.request_counts(api, deployment_id, *span)
+    except (rr.RecordError, GuardError) as error:
+        checks.append(rv.Check("deployment_logs", "failed", [f"the logs cannot be read: {str(error)[:300]}"]))
+        return checks
+    lines = rwy.log_lines(rows, deployment_id)
+    details = [f"{len(lines)} error log lines and {counts.errors} 5xx of {counts.total} requests during dev verify"]
+    if not counts.complete:
+        details.append("the HTTP log read stopped at its page limit; a 5xx after it would be unseen")
+    details += [f"{severity}: {text.splitlines()[0][:200]}" for _, _, _, severity, text in lines[:5]]
+    details += [f"5xx {path} x{count}" for path, count in sorted(counts.paths.items())[:5]]
+    checks.append(
+        rv.Check("deployment_logs", "failed" if lines or counts.errors or not counts.complete else "passed", details)
+    )
+    return checks
+
+
+def check_railway_deployment(service: LightService, record: dict, after: dict[str, dict]) -> rv.Check:
+    """Production serves a new deployment of the release's commit, and it is SUCCESS."""
+    key = railway_key(service)
+    now = after.get(key) or {}
+    before = ((record.get("previous") or {}).get("workloads") or {}).get(key) or {}
+    problems = []
+    if now.get("commit") != record["commit"]:
+        problems.append(
+            f"{now.get('environment')} serves {now.get('deployment') or 'nothing'} of "
+            f"{str(now.get('commit') or 'no commit')[:9]}, not {record['commit'][:9]}"
+        )
+    elif before.get("deployment") and now.get("deployment") == before.get("deployment"):
+        problems.append(f"{now.get('environment')} still serves {now.get('deployment')}, the deployment from before")
+    if now.get("status") not in rwy.SERVING:
+        problems.append(f"deployment {now.get('deployment')} is {now.get('status')}")
+    detail = f"{now.get('deployment')} {now.get('status')} commit {str(now.get('commit'))[:9]} image {str(now.get('image_digest'))[:19]}"
+    return rv.Check("deployment", "failed" if problems else "passed", [detail, *problems])
+
+
+def evaluate_railway_window(service: LightService, store: rr.Store, record: dict, now: datetime) -> dict:
+    """The window checks of kind railway: the deployment status, new error log lines, the 5xx share, the smoke checks.
+
+    The reads filter by deployment id: only the release's own deployment counts against it (control by version).
+    """
+    api = railway_api(service, "prod")
+    key = railway_key(service)
+    env_id = railway_env_id(service, "prod")
+    scope = rs.release_scope(store, record, now)
+    tree = rs.SourceTree(REPO_ROOT, service.code)
+    token = rr_token(service)
+    parts: dict[str, dict] = {}
+    problems: list[rs.Problem] = []
+    regressions: list[dict] = []
+    warnings: list[dict] = []
+    newest = str(((record.get("workloads") or {}).get(key) or {}).get("deployment") or "")
+    deployments = [
+        str(value)
+        for release in scope.releases
+        if (value := ((release.get("workloads") or {}).get(key) or {}).get("deployment"))
+    ]
+    oldest = scope.releases[-1]
+    previous = str((((oldest.get("previous") or {}).get("workloads") or {}).get(key) or {}).get("deployment") or "")
+    moved = True
+    try:
+        mine = api.deployment(newest) if newest else {}
+        live = rwy.serving(api, service.railway_service_id, env_id) or {}
+        moved = live.get("id") != newest
+        status = str(mine.get("status") or "unknown")
+        detail = f"{newest or 'no deployment recorded'} is {status}; production serves {live.get('id') or 'nothing'}"
+        crashed = status in ("CRASHED", "FAILED")
+        parts["deployment"] = {"status": "inconclusive" if moved and not crashed else "checked", "detail": detail}
+        if crashed:
+            moved = False  # the release's own deployment failed: judge it
+            regressions.append({"kind": "check", "name": "deployment", "text": f"deployment: {detail}"})
+    except (rr.RecordError, GuardError) as error:
+        parts["deployment"] = {"status": "inconclusive", "detail": f"Railway cannot be read: {str(error)[:300]}"}
+    try:
+        since = min((start for start, _ in scope.baseline), default=scope.window[0])
+        listed, listed_all = api.deployments(service.railway_service_id, env_id, since=since)
+        if not listed_all:
+            raise rr.RecordError("the deployments of the 24 h baseline do not fit the list pages; new lines not judged")
+        baseline = [
+            (rwy.baseline_deployments(listed, start, end, deployments), start, end) for start, end in scope.baseline
+        ]
+        found, notes, judged = rwy.new_error_problems(
+            api, deployments, baseline, scope, now, min_count=service.log_min_count
+        )
+        parts["logs"] = {
+            "status": "checked" if judged else "inconclusive",
+            "found": len(found),
+            "detail": "; ".join(notes),
+        }
+        problems += found
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        parts["logs"] = {"status": "inconclusive", "detail": str(error)[:300]}
+    rs.trace_suspects(problems, scope, token=token, repo=service.github_repo, tree=tree, code=service.code)
+    try:
+        length = min(now - scope.window[0], rs.BASELINE)
+        new = rwy.request_counts(api, newest, scope.window[0], now)
+        old = None
+        if previous and previous not in deployments:
+            old = rwy.request_counts(api, previous, scope.release_start - length, scope.release_start)
+        status, line = rvc.judge_share(new, old, service.share_limit)
+        # As for kind vercel: a read that stopped at its page limit leaves the check unfinished.
+        capped = not new.errors_complete or (old is not None and not (old.complete and old.errors_complete))
+        parts["5xx"] = {"status": "inconclusive" if capped and status != "ok" else status, "detail": line}
+        if status == "exceeded":
+            runtime, why = rv.runtime_change(service, record, token, (oldest.get("previous") or {}).get("commit"))
+            item = {"kind": "metric", "name": "railway_5xx_share", "text": f"5xx share above the limit: {line}"}
+            if runtime:
+                regressions.append(item)
+            else:
+                item["text"] += f"; {why}, so it does not roll back"
+                warnings.append(item)
+    except (rr.RecordError, GuardError, OSError, ValueError, KeyError) as error:
+        parts["5xx"] = {"status": "inconclusive", "detail": str(error)[:300]}
+    if moved:
+        # Production serves another deployment (a manual deploy or a dashboard rollback): the smoke checks
+        # do not test this release, and a rollback could replace what a human chose. Nothing fails.
+        parts["smoke"] = {"status": "inconclusive", "detail": "not judged: production does not serve this release"}
+    else:
+        checks = [rv.check_http_public(check) for check in service.smoke]
+        version = check_railway_version(service, "prod", record["commit"])
+        checks += [version] if version else []
+        failed = [check for check in checks if check.status == "failed"]
+        parts["smoke"] = {"status": "checked", "found": len(failed), "detail": "; ".join(c.details[0] for c in failed)}
+        regressions += [{"kind": "check", "name": c.name, "text": f"{c.name}: {'; '.join(c.details)}"} for c in failed]
+    complete = all(part.get("status") != "inconclusive" for part in parts.values())
+    return {
+        "scope": scope.summary(),
+        "parts": parts,
+        "problems": [problem.summary() for problem in problems],
+        "regressions": regressions,
+        "warnings": warnings,
+        "complete": complete,
+        "judge": not moved,
+    }
+
+
+def railway_migrations(service: LightService, base: str | None, head: str | None) -> dict | None:
+    """The migration state of base..head ({"migrations": [...]} or {"unknown": why}); None without a migrations rule."""
+    if not service.migrations_prefix:
+        return None
+    return rwy.migrations_between(
+        service.github_repo, base, head, service.migrations_prefix, service.migrations_suffix, rr_token(service)
+    )
+
+
+def forward_state(service: LightService, record: dict) -> dict | None:
+    """The migration state of the range a failed release would roll back, when it forbids the rollback; else None.
+
+    The range runs from the suggested rollback target (an older release when a window judged several
+    together) to the release; the release's own range alone could miss an older release's migration.
+    """
+    if not service.migrations_prefix:
+        return None
+    target = ((record.get("rollback_suggestion") or {}).get("target") or {}).get("commit")
+    base = target or (record.get("previous") or {}).get("commit")
+    state = record.get("migrations")
+    if state is None or "unknown" in state or (target and target != (record.get("previous") or {}).get("commit")):
+        state = railway_migrations(service, base, record["commit"])
+    return state if rwy.forward_only(state) else None
+
+
+def forward_resume(service: LightService, release_id: str) -> str:
+    """How a forward-only hold ends."""
+    return (
+        f"merge a forward fix whose commit message has the trailer `Fixes-release: {release_id}` (a revert does not "
+        "end this hold: the database keeps the migration), or run "
+        f"`{service.kit_command('release_gate.py', 'resume')} --reason '<why>'`"
+    )
+
+
+def forward_hold(service: LightService, store: rr.Store, record: dict, *, force: bool = False) -> None:
+    """A failed release that changed the database schema: no rollback; hold prod deploys and ping the author.
+
+    The hold lives on the failed release's own record (promote_hold with forward_only); release_gate.py
+    holds every later deploy until a commit with `Fixes-release: <release id>` or `resume`.
+    """
+    if not force and os.environ.get("RELEASE_AUTO_ROLLBACK", "").strip() != "1":
+        print("Forward-only release failed; this run holds nothing (RELEASE_AUTO_ROLLBACK is not 1)", flush=True)
+        return
+    release_id = record["release_id"]
+    state = record.get("migrations") or {}
+    why = ", ".join(state.get("migrations") or []) or str(state.get("unknown") or "a migration")
+
+    def change(current: dict) -> None:
+        """Write the forward-only hold, unless it is there already."""
+        if current.get("promote_hold"):
+            return  # saved already, or a human resumed or a fix was seen: never overwrite it
+        current["promote_hold"] = {
+            "status": "held",
+            "forward_only": True,
+            "since": rr.utc_now(),
+            "rolled_back_release": release_id,
+            "rolled_back_commit": record["commit"],
+            "prs": [],
+            "migrations": state,
+            "resume": forward_resume(service, release_id),
+        }
+        current["auto_rollback"] = {"status": "skipped", "reason": f"forward-only: {why[:300]}", "at": rr.utc_now()}
+
+    saved = rr.update_record(store, release_id, change, "forward_hold", {"why": why[:200]})
+    if (saved.get("alert") or {}).get("posted"):
+        return
+    location = store.location(rr.record_name(release_id))
+    text, blocks = forward_alert(service, saved, location, why)
+    if rr.post_slack(text, blocks):
+        rr.update_record(
+            store,
+            release_id,
+            lambda current: current.__setitem__("alert", {"posted": True, "at": rr.utc_now()}),
+            "alert_posted",
+        )
+
+
+def forward_alert(service: LightService, record: dict, location: str, why: str) -> tuple[str, list[dict]]:
+    """The Slack message of a failed forward-only release: hold, who should fix it, a prompt to paste."""
+    people = rv.load_people()
+    suspects = rv.likely_prs(record)
+    who = " ".join(rv._mentions(people, suspects)) or "Someone"
+    short = record["commit"][:9]
+    reasons = "\n".join(
+        f"• {rv._slack_escape(rv._clip(reason, 300))}"
+        for reason in ((record.get("verdict") or {}).get("reasons") or [])[:5]
+    )
+    prompt = "\n".join(
+        [
+            f"{service.title} prod release {record['release_id']} (commit {short}) failed release-verify. It changes "
+            f"the database schema ({why[:200]}), so it did not roll back: an older build does not start against the "
+            "newer schema. Production still runs it, and automatic prod deploys hold.",
+            "",
+            "What regressed:",
+            *[
+                f"- {rv._clip(reason, 300)}"
+                for reason in ((record.get("verdict") or {}).get("reasons") or ["see the record"])[:5]
+            ],
+            "",
+            f"In {service.github_repo}:",
+            f"1. Read {service.docs} and the release record: gcloud storage cat {location}",
+            "2. Confirm the cause with the Railway logs named above.",
+            "3. Fix it forward on the release branch with a test (a new migration if the schema must change again). "
+            f"Put the trailer 'Fixes-release: {record['release_id']}' in the commit message. A revert of the PR does "
+            "not end the hold.",
+            "4. Open the PR as me and follow the PR review loop in AGENTS.md. After it merges it deploys by itself.",
+        ]
+    )
+    header = f":octagonal_sign: {service.title} prod release failed; forward-only, no rollback"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"Release `{record['release_id']}` (`{short}`) failed release-verify. It changes the database "
+                    f"schema ({rv._slack_escape(why[:200])}), so the kit did not roll it back. Prod deploys hold "
+                    f"until a commit with `Fixes-release: {record['release_id']}` merges."
+                ),
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*What regressed*\n{reasons or '• see the record'}"}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{who}: please fix it forward. Paste this prompt into Claude Code or Codex:",
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{rv._slack_escape(prompt)[:2900]}```"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Record `{location}`"}]},
+    ]
+    return (
+        f":octagonal_sign: {service.title} release {short} failed (forward-only, no rollback). {who}: please fix it forward.",
+        blocks,
+    )
+
+
+def railway_rollback_steps(
+    service: LightService, api: rwy.RailwayApi, latest: dict, target: dict
+) -> tuple[list[rb.Step], list[str], list[str]]:
+    """(steps, problems, notes) of a Railway rollback: redeploy the deployment that served before the target release."""
+    key = railway_key(service)
+    wanted = str(((target.get("workloads") or {}).get(key) or {}).get("deployment") or "")
+    live = rwy.serving(api, service.railway_service_id, railway_env_id(service, "prod")) or {}
+    have = str(live.get("id") or "") or None
+    problems: list[str] = []
+    notes = [
+        "Railway redeploys the target deployment with its image (no rebuild) and the current variables; "
+        "a target whose image is gone is rebuilt from its commit"
+    ]
+    recorded = str(((latest.get("workloads") or {}).get(key) or {}).get("deployment") or "")
+    for item in api.building(service.railway_service_id, railway_env_id(service, "prod")):
+        # A deployment still in flight would replace the rollback when it finishes.
+        problems.append(
+            f"{key}: deployment {item.get('id')} of {rwy.commit_of(item)[:9] or 'no commit'} is still "
+            f"{item.get('status')} in production; cancel it in Railway or wait, then roll back"
+        )
+    action = "skip"
+    if not wanted:
+        problems.append(f"{key}: the target release recorded no deployment")
+    else:
+        try:
+            target_deployment = api.deployment(wanted)
+            same = rwy.image_of(target_deployment) and rwy.image_of(target_deployment) == rwy.image_of(live)
+            action = "none" if same and rwy.commit_of(target_deployment) == rwy.commit_of(live) else "set"
+            if not target_deployment.get("canRedeploy") and not rwy.commit_of(target_deployment):
+                problems.append(f"{key}: {wanted} can no longer be redeployed and has no commit to rebuild")
+        except (rr.RecordError, GuardError) as error:
+            problems.append(f"{key}: deployment {wanted} cannot be read: {str(error)[:200]}")
+    if action == "set" and recorded and have and have != recorded:
+        # Production serves a deployment the kit did not record (a `railway up`, a dashboard redeploy or
+        # rollback): a rollback would replace what a human chose.
+        problems.append(
+            f"{key}: production serves {have}, not {recorded} that the release kit recorded (a deploy outside the "
+            "kit?); a human decides"
+        )
+    state = railway_migrations(service, target.get("commit"), latest.get("commit"))
+    if action == "set" and rwy.forward_only(state):
+        found = ", ".join((state or {}).get("migrations") or []) or str((state or {}).get("unknown"))
+        problems.append(
+            f"{key}: the commits since {str(target.get('commit'))[:9]} change the database schema ({found[:200]}); "
+            "an older build does not start against it. Forward-only: fix it forward"
+        )
+    return [rb.Step(key, service.name, "deployment", have, wanted or None, action)], problems, notes
+
+
+def railway_rollback(service: LightService, api: rwy.RailwayApi, target: str, target_commit: str | None) -> list[str]:
+    """Redeploy the target deployment (its image; a rebuild of its commit when the image is gone); return failures."""
+    env_id = railway_env_id(service, "prod")
+    rwy.check_token_scope(api, service.railway_project_id, env_id, "prod")
+    old = api.deployment(target)
+    if old.get("canRedeploy"):
+        new_id = str(api.redeploy(target).get("id") or "")
+    else:
+        commit = rwy.commit_of(old) or str(target_commit or "")
+        print(f"{target} can no longer be redeployed; rebuilding its commit {commit[:9]}", flush=True)
+        new_id = api.deploy(service.railway_service_id, env_id, commit)
+    deployment = rwy.wait_for_deployment(api, new_id, service.deployment_wait_minutes * 60)
+    print(f"railway/{service.name}: {target} redeployed as {rwy.describe(deployment)}", flush=True)
+    failures = []
+    if deployment.get("status") in rwy.BUILDING:
+        # It must not go live later, after the lock is free and without a record: cancel it.
+        try:
+            api.cancel(new_id)
+            deployment = {**deployment, "status": f"{deployment.get('status')}, cancelled after the wait"}
+        except (rr.RecordError, GuardError) as error:
+            deployment = {**deployment, "status": f"{deployment.get('status')}; the cancel failed: {str(error)[:160]}"}
+    if deployment.get("status") != rwy.SUCCESS:
+        failures.append(f"railway/{service.name}: the rollback deployment {new_id} is {deployment.get('status')}")
+    if rwy.image_of(old) and rwy.image_of(deployment) and rwy.image_of(old) != rwy.image_of(deployment):
+        print(f"NOTE: the rollback runs image {rwy.image_of(deployment)[:19]}, not {rwy.image_of(old)[:19]} (rebuilt)")
+    return failures
+
+
+def _railway(service: LightService) -> None:
+    """Raise ConfigError unless the service is kind railway."""
+    if service.kind != "railway":
+        raise rc.ConfigError(f"{service.name} is kind {service.kind}; this command is for kind railway")
+
+
+# --------------------------------------------------------------------------- kind static_site
+
+
+def snapshot_static(service: LightService) -> dict[str, dict]:
+    """The site now: the sitemap's status and page count."""
+    site = service.site
+    assert site is not None
+    status, text = rst.fetch(rst.http_get, site.url + site.sitemap_path)
+    return {
+        f"static/{service.name}": {
+            "kind": "static_site",
+            "url": site.url,
+            "sitemap_status": status,
+            "sitemap_urls": len(rst.sitemap_urls(text)) if status == 200 else None,
+        }
+    }
+
+
+def last_published(store: rr.Store, record: dict | None, limit: int = 20) -> dict | None:
+    """The newest record from this one back that went live (status deployed), else None."""
+    for _ in range(limit):
+        if not record or record.get("status") == "deployed":
+            return record
+        previous_id = (record.get("previous") or {}).get("release_id")
+        record = rr.read_record(store, previous_id) if previous_id else None
+    return None
+
+
+def static_pages(
+    service: LightService,
+    store: rr.Store,
+    record: dict,
+    *,
+    strict_content: bool,
+    get: rst.Get | None = None,
+    base: dict | None = None,
+) -> rst.PageResult:
+    """The page checks of a release: the pages changed since base (default: the release; the window passes the
+    oldest release it judges), and the page count of the release before base."""
+    site = service.site
+    assert site is not None
+    base = base or record
+    previous_id = (base.get("previous") or {}).get("release_id")
+    previous_count = None
+    if previous_id:
+        try:
+            before = rr.read_record(store, previous_id)
+            previous_count = ((before.get("workloads") or {}).get(f"static/{service.name}") or {}).get("sitemap_urls")
+        except (rr.RecordError, GuardError) as error:
+            print(f"WARNING: the previous release cannot be read: {str(error)[:200]}", file=sys.stderr, flush=True)
+
+    def read(path: str) -> str | None:
+        """A page file of the release's source tree (the build's checkout or the window build's copy)."""
+        try:
+            return (REPO_ROOT / path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    changes = rst.changed_pages(
+        service.github_repo,
+        (base.get("previous") or {}).get("commit"),
+        record["commit"],
+        site,
+        rr_token(service),
+        read,
+    )
+    return rst.check_pages(
+        site, record["commit"], changes, previous_count, strict_content=strict_content, get=get or rst.http_get
+    )
+
+
+def static_publish_check(service: LightService, record: dict) -> rv.Check:
+    """The publisher's check run of the commit succeeded (read now, no wait)."""
+    site = service.site
+    assert site is not None
+    token = rr_token(service)
+    if not token:
+        return rv.Check("publish", "failed", ["no GitHub token to read the publisher's check run"])
+    try:
+        run = rst.check_run(service.github_repo, record["commit"], site.publisher_check, token)
+    except (GuardError, OSError, ValueError) as error:
+        return rv.Check("publish", "failed", [f"the check run cannot be read: {str(error)[:200]}"])
+    ok = bool(run) and run.get("status") == "completed" and run.get("conclusion") in rst.PUBLISHED  # type: ignore[union-attr]
+    return rv.Check("publish", "passed" if ok else "failed", [rst.run_line(run)])
+
+
+def static_deploy_checks(service: LightService, store: rr.Store, record: dict) -> list[rv.Check]:
+    """+0: the publish succeeded, then the page checks; a changed page without its new title only warns."""
+    checks = [static_publish_check(service, record)]
+    if checks[0].status != "passed":
+        return checks
+    result = static_pages(service, store, record, strict_content=False)
+    details = [json.dumps(result.facts, sort_keys=True), *result.failures, *[f"warning: {w}" for w in result.warnings]]
+    checks.append(rv.Check("pages", "failed" if result.failures else "passed", details))
+    return checks
+
+
+def evaluate_static_window(service: LightService, store: rr.Store, record: dict, now: datetime) -> dict:
+    """The window checks of kind static_site: every page check, a changed page without its title fails now."""
+    scope = rs.release_scope(store, record, now)
+    # The pages of every release this checkpoint judges: a newer merge must not drop an older one's checks.
+    result = static_pages(service, store, record, strict_content=True, base=scope.releases[-1])
+    regressions = [
+        {"kind": "check", "name": f"pages_{index}", "text": text} for index, text in enumerate(result.failures)
+    ]
+    warnings = [
+        {"kind": "check", "name": f"pages_warning_{index}", "text": text} for index, text in enumerate(result.warnings)
+    ]
+    return {
+        "scope": scope.summary(),
+        "parts": {
+            "pages": {
+                "status": "checked" if result.complete else "inconclusive",
+                "found": len(result.failures),
+                "detail": json.dumps(result.facts, sort_keys=True),
+            }
+        },
+        "problems": [],
+        "regressions": regressions,
+        "warnings": warnings,
+        "complete": result.complete,
+        "judge": True,
+    }
+
+
+def static_alert(service: LightService, record: dict, location: str, command: str) -> tuple[str, list[dict]]:
+    """The Slack message of a failed static-site release: the author ping, the revert command and a fix prompt."""
+    people = rv.load_people()
+    suspects = rv.likely_prs(record) or [item for item in record.get("commits") or [] if item.get("sha")][-3:]
+    who = " ".join(rv._mentions(people, suspects)) or "Someone"
+    short = record["commit"][:9]
+    reasons = [
+        rv._clip(reason, 300) for reason in ((record.get("verdict") or {}).get("reasons") or ["see the record"])[:5]
+    ]
+    published = record.get("status") != "deploy_failed"
+    state = (
+        "It is live: the publisher published it, and nothing reverts by itself."
+        if published
+        else "Nothing went live: the publisher's check run did not succeed."
+    )
+    prompt = "\n".join(
+        [
+            f"{service.title} release {record['release_id']} (commit {short}) failed its release check. {state}",
+            "",
+            "What failed:",
+            *[f"- {reason}" for reason in reasons],
+            "",
+            f"In {service.github_repo}:",
+            f"1. Read {service.docs} and the release record: gcloud storage cat {location}",
+            "2. Open the failing pages on the live site and confirm the cause.",
+            f"3. Fix it on {service.release_branch} (run npm run check), or revert the release when a fix is not quick:",
+            f"   {command}",
+            "4. Open the PR as me and follow the PR review loop in AGENTS.md. It publishes when it merges.",
+        ]
+    )
+    header = f":rotating_light: {service.title} release check failed"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Release `{record['release_id']}` (`{short}`): {rv._slack_escape(state)}\n"
+                + "\n".join(f"• {rv._slack_escape(reason)}" for reason in reasons),
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{who}: please fix or revert it. Revert:\n```{rv._slack_escape(command)}```",
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": "Or paste this prompt into Claude Code or Codex:"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{rv._slack_escape(prompt)[:2900]}```"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Record `{location}`"}]},
+    ]
+    return f"{header}: release {short}. {who}: please fix or revert it.", blocks
+
+
+def cmd_static_wait(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
+    """Merge build: wait for the publisher's check run; 0 published, 5 nothing published, 1 failed or missing."""
+    if service.kind != "static_site" or service.site is None:
+        raise rc.ConfigError(f"{service.name} is kind {service.kind}; static-wait is for kind static_site")
+    token = rr_token(service)
+    if not token:
+        raise rr.RecordError("no GitHub token to read the publisher's check run")
+    outcome, run = rst.wait_for_publish(service.github_repo, args.commit, service.site, token)
+    Path(args.out_dir, "static_publish.json").write_text(
+        json.dumps({"outcome": outcome, "run": rst.run_line(run)}, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"{service.site.publisher_check} on {args.commit[:9]}: {outcome} ({rst.run_line(run)})", flush=True)
+    if outcome == "nothing":
+        return rst.EXIT_NOTHING_PUBLISHED
+    return rv.EXIT_OK if outcome == "published" else rv.EXIT_ERROR
 
 
 # --------------------------------------------------------------------------- checks
@@ -920,7 +2394,14 @@ def deploy_checks(
 ) -> tuple[list[rv.Check], dict[str, dict]]:
     """Run the deploy checks and the public smoke checks; return them with the snapshot after the deploy."""
     after = snapshot(service, runner, token)
-    if service.kind == "cloud_run" and service.has_gate:
+    if service.kind == "railway":
+        checks = [check_railway_deployment(service, record, after)]
+        checks += [rv.check_http_public(check, get) for check in service.smoke]
+        version = check_railway_version(service, "prod", record["commit"], get)
+        return checks + ([version] if version else []), after
+    if service.kind == "vercel":
+        checks = [check_vercel_domains(service, record, after)]
+    elif service.kind == "cloud_run" and service.has_gate:
         checks = [check_promoted_revisions(service, record, after)]
     elif service.kind == "cloud_run":
         checks = [check_cloud_run(record.get("previous_snapshot") or {}, after)]
@@ -974,6 +2455,9 @@ def rollback_command(service: LightService, record: dict, target: dict | None = 
     if service.has_gate:
         return f"{rv.rollback_cli(service, 'run', target)} --reason '<why>'"
     previous = record.get("previous") or {}
+    if service.kind == "static_site":
+        # No rollback exists: the command opens a revert PR of the release's commits; a human merges it.
+        return rst.revert_command(service.github_repo, service.release_branch, record["commit"], previous.get("commit"))
     if service.kind == "composer":
         commit = previous.get("commit") or "<previous commit>"
         return (
@@ -1021,12 +2505,17 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
     else:
         before = snapshot(service, runner, token)
     artifacts = _json_file(args.artifacts_file)
+    if service.kind == "railway" and not dev and not artifacts:
+        artifacts = {service.name: args.commit}
     if service.has_gate and not dev and not artifacts:
         raise rr.RecordError("tier full: the prod record needs --artifacts-file (what the build promotes)")
     pointer, _ = store.read("latest.json")
     previous: dict = {"release_id": None, "commit": None}
     if pointer:
         record, _ = store.read(rr.record_name(pointer["release_id"]))
+        if service.kind == "static_site":
+            # The comparison base is the newest release that went live: a failed publish changed nothing.
+            record = last_published(store, record)
         if record:
             previous = {
                 "release_id": record["release_id"],
@@ -1035,6 +2524,12 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
             }
             if service.has_gate and record.get("artifacts"):
                 previous["artifacts"] = record["artifacts"]
+    serving_commit = ((before.get(f"railway/{service.name}") or {}).get("commit")) if service.kind == "railway" else ""
+    if serving_commit and serving_commit != previous["commit"]:
+        # Railway keeps the old deployment when a deploy fails, so the newest record may name a commit that
+        # never served. The commits since, the migration range and the rollback check start at what serves.
+        previous["recorded_commit"] = previous["commit"]
+        previous["commit"] = serving_commit
     if not previous["commit"] and args.previous_commit:
         previous["commit"] = args.previous_commit
     if service.has_gate and not dev:
@@ -1058,6 +2553,13 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
     record["previous_snapshot"] = before
     if artifacts:
         record["artifacts"] = artifacts
+    if service.kind == "railway" and not dev:
+        # Whether the commits since the last release change the database schema: such a release never
+        # rolls back by itself (forward-only).
+        state = railway_migrations(service, previous.get("commit"), args.commit)
+        if state is not None:
+            record["migrations"] = state
+            print(f"Migrations since {str(previous.get('commit'))[:9]}: {json.dumps(state)[:300]}", flush=True)
     rr.create_record(store, record, "deploy_started")
     Path(args.release_id_file).write_text(record["release_id"] + "\n", encoding="utf-8")
     print(f"Release {record['release_id']}: {store.location(rr.record_name(record['release_id']))}", flush=True)
@@ -1066,7 +2568,13 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
 
 
 def dev_artifacts(service: LightService, record: dict, after: dict, runner: Runner) -> dict[str, str]:
-    """What the dev stage holds now: the candidate revisions (cloud_run) or the candidate folder (composer)."""
+    """What the dev stage holds now: the candidate revisions (cloud_run), the deployment Vercel built (vercel),
+    or the candidate folder (composer)."""
+    if service.kind == "vercel":
+        wanted = str((record.get("images") or {}).get(service.name) or "")
+        return vercel_deployment_artifacts(service, vercel_api(service), record["commit"], wanted)
+    if service.kind == "railway":
+        return railway_dev_artifacts(service, railway_api(service, "dev"), record)
     if service.kind == "cloud_run":
         return revision_artifacts(service, runner, candidate_revisions(service, after))
     return composer_artifacts(
@@ -1086,6 +2594,11 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
     problem = ""
     if args.env == "dev":
         after = snapshot_cloud_run(service, runner) if service.kind == "cloud_run" else {}
+        if service.kind == "railway":
+            try:
+                after = snapshot_railway(service, railway_api(service, "dev"), "dev")
+            except (rr.RecordError, GuardError) as error:
+                print(f"WARNING: no dev snapshot: {str(error)[:200]}", file=sys.stderr, flush=True)
         try:
             artifacts = dev_artifacts(service, rr.read_record(store, release_id), after, runner)
         except (rr.RecordError, GuardError) as error:
@@ -1097,8 +2610,8 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
     def finish(record: dict) -> None:
         """Write the snapshot, the status and the deploy finish time on the record."""
         record["workloads"] = after
+        rr.keep_finish_time(record, args.status)
         record["status"] = args.status
-        record.setdefault("times", {})["deploy_finished"] = rr.utc_now()
         if args.env == "dev":
             record["artifacts"] = artifacts
             if problem:
@@ -1127,21 +2640,36 @@ def _fail(
     """Set the failed verdict and the suggestion (the rollback command for a human).
 
     A window that judges several releases together and blames an older one suggests
-    what ran before that older release, from its own record.
+    what ran before that older release, from its own record. A metric or check failure
+    over several unjudged releases cannot tell which one regressed: it suggests what ran
+    before the oldest of them (release_verify.apply_result does the same for GKE), and
+    the suspects come from the commits of every release it removes.
     """
     base = record
     target = None
+    commits = None
     if new_errors:
         target = rs.rollback_target(record, store, new_errors.get("problems") or [], new_errors.get("scope") or {})
-        if target:
-            base = rr.read_record(store, target["rollback_to"].split(":", 1)[1])
+    chain = list(((new_errors or {}).get("scope") or {}).get("releases") or [])
+    if len(chain) > 1 and any(item.get("kind") != "new_error" for item in regressions):
+        target = {"rollback_to": f"previous-of:{chain[-1]}"}
+    if target:
+        culprit = target["rollback_to"].split(":", 1)[1]
+        base = rr.read_record(store, culprit)
+        removed = chain[: chain.index(culprit) + 1] if culprit in chain else [record["release_id"]]
+        if len(removed) > 1:
+            commits = []
+            for release_id in reversed(removed):
+                commits += rr.read_record(store, release_id).get("commits") or []
     previous = base.get("previous") or {}
     suggestion = {
         "created_at": rr.utc_now(),
         "phase": phase,
         "summary": f"{len(regressions)} problem(s): " + "; ".join(item["text"] for item in regressions[:3]),
         "regressions": regressions,
-        "suspected_prs": rv.suspected_prs(service, record, regressions, rr_token(service)),
+        "suspected_prs": rv.suspected_prs(
+            service, {**record, "commits": commits} if commits is not None else record, regressions, rr_token(service)
+        ),
         "target": {
             "release_id": previous.get("release_id"),
             "commit": previous.get("commit"),
@@ -1181,6 +2709,9 @@ def rr_token(service: LightService) -> str | None:
 
 def on_failed(service: LightService, store: rr.Store, record: dict) -> None:
     """A failed prod release: tier full starts the rollback trigger (release_verify.start_rollback), else the alert."""
+    if service.kind == "railway" and forward_state(service, record) is not None:
+        forward_hold(service, store, {**record, "migrations": forward_state(service, record)})
+        return
     if service.auto_rollback:
         rv.start_rollback(service, store, record)
     else:
@@ -1206,7 +2737,10 @@ def alert(service: LightService, store: rr.Store, record: dict) -> None:
         print("The failed-release alert was sent already", flush=True)
         return
     location = store.location(rr.record_name(record["release_id"]))
-    text, blocks = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
+    if service.kind == "static_site":
+        text, blocks = static_alert(service, record, location, suggested(service, record))
+    else:
+        text, blocks = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
     if not rr.post_slack(text, blocks):
         return
     try:
@@ -1228,7 +2762,10 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
     if service.kind == "composer" and args.wait:
         print(f"Waiting {service.parse_wait_seconds} s for the DAG processor", flush=True)
         time.sleep(service.parse_wait_seconds)
-    checks, after = deploy_checks(service, record, runner, GoogleApi(service.project, service.region).access_token)
+    if service.kind == "static_site":
+        checks = static_deploy_checks(service, store, record)
+    else:
+        checks, _ = deploy_checks(service, record, runner, GoogleApi(service.project, service.region).access_token)
     if record.get("status") == "deploy_failed":
         checks.insert(0, rv.Check("deploy", "failed", ["the deploy step failed (status deploy_failed)"]))
     for check in checks:
@@ -1263,10 +2800,19 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 f"{rv.TEST_RUN_LINE}. A test of {service.title} release-verify failed on purpose; no action needed."
             )
         elif service.auto_rollback:
-            # The watch-window build sees the failed verdict at once and starts the rollback trigger.
+            # The watch-window build sees the failed verdict at once and starts the rollback trigger. A
+            # forward-only release holds now, before another prod build can pass the gate.
+            state = forward_state(service, saved) if service.kind == "railway" else None
+            if state is not None:
+                forward_hold(service, store, {**saved, "migrations": state}, force=True)
+            follows = (
+                "It changes the database schema (forward-only): no rollback; prod deploys hold."
+                if state is not None
+                else "An automatic rollback follows."
+            )
             rr.post_slack(
                 f":rotating_light: {service.title} release-verify {record['commit'][:9]} FAILED (deploy): "
-                f"{saved['rollback_suggestion']['summary'][:300]} An automatic rollback follows. Record {where}"
+                f"{saved['rollback_suggestion']['summary'][:300]} {follows} Record {where}"
             )
         else:
             alert(service, store, saved)
@@ -1287,6 +2833,10 @@ def dev_checks(service: LightService, record: dict, args: argparse.Namespace, ru
     artifacts = record.get("artifacts") or {}
     if not artifacts:
         checks.append(rv.Check("artifacts", "failed", [record.get("artifacts_error") or "the dev record has none"]))
+    elif service.kind == "vercel":
+        checks += vercel_dev_checks(service, record, vercel_api(service))
+    elif service.kind == "railway":
+        checks += railway_dev_checks(service, record, railway_api(service, "dev"))
     elif service.kind == "cloud_run":
         problems = []
         now = candidate_revisions(service, snapshot_cloud_run(service, runner))
@@ -1373,7 +2923,17 @@ def cmd_dev_verify(args: argparse.Namespace, service: LightService, store: rr.St
 
 
 def evaluate_window(service: LightService, store: rr.Store, record: dict, runner: Runner, now: datetime) -> dict:
-    """New error log lines (and composer: newly failing DAGs), traced to suspects."""
+    """New error log lines (and composer: newly failing DAGs), traced to suspects.
+
+    Kind vercel reads Vercel's request logs instead (evaluate_vercel_window); its result also carries
+    "regressions" and "warnings" of its own (the 5xx share, the smoke checks).
+    """
+    if service.kind == "vercel":
+        return evaluate_vercel_window(service, store, record, now)
+    if service.kind == "railway":
+        return evaluate_railway_window(service, store, record, now)
+    if service.kind == "static_site":
+        return evaluate_static_window(service, store, record, now)
     token = GoogleApi(service.project, service.region).access_token
     scope = rs.release_scope(store, record, now)
     logs = rs.CloudLogging(service.project, token)
@@ -1565,16 +3125,19 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             for problem in new_errors["problems"]
             if not problem["clear"] and problem.get("suspects") and problem["suspects"][0].get("linked")
         ]
+        # Kind vercel: the 5xx share and the smoke checks judge the release too. When the domains no longer
+        # serve the release (judge False), nothing fails: every finding is a warning.
+        regressions += list(new_errors.get("regressions") or [])
+        warnings += list(new_errors.get("warnings") or [])
+        if new_errors.get("judge") is False:
+            warnings, regressions = warnings + regressions, []
+        checked = window_checked(new_errors)
         result = {
             "phase": "window",
             "at": rr.utc_now(),
             "new_errors": new_errors,
             "warnings": warnings,
-            "result": "failed"
-            if regressions
-            else "passed"
-            if new_errors["parts"].get("logs", {}).get("status") == "checked"
-            else "inconclusive",
+            "result": "failed" if regressions else "passed" if checked else "inconclusive",
         }
         fresh: list[dict] = []
 
@@ -1607,12 +3170,12 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         if fresh:
             rv.post_warnings(service, store, saved, fresh, command=rollback_command(service, saved))
         if last:
-            checked = new_errors["parts"].get("logs", {}).get("status") == "checked"
             status = "passed" if checked else "inconclusive"
 
             def done(current: dict, status: str = status) -> None:
-                """Set the final verdict, unless the record has failed already."""
-                if (current.get("verdict") or {}).get("status") != "failed":
+                """Set the final verdict, unless the record has failed or a later checkpoint decided it."""
+                verdict = current.get("verdict") or {}
+                if verdict.get("status") != "failed" and not rv.ro.later_terminal(verdict, key):
                     current["verdict"] = {
                         "status": status,
                         "at": rr.utc_now(),
@@ -1636,6 +3199,13 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
     )
 
 
+def window_checked(new_errors: dict) -> bool:
+    """Whether a checkpoint's checks all ran: the logs part, or every part when the kind reports "complete"."""
+    if "complete" in new_errors:
+        return bool(new_errors["complete"])
+    return new_errors["parts"].get("logs", {}).get("status") == "checked"
+
+
 def window_sources(service: LightService) -> list[Path]:
     """The files the watch window build needs: the kit files and the runtime source files."""
     sources = [path for path in KIT_DIR.rglob("*") if path.is_file() and "__pycache__" not in path.parts]
@@ -1649,6 +3219,9 @@ def window_sources(service: LightService) -> list[Path]:
                 and service.code.is_source(path.relative_to(REPO_ROOT).as_posix())
             ):
                 sources.append(path)
+    if service.site is not None and service.site.ignore_file and (REPO_ROOT / service.site.ignore_file).is_file():
+        # The static window applies the publisher's ignore file when GitHub cannot list the page sets.
+        sources.append(REPO_ROOT / service.site.ignore_file)
     return sources
 
 
@@ -1715,6 +3288,7 @@ def cmd_turn(args: argparse.Namespace, service: LightService, store: rr.Store, r
         commit=args.commit,
         peer_triggers=service.dev_triggers if dev else service.deploy_triggers,
         promoting_trigger=service.dev_triggers[0] if dev else "",
+        wait_only=bool(getattr(args, "wait_only", False)),
     )
     try:
         own = turn.own_build()
@@ -1856,6 +3430,8 @@ def cmd_preflight(args: argparse.Namespace, service: LightService, store: rr.Sto
         print(f"SUPERSEDED: {reason}; this build deploys nothing", flush=True)
         return guard.EXIT_SUPERSEDED
     recorded = _verified_artifacts(service, args.commit, args.dry_run_dir)
+    if service.kind == "vercel":
+        vercel_hold_guard(service, store, vercel_api(service))
     live = live_artifacts(service, runner, api.access_token, args.commit, recorded)
     (Path(args.out_dir) / ARTIFACTS_FILE).write_text(
         json.dumps(live, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1880,6 +3456,8 @@ def cmd_still_current(args: argparse.Namespace, service: LightService, store: rr
         print(f"SUPERSEDED: {reason}; this build deploys nothing", flush=True)
         return guard.EXIT_SUPERSEDED
     expected = _json_file(str(Path(args.out_dir) / ARTIFACTS_FILE))
+    if service.kind == "vercel":
+        vercel_hold_guard(service, store, vercel_api(service))
     live = live_artifacts(service, runner, api.access_token, args.commit, expected)
     if live != expected:
         raise GuardError(f"the artifacts changed after preflight: {live} (preflight: {expected})")
@@ -1900,9 +3478,22 @@ def sync_verified_dags(service: LightService, artifact: str, destination: str, r
         raise rr.RecordError("the live DAG manifest differs from the verified artifact after the copy")
 
 
-def promote_artifacts(service: LightService, artifacts: dict[str, str], runner: Runner) -> list[str]:
-    """Send prod to the artifacts: 100% traffic to each revision, or the candidate folder to dags/. Returns failures."""
+def promote_artifacts(
+    service: LightService, artifacts: dict[str, str], runner: Runner, store: rr.Store | None = None
+) -> list[str]:
+    """Send prod to the artifacts: 100% traffic to each revision, the verified Vercel deployment to the domains, or
+    the candidate folder to dags/. Returns failures."""
     failures = []
+    if service.kind == "vercel":
+        if store is None:
+            raise rc.ConfigError("kind vercel promotes with the prod store (the hold guard reads it)")
+        return vercel_promote(service, vercel_api(service), artifacts, store)
+    if service.kind == "railway":
+        commit = str(artifacts.get(service.name) or "")
+        if not guard.COMMIT_PATTERN.match(commit):
+            return [f"{railway_key(service)}: no commit to deploy ({commit!r})"]
+        _, problems = railway_deploy(service, railway_api(service, "prod"), "prod", commit)
+        return [f"{railway_key(service)}: {problem}" for problem in problems]
     if service.kind == "cloud_run":
         for name in service.services:
             revision = str(artifacts.get(name) or "").split("@", 1)[0]
@@ -1935,9 +3526,10 @@ def promote_artifacts(service: LightService, artifacts: dict[str, str], runner: 
 
 
 def cmd_apply(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
-    """The promote of the prod build (tier full): exit 1 when a change failed (the build records deploy_failed)."""
-    _full(service)
-    failures = promote_artifacts(service, _json_file(args.artifacts_file), runner)
+    """The prod deploy of a gated tier (full: the promote; check_rollback: railway's deploy): exit 1 when it failed."""
+    if not service.has_gate:
+        raise rc.ConfigError(f"{service.name} is tier {service.tier}; apply is for the gated tiers")
+    failures = promote_artifacts(service, _json_file(args.artifacts_file), runner, store)
     for failure in failures:
         print(f"FAILED: {failure}", file=sys.stderr, flush=True)
     return rv.EXIT_ERROR if failures else rv.EXIT_OK
@@ -1947,11 +3539,16 @@ def cmd_apply(args: argparse.Namespace, service: LightService, store: rr.Store, 
 
 
 def rollback_plan(service: LightService, latest: dict, target: dict, runner: Runner) -> rb.Plan:
-    """One step per Cloud Run service (traffic split) or one for the DAG folder (commit); problems block the apply."""
+    """One step per Cloud Run service (traffic split), one for the Vercel domains (deployment) or one for the DAG
+    folder (commit); problems block the apply."""
     steps: list[rb.Step] = []
     problems: list[str] = []
     notes: list[str] = []
-    if service.kind == "cloud_run":
+    if service.kind == "vercel":
+        steps, problems, notes = vercel_rollback_steps(service, vercel_api(service), target)
+    elif service.kind == "railway":
+        steps, problems, notes = railway_rollback_steps(service, railway_api(service, "prod"), latest, target)
+    elif service.kind == "cloud_run":
         live = snapshot_cloud_run(service, runner)
         for name in service.services:
             key = f"cloud_run/{name}"
@@ -1994,6 +3591,83 @@ def rollback_plan(service: LightService, latest: dict, target: dict, runner: Run
         problems=problems,
         target_artifacts=dict(target.get("artifacts") or {}),
     )
+
+
+ROLLBACK_ATTEMPTS = "vercel_rollback_attempts"
+
+
+def vercel_serving_guard(service: LightService, api: rvc.VercelApi, latest: dict) -> None:
+    """An automatic rollback (_EXPECT_LATEST) refuses when the domains serve what only a human can explain.
+
+    A rollback in the Vercel dashboard writes no kit record, so latest.json still names the release.
+    Accepted, each with the kit's own evidence: the failed release's deployment; the deployment that
+    served before it when the release's promote failed (deploy_failed: a promote that moved only some
+    domains); and the target of a rollback attempt the kit recorded on the release before it called
+    Vercel (a retry after that call moved the domains). Any other deployment: refuse.
+    """
+    key = vercel_key(service)
+    known = {str((latest.get("artifacts") or {}).get(service.name) or "")}
+    if latest.get("status") == "deploy_failed":
+        known.add(str((((latest.get("previous") or {}).get("workloads") or {}).get(key) or {}).get("deployment") or ""))
+    known |= {str(item.get("deployment") or "") for item in latest.get(ROLLBACK_ATTEMPTS) or []}
+    known.discard("")
+    serving = rvc.aliases(api, service.vercel_domains)
+    moved = {domain: value for domain, value in serving.items() if value not in known}
+    if not moved:
+        return
+    detail = "; ".join(f"{domain} serves {value or 'nothing'}" for domain, value in moved.items())
+    raise rr.RecordError(
+        f"a domain serves a deployment that release {latest.get('release_id')} and the kit's rollback attempts "
+        f"never set: {detail}. A human moved it; the automatic rollback changes nothing"
+    )
+
+
+def note_rollback_attempt(service: LightService, store: rr.Store, latest: dict, plan: rb.Plan, build_id: str) -> None:
+    """Before the rollback call: record its target deployment on the rolled-back release (the guard's evidence)."""
+    targets = [str(step.target) for step in plan.changes() if step.target]
+    if not targets:
+        return
+    attempt = {"deployment": targets[0], "build": build_id, "at": rr.utc_now()}
+    rr.update_record(
+        store,
+        latest["release_id"],
+        lambda current: current.setdefault(ROLLBACK_ATTEMPTS, []).append(attempt),
+        "vercel_rollback_attempt",
+        attempt,
+    )
+
+
+def vercel_target(service: LightService, target: dict) -> str:
+    """The deployment a Vercel rollback returns to: what served before the target release (its snapshot), else its own."""
+    served = ((target.get("workloads") or {}).get(vercel_key(service)) or {}).get("deployment")
+    return str(served or (target.get("artifacts") or {}).get(service.name) or "")
+
+
+def vercel_rollback_steps(
+    service: LightService, api: rvc.VercelApi, target: dict
+) -> tuple[list[rb.Step], list[str], list[str]]:
+    """(steps, problems, notes) of a Vercel rollback: the domains go back to the target deployment."""
+    key = vercel_key(service)
+    wanted = vercel_target(service, target)
+    serving = rvc.aliases(api, service.vercel_domains)
+    have = serving.get(service.vercel_domains[0]) or None
+    problems: list[str] = []
+    if not wanted:
+        problems.append(f"{key}: the target release recorded no deployment")
+    else:
+        try:
+            state = rvc.deployment_state(api.deployment(wanted))
+        except (rr.RecordError, GuardError) as error:
+            state = f"unreadable ({str(error)[:160]})"
+        if state != rvc.READY:
+            problems.append(f"{key}: deployment {wanted} is {state} (expired after 30 days?); pick another --to")
+    # Any domain that does not serve the target makes the rollback call (it moves every production domain).
+    action = "skip" if not wanted else "none" if all(value == wanted for value in serving.values()) else "set"
+    notes = [
+        "Vercel turns auto-assignment of the production domains off after a rollback (its own hold); "
+        "the kit's next promote turns it on again"
+    ]
+    return [rb.Step(key, service.name, "deployment", have, wanted or None, action)], problems, notes
 
 
 def resolve_target(store: rr.Store, target: str) -> tuple[dict, dict]:
@@ -2075,10 +3749,23 @@ def stage_from_github(service: LightService, commit: str, target: str, runner: R
 
 
 def apply_rollback(service: LightService, plan: rb.Plan, runner: Runner) -> list[str]:
-    """Set every planned traffic split, or sync the target commit's DAGs to dags/; return the failures."""
+    """Set every planned traffic split, point the Vercel domains back, or sync the target commit's DAGs to dags/;
+    return the failures."""
     failures = []
     for step in plan.changes():
         try:
+            if service.kind == "vercel":
+                api = vercel_api(service)
+                project_id = str(api.project(service.vercel_project)["id"])
+                api.rollback(project_id, str(step.target))
+                now = rvc.wait_for_aliases(api, service.vercel_domains, str(step.target), service.assign_wait_seconds)
+                print(f"{step.workload}: {step.current} -> {step.target} ({now})", flush=True)
+                continue
+            if service.kind == "railway":
+                failures += railway_rollback(
+                    service, railway_api(service, "prod"), str(step.target), plan.target_commit
+                )
+                continue
             if service.kind == "cloud_run":
                 runner(
                     [
@@ -2115,9 +3802,25 @@ def apply_rollback(service: LightService, plan: rb.Plan, runner: Runner) -> list
 
 
 def check_rollback(service: LightService, plan: rb.Plan, after: dict) -> rv.Check:
-    """Cloud Run: each service serves its target split; Composer: the sync ran (the next window checks the DAGs)."""
+    """Cloud Run: each service serves its target split; Vercel: every domain points at the target deployment;
+    Composer: the live DAG manifest is the target's."""
     problems = []
-    if service.kind == "cloud_run":
+    if service.kind == "railway":
+        now = after.get(railway_key(service)) or {}
+        if now.get("commit") != plan.target_commit or now.get("status") not in rwy.SERVING:
+            problems.append(
+                f"{railway_key(service)}: production serves {now.get('deployment')} {now.get('status')} of "
+                f"{str(now.get('commit'))[:9]}, not {str(plan.target_commit)[:9]}"
+            )
+    elif service.kind == "vercel":
+        now = (after.get(vercel_key(service)) or {}).get("aliases") or {}
+        for step in plan.steps:
+            problems += [
+                f"{domain} serves {value or 'nothing'}, not {step.target}"
+                for domain, value in sorted(now.items())
+                if step.target and value != step.target
+            ]
+    elif service.kind == "cloud_run":
         for step in plan.steps:
             have = split_text(serving_split(after.get(step.workload) or {}))
             if step.target and have != step.target:
@@ -2148,6 +3851,8 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
     rb.assert_alone(service, args.build_id)
     latest, target = resolve_target(store, args.target)
     rb.check_expect_latest(args, latest)
+    if service.kind == "vercel" and args.expect_latest and not args.dry_run:
+        vercel_serving_guard(service, vercel_api(service), latest)
     plan = rollback_plan(service, latest, target, runner)
     print_rollback_plan(service, plan)
     if plan.problems:
@@ -2157,9 +3862,24 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
         return 0
     previous = (latest.get("workloads") or {}, latest.get("images") or {})
     record = rb.create_rollback_record(service, store, args, latest, target, previous, plan)
+    if service.kind == "vercel":
+        note_rollback_attempt(service, store, latest, plan, args.build_id)
     failures = apply_rollback(service, plan, runner)
     cleanup_failures = []
-    if service.kind == "cloud_run":
+    if service.kind == "railway":
+        after = snapshot_railway(service, railway_api(service, "prod"))
+    elif service.kind == "vercel":
+        after = snapshot_vercel(service, vercel_api(service))
+        if latest.get("commit") and latest.get("commit") != target.get("commit"):
+            # The commit this rollback removes (a release, or the target of an earlier rollback) must not go
+            # live again through its old success status, by a redeploy or a deploy hook.
+            try:
+                post_commit_status(
+                    service, latest["commit"], "failure", f"rolled back: release {latest.get('release_id')} failed"
+                )
+            except (rr.RecordError, GuardError) as error:
+                print(f"WARNING: the commit status stays success: {str(error)[:200]}", file=sys.stderr, flush=True)
+    elif service.kind == "cloud_run":
         failed_candidates = {
             name: str(artifact).partition("@")[0]
             for name, artifact in (latest.get("artifacts") or {}).items()
@@ -2200,9 +3920,9 @@ def cmd_rollback_command(args: argparse.Namespace, service: LightService, store:
     return rv.EXIT_OK
 
 
-def long_runner(command: list[str]) -> str:
+def long_runner(command: list[str], timeout: float = 1800) -> str:
     """rr.run_command with the time a deploy step needs (a gsutil rsync, a traffic move)."""
-    return rr.run_command(command, timeout=1800)
+    return rr.run_command(command, timeout=timeout)
 
 
 # Commands that change or copy something: their gcloud and gsutil calls may take minutes.
@@ -2257,6 +3977,7 @@ def main(argv: list[str] | None = None) -> int:
     env_arg(finish)
     release_id_args(finish)
     finish.add_argument("--status", required=True, choices=["deployed", "deploy_failed"])
+    finish.add_argument("--attempts", type=int, default=1, help="retry a failed finish; the last failure alerts")
     check = commands.add_parser("check", help="deploy checks (prod) or dev verify (--env dev)")
     env_arg(check)
     release_id_args(check)
@@ -2279,6 +4000,7 @@ def main(argv: list[str] | None = None) -> int:
     turn.add_argument("--build-id", required=True)
     turn.add_argument("--commit", required=True)
     turn.add_argument("--older-timeout-seconds", type=float, default=1800)
+    turn.add_argument("--wait-only", action="store_true", help="wait for older builds; a newer one never supersedes")
     command = commands.add_parser("rollback-command", help="print the command that undoes a release")
     release_id_args(command)
     stage = commands.add_parser("stage", help="tier full, composer: copy dags/ to the commit's candidate folder")
@@ -2303,8 +4025,34 @@ def main(argv: list[str] | None = None) -> int:
     prod_build_args(still)
     apply = commands.add_parser("apply", help="tier full, prod: promote the artifacts")
     apply.add_argument("--artifacts-file", required=True)
+    wait = commands.add_parser("vercel-wait", help="kind vercel, dev: wait for Vercel's deployment (exit 5: skipped)")
+    wait.add_argument("--commit", required=True)
+    wait.add_argument("--out-dir", default="/workspace")
+    status = commands.add_parser("vercel-status", help="kind vercel: set the Deployment Check's commit status")
+    status.add_argument("--commit", required=True)
+    source = status.add_mutually_exclusive_group(required=True)
+    source.add_argument("--state", choices=rvc.STATUS_STATES)
+    source.add_argument("--from-dev-index", action="store_true", help="after the dev build: from the gate's decision")
+    source.add_argument("--from-skip-file", help="after the prod build: from release_gate.py's skip reason file")
+    status.add_argument("--description", default="")
+    status.add_argument("--target-url", default="")
+    deploy = commands.add_parser("railway-deploy", help="kind railway, dev: deploy the commit to the dev environment")
+    env_arg(deploy)
+    deploy.add_argument("--commit", required=True)
+    deploy.add_argument("--out-dir", default="/workspace")
+    publish = commands.add_parser("static-wait", help="kind static_site: wait for the publisher's check run (exit 5)")
+    publish.add_argument("--commit", required=True)
+    publish.add_argument("--out-dir", default="/workspace")
 
     args = parser.parse_args(argv)
+    if args.command in (
+        "vercel-wait",
+        "vercel-status",
+        "railway-deploy",
+        "static-wait",
+    ) and not guard.COMMIT_PATTERN.match(args.commit):
+        print(f"release light: --commit must be a full 40-character sha, got {args.commit!r}", file=sys.stderr)
+        return rv.EXIT_ERROR
     if args.command == "parse-dags":
         if not args.one and not (args.candidate and args.baseline):
             parser.error("parse-dags needs --candidate and --baseline")
@@ -2326,6 +4074,10 @@ def main(argv: list[str] | None = None) -> int:
         "preflight": cmd_preflight,
         "still-current": cmd_still_current,
         "apply": cmd_apply,
+        "vercel-wait": cmd_vercel_wait,
+        "vercel-status": cmd_vercel_status,
+        "railway-deploy": cmd_railway_deploy,
+        "static-wait": cmd_static_wait,
     }
     try:
         service = load_light(args.service)
@@ -2334,6 +4086,15 @@ def main(argv: list[str] | None = None) -> int:
             raise rc.ConfigError(f"{service.name} is tier {service.tier}: it has no dev stage")
         store = open_store(service, args.dry_run_dir, env=env)
         runner = long_runner if args.command in LONG_COMMANDS else rr.run_command
+        if args.command == "finish":
+            return rr.finish_with_retries(
+                lambda: cmd_finish(args, service, store, runner),
+                attempts=args.attempts,
+                title=service.title,
+                env=args.env,
+                release_id=args.release_id,
+                recovery=rr.finish_recovery("light", service.name, args.env, args.release_id, args.status),
+            )
         return handlers[args.command](args, service, store, runner)
     except guard.Superseded as reason:
         print(f"SUPERSEDED: {reason}; this build deploys nothing", flush=True)

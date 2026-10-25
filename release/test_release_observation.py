@@ -151,6 +151,23 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(ro.scheduled_minute({}, 63), 60)
         self.assertEqual(ro.scheduled_minute({}, 99, 15), 15)
 
+    def test_early_check_binds_to_no_checkpoint(self):
+        self.assertIsNone(ro.scheduled_minute({}, 3))
+        self.assertIsNone(ro.scheduled_minute({}, 5, 15))
+        self.assertEqual(ro.scheduled_minute({}, 15), 15)
+        record = {"release_id": "r1", "times": {"deploy_finished": "2026-10-23T20:00:00Z"}}
+        ro.merge_plan(record, [15, 60])
+        for index in range(ro.EARLY_CHECKS_KEPT + 2):
+            ro.note_early_check(record, {"at": f"t{index}", "result": "passed"}, "early_3m")
+        self.assertEqual(len(record["followup"]["early_checks"]), ro.EARLY_CHECKS_KEPT)
+        self.assertEqual({receipt["state"] for receipt in record["followup"]["checkpoints"].values()}, {"scheduled"})
+
+    def test_later_terminal_verdict_survives_older_checkpoints(self):
+        for status in ("passed", "warning", "inconclusive"):
+            self.assertTrue(ro.later_terminal({"status": status, "phase": "window_60m"}, "window_15m"))
+        self.assertFalse(ro.later_terminal({"status": "pending", "phase": "window_60m"}, "window_15m"))
+        self.assertFalse(ro.later_terminal({"status": "passed", "phase": "window_15m"}, "window_60m"))
+
     def test_manual_repair_restores_adaptive_checkpoint_without_rewriting_earlier_evidence(self):
         record = {"release_id": "r1", "times": {"deploy_finished": "2026-10-23T20:00:00Z"}}
         ro.merge_plan(record, [15, 60])

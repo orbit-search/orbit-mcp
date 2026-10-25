@@ -443,9 +443,14 @@ class Guard:
     # The merge trigger. A build of it that promotes is replaced only by a newer one that
     # promotes too, so a manual dev deploy (_AUTO_PROMOTE=false) never drops a merged release.
     promoting_trigger: str = ""
+    # Order only: no newer build replaces this one; it waits for the older ones (a check that must run
+    # for every commit, such as a static site's publish check).
+    wait_only: bool = False
 
     def _can_supersede(self, own: Build) -> Callable[[Build], bool] | None:
         """Which builds may replace this one: newer promoting builds of the merge trigger, else None (all)."""
+        if self.wait_only:
+            return lambda _build: False
 
         def promotes(build: Build) -> bool:
             """Whether a build is a merge trigger build that promotes."""

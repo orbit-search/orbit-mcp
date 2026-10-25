@@ -20,7 +20,7 @@ steps:
       env:
           - "RELEASE_SLACK_DISABLED=${_SLACK_DISABLED}"
           - "RELEASE_AUTO_ROLLBACK=${_AUTO_ROLLBACK}"
-      secretEnv: ["WEBHOOK_ORBIT"]
+      secretEnv: ["WEBHOOK_ORBIT", "RELEASE_PEOPLE_JSON"]
       timeout: "13800s"
 
 substitutions:
@@ -42,3 +42,5 @@ availableSecrets:
     secretManager:
         - versionName: projects/$PROJECT_ID/secrets/slack-webhook-workspace-orbit/versions/latest
           env: "WEBHOOK_ORBIT"
+        - versionName: projects/$PROJECT_ID/secrets/release-people-json/versions/latest
+          env: "RELEASE_PEOPLE_JSON"

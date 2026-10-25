@@ -155,17 +155,35 @@ def owned(record: dict) -> bool:
     return bool(str(owner.get("thread_url") or "").strip() and str(owner.get("pr_url") or "").strip())
 
 
-def scheduled_minute(record: dict, elapsed: float, requested: int | None = None) -> int:
-    """Bind a late manual repair to the original scheduled checkpoint."""
+def scheduled_minute(record: dict, elapsed: float, requested: int | None = None) -> int | None:
+    """The scheduled checkpoint a manual check completes: the latest one that is due, else None.
+
+    A late manual repair binds to the original scheduled checkpoint. A check before a checkpoint is due
+    (an early check, or --checkpoint-minutes ahead of its due time) completes none: it returns None, and
+    the caller records it apart with note_early_check, so the watch still runs the real checkpoint.
+    """
     if requested is not None:
-        return requested
+        return requested if requested <= elapsed else None
     planned = (record.get("checks", {}).get("window_build") or {}).get("checkpoints_minutes") or [15, 60]
     planned = restore_extensions(record, planned)
-    return max((minute for minute in planned if minute <= elapsed), default=min(planned))
+    return max((minute for minute in planned if minute <= elapsed), default=None)
+
+
+EARLY_CHECKS_KEPT = 20
+
+
+def note_early_check(record: dict, result: dict, key: str) -> None:
+    """Keep an early manual observation apart from the scheduled checkpoint receipts and checks."""
+    early = record.setdefault("followup", {}).setdefault("early_checks", [])
+    early.append({"key": key, "at": result["at"], "result": result["result"], "check": result})
+    del early[:-EARLY_CHECKS_KEPT]
 
 
 def later_terminal(verdict: dict, checkpoint: str) -> bool:
-    """A late repair of an earlier checkpoint cannot erase a later terminal verdict."""
+    """A late repair of an earlier checkpoint cannot erase a later terminal verdict.
+
+    Only a failure replaces it (the callers set a failed verdict before they ask), also with --final.
+    """
     previous = re.fullmatch(r"window_(\d+)m", verdict.get("phase") or "")
     current = re.fullmatch(r"window_(\d+)m", checkpoint)
     return bool(

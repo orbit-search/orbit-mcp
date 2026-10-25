@@ -31,7 +31,7 @@ steps:
           - "ROLLBACK_REQUESTED_BY=${_REQUESTED_BY}"
           - "ROLLBACK_DRY_RUN=${_DRY_RUN}"
           - "ROLLBACK_EXPECT_LATEST=${_EXPECT_LATEST}"
-      secretEnv: ["WEBHOOK_ORBIT"]
+      secretEnv: ["WEBHOOK_ORBIT", "RELEASE_PEOPLE_JSON"]
       # Up to 30 min for the prod lock (release_rollback.py LOCK_WAIT_SECONDS), then the apply.
       timeout: "3600s"
 
@@ -54,3 +54,5 @@ availableSecrets:
     secretManager:
         - versionName: projects/$PROJECT_ID/secrets/slack-webhook-workspace-orbit/versions/latest
           env: "WEBHOOK_ORBIT"
+        - versionName: projects/$PROJECT_ID/secrets/release-people-json/versions/latest
+          env: "RELEASE_PEOPLE_JSON"

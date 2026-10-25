@@ -172,7 +172,7 @@ class FakeCluster:
         name = next(item.name for item in self.env.deployments if item.selector == selector)
         return [item for item in items if item["metadata"]["name"].startswith(f"{name}-")]
 
-    def __call__(self, command: list[str]) -> str:
+    def __call__(self, command: list[str], timeout: float = 120) -> str:
         """Answer one recorded command."""
         self.commands.append(command)
         args = [part for part in command[1:] if not part.startswith("--request-timeout")]
@@ -307,7 +307,7 @@ class FirstDeployTest(unittest.TestCase):
         """Before the first deploy of an environment its Deployments do not exist: the snapshot leaves them out."""
         cluster = FakeCluster()
 
-        def runner(command: list[str]) -> str:
+        def runner(command: list[str], timeout: float = 120) -> str:
             """A cluster where prod-demo-worker does not exist yet."""
             if "prod-demo-worker" in command and "deployment" in command:
                 raise rr.RecordError(
@@ -1153,7 +1153,13 @@ class AlertTest(unittest.TestCase):
                 ],
             },
         )
-        text, blocks = rv.rollback_alert(SERVICE, record, "https://build", "gs://x")
+        people = {"slack_ids": {"jonnybcw": "U095N7BBQKD"}, "fallback": []}
+        # The same in a private repository (vendored map) and a public one (no file, the secret's env).
+        with (
+            mock.patch.object(rv, "PEOPLE_FILE", Path(tempfile.gettempdir()) / "no-release-people.json"),
+            mock.patch.dict(os.environ, {"RELEASE_PEOPLE_JSON": json.dumps(people)}),
+        ):
+            text, blocks = rv.rollback_alert(SERVICE, record, "https://build", "gs://x")
         self.assertIn("<@U095N7BBQKD>", text)
         self.assertIn("Fixes-release: 20261021T100000Z-aaaaaaaaa", json.dumps(blocks))
         text, _ = rv.rollback_alert(SERVICE, record, None, "gs://x")
@@ -1176,7 +1182,7 @@ class AutoRollbackTest(unittest.TestCase):
             _save(store, record)
             commands = []
 
-            def runner(command: list[str]) -> str:
+            def runner(command: list[str], timeout: float = 120) -> str:
                 """Record the command and answer with a build id."""
                 commands.append(command)
                 return "rollback-build-1\n"
@@ -1216,7 +1222,7 @@ class AutoRollbackTest(unittest.TestCase):
                     SERVICE,
                     store,
                     record,
-                    runner=lambda _: "rb1\n",
+                    runner=lambda _, timeout=120: "rb1\n",
                     builds=lambda *_: (False, []),
                     follow=False,
                     sleep=sleep,
@@ -2226,7 +2232,7 @@ class RoundSixTest(unittest.TestCase):
         service = rc.parse_service(data)
 
         class PatchingCluster(FakeCluster):
-            def __call__(self, command: list[str]) -> str:
+            def __call__(self, command: list[str], timeout: float = 120) -> str:
                 """Apply a strategic patch's image to the fake Deployment and its pods."""
                 if "patch" in command:
                     self.commands.append(command)
@@ -2820,7 +2826,7 @@ class FakeGcloud:
         self.tags = {"demo-a": {"candidate": "demo-a-2"}, "demo-b": {"candidate": "demo-b-2"}}
         self.fail: str = ""
 
-    def __call__(self, command: list[str]) -> str:
+    def __call__(self, command: list[str], timeout: float = 120) -> str:
         """Answer one recorded command."""
         self.commands.append(command)
         if self.fail and self.fail in " ".join(command):
@@ -3008,6 +3014,35 @@ class LightFullConfigTest(unittest.TestCase):
         light = kit.rendered(rl.parse_light(light_data("cloud_run")))
         self.assertEqual(list(light), ["release/services/demo-cloud-run.release-verify.yaml"])
         self.assertNotIn("AUTO_ROLLBACK", light["release/services/demo-cloud-run.release-verify.yaml"])
+
+    def test_build_service_account(self) -> None:
+        """The window and rollback builds run as cloud-build@ unless the config names its own build identity."""
+        for name, text in kit.rendered(RUN).items():
+            self.assertIn(
+                'serviceAccount: "projects/orbit-search/serviceAccounts/cloud-build@orbit-search.iam.gserviceaccount.com"',
+                text,
+                name,
+            )
+        own = rl.parse_light(full_run_data(build_service_account="demo-run-build@orbit-search.iam.gserviceaccount.com"))
+        self.assertEqual(own.build_service_account, "demo-run-build@orbit-search.iam.gserviceaccount.com")
+        files = kit.rendered(own)
+        self.assertEqual(len(files), 2)
+        for name, text in files.items():
+            self.assertIn(
+                'serviceAccount: "projects/orbit-search/serviceAccounts/demo-run-build@orbit-search.iam.gserviceaccount.com"',
+                text,
+                name,
+            )
+            self.assertNotIn("cloud-build@", text, name)
+        for bad in (
+            "demo-run-build@other-project.iam.gserviceaccount.com",
+            "621810938413-compute@developer.gserviceaccount.com",
+            "projects/orbit-search/serviceAccounts/demo-run-build@orbit-search.iam.gserviceaccount.com",
+            'x@orbit-search.iam.gserviceaccount.com"\nsteps: []',
+            "demo-run-build@orbit-search.iam.gserviceaccount.com\n",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(rc.ConfigError):
+                rl.parse_light(full_run_data(build_service_account=bad))
 
     def test_any_service_loader(self) -> None:
         """release_config.load_any_service picks the GKE or the light loader by kind."""
@@ -3494,7 +3529,7 @@ class LightFullProdTest(unittest.TestCase):
                 RUN,
                 self.prod,
                 record,
-                runner=lambda c: commands.append(c) or "rb1\n",
+                runner=lambda c, timeout=120: commands.append(c) or "rb1\n",
                 builds=lambda *_: (False, []),
                 follow=False,
             )
@@ -3759,7 +3794,7 @@ class LightFullRollbackTest(unittest.TestCase):
         response.__enter__.return_value.read.return_value = buffer.getvalue()
         seen = {}
 
-        def runner(command):
+        def runner(command, timeout=120):
             """Look at the folder that rsync would upload."""
             folder = Path(command[-2])
             seen["files"] = sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file())
@@ -4435,6 +4470,598 @@ class VersionTest(unittest.TestCase):
             self.assertNotIn("cause", rr.read_record(store, record["release_id"])["verdict"])
             self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
             slack.assert_not_called()
+
+
+class CheckpointReviewDefectsTest(unittest.TestCase):
+    """Early checks, later terminal verdicts, busy prod, the runner contract and the prod build contract."""
+
+    def _result(self, **overrides) -> dict:
+        """A window check result, with defaults for what the test leaves out."""
+        result = {
+            "phase": "window",
+            "at": "2026-10-21T10:08:00Z",
+            "candidate_minutes": 3,
+            "checks": [],
+            "regressions": [],
+            "warnings": [],
+            "judged": 500,
+            "signals_checked": ["logs"],
+            "result": "passed",
+        }
+        result.update(overrides)
+        return result
+
+    def _check(self, store, record, *, minutes: float, result: dict, state=(None, None), final=True, requested=None):
+        """Run release_verify.py check --phase window at deploy_finished + minutes; return (exit, record)."""
+        args = argparse.Namespace(
+            release_id=record["release_id"],
+            phase="window",
+            no_metrics=True,
+            now=None,
+            wait_rollouts_seconds=0,
+            force_fail="",
+            final=final,
+            failed_marker="",
+            checkpoint_minutes=requested,
+        )
+        when = datetime(2026, 10, 21, 10, 5, tzinfo=rr.UTC) + timedelta(minutes=minutes)
+        with (
+            mock.patch.object(rv, "_token", return_value=None),
+            mock.patch.object(rv, "_now", return_value=when),
+            mock.patch.object(rv, "prod_state", return_value=state),
+            mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+            mock.patch.object(rv, "evaluate", return_value=result),
+            mock.patch.object(rv, "print_result"),
+            mock.patch.object(rv, "on_failure"),
+            mock.patch.object(rr, "post_slack", return_value=True),
+        ):
+            outcome = rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock())
+        return outcome, rr.read_record(store, record["release_id"])
+
+    def test_early_manual_check_completes_no_scheduled_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            rv.ro.merge_plan(record, [15, 60])
+            _save(store, record)
+            outcome, saved = self._check(store, record, minutes=3, result=self._result())
+            self.assertEqual(outcome, rv.EXIT_OK)
+            receipts = saved["followup"]["checkpoints"]
+            self.assertEqual({receipts[key]["state"] for key in ("window_15m", "window_60m")}, {"scheduled"})
+            self.assertNotIn("window_15m", saved["checks"])
+            self.assertEqual([item["key"] for item in saved["followup"]["early_checks"]], ["early_3m"])
+            self.assertEqual(saved["verdict"]["status"], "pending")
+            # A checkpoint asked for before its due time is early too.
+            outcome, saved = self._check(store, saved, minutes=5, result=self._result(), requested=15)
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "scheduled")
+            self.assertEqual(len(saved["followup"]["early_checks"]), 2)
+            # The watch still runs the real +15 and +60 checkpoints.
+            args = argparse.Namespace(
+                release_id=record["release_id"],
+                checkpoints="15,60",
+                extend_minutes=15,
+                max_window_minutes=180,
+                retry_completed=False,
+            )
+            with (
+                mock.patch.object(rv, "_datadog", return_value=(None, None)),
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv, "wait_until_settled", return_value=None),
+                mock.patch.object(rv, "prod_state", return_value=(None, None)),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rv, "evaluate", return_value=self._result(candidate_minutes=60)) as evaluate,
+                mock.patch.object(rv, "print_result"),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                self.assertEqual(rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_OK)
+            self.assertEqual(evaluate.call_count, 2)
+            final = rr.read_record(store, record["release_id"])
+            self.assertEqual(final["followup"]["checkpoints"]["window_15m"]["state"], "completed")
+            self.assertEqual(final["verdict"]["phase"], "window_60m")
+
+    def test_early_check_failure_still_fails_the_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            failed = self._result(
+                candidate_minutes=4, result="failed", regressions=[{"kind": "check", "name": "images", "text": "crash"}]
+            )
+            outcome, saved = self._check(store, record, minutes=4, result=failed)
+            self.assertEqual(outcome, rv.EXIT_FAILED)
+            self.assertEqual((saved["verdict"]["status"], saved["verdict"]["phase"]), ("failed", "early_4m"))
+            self.assertNotIn("checkpoints", saved["followup"])
+
+    def test_older_checkpoint_never_replaces_a_later_terminal_verdict(self) -> None:
+        cases = [
+            (dict(result="inconclusive", availability={"status": "unconfirmed"}), False),
+            (dict(result="passed"), True),
+            (dict(result="passed", judged=0), True),
+        ]
+        for overrides, final in cases:
+            with self.subTest(overrides=overrides, final=final), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record(verdict={"status": "passed", "phase": "window_60m", "judged": 500})
+                _save(store, record)
+                result = self._result(candidate_minutes=70, checkpoint_minutes=15, **overrides)
+                saved = rv.apply_result(SERVICE, store, record, result, final=final, token=None)
+                self.assertEqual(saved["verdict"], {"status": "passed", "phase": "window_60m", "judged": 500})
+                self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "completed")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "passed", "phase": "window_60m"})
+            _save(store, record)
+            failed = self._result(
+                checkpoint_minutes=15, result="failed", regressions=[{"kind": "check", "name": "x", "text": "x"}]
+            )
+            saved = rv.apply_result(SERVICE, store, record, failed, final=True, token=None)
+            self.assertEqual(saved["verdict"]["status"], "failed")
+
+    def test_older_checkpoint_error_keeps_a_later_terminal_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "passed", "phase": "window_60m"})
+            _save(store, record)
+            rv._record_checkpoint_error(store, record, 15, "cluster unavailable", final=True)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual(saved["verdict"], {"status": "passed", "phase": "window_60m"})
+            self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "error")
+
+    def test_light_older_final_checkpoint_keeps_the_later_verdict(self) -> None:
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(verdict={"status": "passed", "phase": "window_60m"})
+            _save(store, record)
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="15", retry_completed=True)
+            unread = {"problems": [], "parts": {"logs": {"status": "inconclusive"}}, "scope": {}}
+            with (
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=unread),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                rl.cmd_watch(args, service, store, mock.Mock())
+            saved = rr.read_record(store, record["release_id"])
+            self.assertEqual((saved["verdict"]["status"], saved["verdict"]["phase"]), ("passed", "window_60m"))
+
+    def test_busy_prod_leaves_checkpoints_open_and_only_a_replacement_supersedes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            rv.ro.merge_plan(record, [15, 60])
+            _save(store, record)
+            busy = (None, "build d2 is changing prod")
+            outcome, saved = self._check(store, record, minutes=16, result=self._result(), state=busy, final=False)
+            self.assertEqual(outcome, rv.EXIT_ERROR)
+            receipts = saved["followup"]["checkpoints"]
+            self.assertEqual(receipts["window_15m"]["state"], "error")
+            self.assertIn("stays open", receipts["window_15m"]["last_error"])
+            self.assertEqual(receipts["window_60m"]["state"], "scheduled")
+            self.assertNotIn("window_15m", saved["checks"])
+            outcome, saved = self._check(store, saved, minutes=17, result=self._result(), state=("release r2", None))
+            self.assertEqual(outcome, rv.EXIT_ERROR)
+            receipts = saved["followup"]["checkpoints"]
+            self.assertEqual({receipt["state"] for receipt in receipts.values()}, {"superseded"})
+
+    def test_window_check_with_an_injected_runner_passes_its_deadline(self) -> None:
+        timeouts: list[float] = []
+
+        class TimedCluster(FakeCluster):
+            """FakeCluster that records the timeout of every command."""
+
+            def __call__(self, command: list[str], timeout: float = 120) -> str:
+                """Record the timeout, then answer."""
+                timeouts.append(timeout)
+                return super().__call__(command, timeout)
+
+        clients = rr.Clients(env=PROD, runner=TimedCluster(digest=NEW))
+        result = rv.evaluate(
+            SERVICE,
+            _record(),
+            phase="window",
+            clients=clients,
+            dd=None,
+            now=datetime(2026, 10, 21, 10, 20, tzinfo=rr.UTC),
+            get=mock.Mock(side_effect=AssertionError("no HTTP in a window check")),
+        )
+        images = next(check for check in result["checks"] if check["name"] == "images")
+        self.assertEqual(images["status"], "passed", images)
+        self.assertEqual(result["availability"]["status"], "confirmed")
+        self.assertTrue(timeouts)
+        self.assertTrue(all(0 < value <= 120 for value in timeouts), timeouts)
+
+    def test_finish_retries_then_alerts_with_the_recovery_commands(self) -> None:
+        calls = []
+
+        def flaky() -> int:
+            """Fail twice, then finish."""
+            calls.append(1)
+            if len(calls) < 3:
+                raise rr.RecordError("GCS 503")
+            return 0
+
+        sleeps: list[float] = []
+        with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            code = rr.finish_with_retries(
+                flaky, attempts=3, title="demo", env="prod", release_id="r1", recovery=["a"], sleep=sleeps.append
+            )
+            self.assertEqual((code, len(calls), len(sleeps)), (0, 3, 2))
+            slack.assert_not_called()
+            recovery = rr.finish_recovery("gke", "demo", "prod", "r1", "deployed")
+            code = rr.finish_with_retries(
+                mock.Mock(side_effect=OSError("disk")),
+                attempts=3,
+                title="demo",
+                env="prod",
+                release_id="r1",
+                recovery=recovery,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(code, 1)
+        text = slack.call_args[0][0]
+        for command in recovery:
+            self.assertIn(command, text)
+        self.assertIn("release_record.py finish --service demo --env prod --release-id r1 --status deployed", text)
+        self.assertIn("release_verify.py check --service demo --env prod --phase deploy --release-id r1", text)
+        self.assertIn("release_verify.py schedule-window --service demo --env prod --release-id r1", text)
+        light = rr.finish_recovery("light", "demo-run", "prod", "r1", "deploy_failed")
+        self.assertIn("release_light.py --service demo-run finish --env prod --release-id r1", light[0])
+        self.assertIn("schedule-window --release-id r1", light[2])
+
+    def test_retried_finish_keeps_the_first_finish_time(self) -> None:
+        record = {"status": "deployed", "times": {"deploy_finished": "2026-10-21T10:05:00Z"}}
+        rr.keep_finish_time(record, "deployed")
+        self.assertEqual(record["times"]["deploy_finished"], "2026-10-21T10:05:00Z")
+        record["status"] = "deploying"
+        rr.keep_finish_time(record, "deployed")
+        self.assertNotEqual(record["times"]["deploy_finished"], "2026-10-21T10:05:00Z")
+
+    def test_finish_cli_retries_and_returns_red(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "release_id").write_text("r1\n", encoding="utf-8")
+            with (
+                mock.patch.object(rr, "open_from_args", return_value=(SERVICE, PROD, mock.Mock(), mock.Mock())),
+                mock.patch.object(rr, "cmd_finish", side_effect=rr.RecordError("GCS 503")) as finish,
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                mock.patch.object(rr.time, "sleep"),
+            ):
+                code = rr.main(
+                    ["finish", "--env", "prod", "--attempts", "3", "--release-id-file", f"{tmp}/release_id"]
+                    + ["--status", "deployed"]
+                )
+            self.assertEqual((code, finish.call_count), (1, 3))
+            self.assertIn("--release-id r1", slack.call_args[0][0])
+
+    def test_prod_build_contract(self) -> None:
+        good = """steps:
+  - id: notify-promote-blocked
+    args:
+      - |
+        if [ ! -f /workspace/promote_blocked ]; then exit 0; fi
+        printf '%s\\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
+        exit 1
+  - id: release-record-begin
+    args:
+      - |
+        release_no_change() {
+          printf '%s\\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
+        }
+        if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ] || [ -f /workspace/promote_blocked ]; then
+          release_no_change
+          exit 0
+        fi
+        python3 release/release_record.py begin --env prod --commit "$COMMIT_SHA" \\
+          || { echo failed; release_no_change; }
+  - id: release-record-finish
+    secretEnv: ["WEBHOOK_ORBIT"]
+    args:
+      - |
+        python3 release/release_record.py finish --env prod --attempts 3 --status deployed
+"""
+        self.assertEqual(kit.prod_build_problems("good.yaml", good), [])
+        old_skip = good.replace(
+            " || [ -f /workspace/deploy_superseded ] || [ -f /workspace/promote_blocked ]",
+            " || [ -f /workspace/deploy_superseded ]",
+        )
+        self.assertIn("promote_blocked", kit.prod_build_problems("b.yaml", old_skip)[0])
+        no_failure_receipt = good.replace("echo failed; release_no_change;", "echo failed;")
+        self.assertIn("release_no_change", kit.prod_build_problems("b.yaml", no_failure_receipt)[0])
+        no_retry = good.replace(" --attempts 3", "")
+        self.assertIn("--attempts", kit.prod_build_problems("b.yaml", no_retry)[0])
+        no_alert = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', "")
+        self.assertEqual(len(kit.prod_build_problems("b.yaml", no_alert)), 1)
+        self.assertIn("WEBHOOK_ORBIT", kit.prod_build_problems("b.yaml", no_alert)[0])
+        block_lists = [
+            "    secretEnv:\n      - GITHUB_TOKEN\n      - WEBHOOK_ORBIT\n",
+            '    secretEnv:\n    - "WEBHOOK_ORBIT"\n',
+            '    secretEnv: [\n      "GITHUB_TOKEN",\n      "WEBHOOK_ORBIT",\n    ]\n',
+        ]
+        for listing in block_lists:
+            with self.subTest(listing=listing):
+                variant = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', listing)
+                self.assertEqual(kit.prod_build_problems("b.yaml", variant), [])
+        other = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', "    secretEnv:\n      - GITHUB_TOKEN\n")
+        self.assertIn("WEBHOOK_ORBIT", kit.prod_build_problems("b.yaml", other)[0])
+        silent_block = good.replace(
+            """        printf '%s\\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
+        exit 1""",
+            "        exit 1",
+        )
+        self.assertIn("notify-promote-blocked", kit.prod_build_problems("b.yaml", silent_block)[0])
+        self.assertEqual(kit.prod_build_problems("dev.yaml", good.replace("--env prod", "--env dev")), [])
+
+    def test_prod_build_skip_paths_leave_the_receipt_in_bash(self) -> None:
+        """Run the record-begin script of each prod build of the repository: every stop before the deploy
+        writes the receipt (orbit-infrastructure has none; test_release_vercel runs the rendered ones)."""
+        root = Path(__file__).resolve().parents[1]
+        checked = 0
+        for path in sorted(root.glob("cloudbuild*.yaml")):
+            text = path.read_text(encoding="utf-8")
+            steps = {kit._step_id(block): block for block in kit.STEP_START.split(text)}
+            if not kit.PROD_RECORD.search(steps.get("release-record-begin", "")):
+                continue
+            with self.subTest(build=path.name):
+                assert_receipts(self, steps["release-record-begin"], steps.get("notify-promote-blocked"))
+            checked += 1
+        if not checked:
+            self.skipTest("no prod build file next to the kit")
+
+    def test_offline_launcher_nulls_credentials_and_blocks_live_clis(self) -> None:
+        import run_offline_checks as offline
+
+        script = (
+            "import json, os, subprocess\n"
+            "names = ('KUBECONFIG', 'GOOGLE_APPLICATION_CREDENTIALS', 'CLOUDSDK_CONFIG', 'RELEASE_SLACK_DISABLED',"
+            " 'HTTPS_PROXY', 'SECRET_TOKEN')\n"
+            "seen = {name: os.environ.get(name) for name in names}\n"
+            "seen['kubectl'] = subprocess.run(['kubectl', 'get', 'pods'], capture_output=True).returncode\n"
+            "seen['gcloud'] = subprocess.run(['gcloud', 'auth', 'list'], capture_output=True).returncode\n"
+            "open('seen.json', 'w').write(json.dumps(seen))\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"SECRET_TOKEN": "x"}):
+            self.assertEqual(offline.main(["--cwd", tmp, "--", sys.executable, "-c", script]), 0)
+            seen = json.loads(Path(tmp, "seen.json").read_text(encoding="utf-8"))
+        self.assertEqual((seen["KUBECONFIG"], seen["GOOGLE_APPLICATION_CREDENTIALS"]), ("/dev/null", "/dev/null"))
+        self.assertTrue(seen["CLOUDSDK_CONFIG"].endswith("gcloud-config"))
+        self.assertEqual((seen["RELEASE_SLACK_DISABLED"], seen["HTTPS_PROXY"]), ("1", "http://127.0.0.1:9"))
+        self.assertIsNone(seen["SECRET_TOKEN"])
+        self.assertEqual((seen["kubectl"], seen["gcloud"]), (offline.BLOCKED_EXIT, offline.BLOCKED_EXIT))
+
+
+def step_script(block: str) -> str:
+    """The bash script of one Cloud Build step block (the "- |" argument), with Cloud Build's $$ unescaped."""
+    lines = block.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.strip() == "- |") + 1
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    body = []
+    for line in lines[start:]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        body.append(line[indent:])
+    return "\n".join(body).replace("$$", "$")
+
+
+def assert_receipts(test: unittest.TestCase, begin: str, blocked: str | None) -> None:
+    """Every pre-deploy stop of a prod build's record-begin (and blocked notice) leaves the no-change receipt."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp, "bin")
+        stub.mkdir()
+        for name in ("python3", "curl"):
+            path = stub / name
+            path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            path.chmod(0o700)
+        scenarios = [("begin", begin, marker) for marker in ("deploy_failed", "deploy_superseded", "promote_blocked")]
+        scenarios.append(("begin", begin, "record_begin_fails"))
+        if blocked:
+            scenarios.append(("blocked", blocked, "promote_blocked"))
+        for kind, block, marker in scenarios:
+            workspace, output = Path(tmp, f"ws-{kind}-{marker}"), Path(tmp, f"out-{kind}-{marker}")
+            workspace.mkdir()
+            output.mkdir()
+            if marker != "record_begin_fails":
+                (workspace / marker).touch()
+            (workspace / "release_image").write_text("repo@sha256:" + "1" * 64, encoding="utf-8")
+            script = step_script(block).replace("/workspace", str(workspace))
+            subprocess.run(
+                ["bash", "-c", script],
+                env={"PATH": f"{stub}:/usr/bin:/bin", "BUILDER_OUTPUT": str(output), "WEBHOOK_ORBIT": ""},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            receipt = output / "output"
+            test.assertTrue(receipt.exists(), f"{kind} {marker}: no receipt")
+            test.assertEqual(json.loads(receipt.read_text()), {"release_deploy": "skipped_before_mutation"})
+
+
+# --------------------------------------------------------------------------- people map in public repositories
+
+
+class PeopleMapTest(unittest.TestCase):
+    """The GitHub-to-Slack map: vendored in private repositories, from Secret Manager in public ones."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="release-people-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.missing = self.tmp / "missing.json"
+
+    def load(self, path: Path, env: str | None) -> dict:
+        values = {} if env is None else {"RELEASE_PEOPLE_JSON": env}
+        with mock.patch.dict(os.environ, values, clear=False), mock.patch("sys.stderr"):
+            if env is None:
+                os.environ.pop("RELEASE_PEOPLE_JSON", None)
+            return rv.load_people(path)
+
+    def test_the_file_wins_and_the_secret_is_the_fallback(self) -> None:
+        vendored = self.tmp / "people.json"
+        vendored.write_text(json.dumps({"slack_ids": {"a": "UFILE"}, "fallback": ["UF"]}))
+        secret = json.dumps({"slack_ids": {"a": "USECRET"}, "fallback": []})
+        self.assertEqual(self.load(vendored, secret)["slack_ids"], {"a": "UFILE"})
+        self.assertEqual(self.load(self.missing, secret)["slack_ids"], {"a": "USECRET"})
+        self.assertEqual(self.load(self.missing, None), {"slack_ids": {}, "fallback": []})
+
+    def test_a_malformed_map_mentions_nobody_and_never_raises(self) -> None:
+        bad = [
+            "not json",
+            "[1]",
+            '{"slack_ids": ["a"]}',
+            '{"slack_ids": {"a": 7}}',
+            '{"fallback": "U1"}',
+            '{"fallback": [1]}',
+        ]
+        for text in bad:
+            with self.subTest(text=text):
+                self.assertEqual(self.load(self.missing, text), {"slack_ids": {}, "fallback": []})
+                vendored = self.tmp / "bad.json"
+                vendored.write_text(text)
+                self.assertEqual(self.load(vendored, None), {"slack_ids": {}, "fallback": []})
+
+    def test_an_undecodable_map_mentions_nobody(self) -> None:
+        vendored = self.tmp / "binary.json"
+        vendored.write_bytes(b'{"slack_ids": {"a": "\xff\xfe"}}')
+        self.assertEqual(self.load(vendored, None), {"slack_ids": {}, "fallback": []})
+
+    def test_sync_check_catches_a_stale_private_map(self) -> None:
+        if not (HERE.parent / "sync.py").is_file():
+            self.skipTest("sync.py lives in orbit-infrastructure/release-kit, not in a consuming repository")
+        sys.path.insert(0, str(HERE.parent))
+        import sync  # noqa: PLC0415
+
+        repo = self.tmp / "private-repo"
+        with mock.patch("builtins.print"):
+            sync.sync(repo, "private")
+        pin_path = repo / "release" / "KIT.json"
+        pin = json.loads(pin_path.read_text())
+        # An older people map with a matching old pin: the shared version still matches.
+        (repo / "release" / kit.PEOPLE_FILE).write_text("{}")
+        pin["files"][kit.PEOPLE_FILE] = kit.digest(repo / "release" / kit.PEOPLE_FILE)
+        pin_path.write_text(json.dumps(pin))
+        with mock.patch("builtins.print") as printed, mock.patch.object(sync.subprocess, "run") as run:
+            self.assertEqual(sync.check(repo, "private"), 1)
+        run.assert_not_called()
+        self.assertIn("is stale", printed.call_args[0][0])
+
+    def test_a_malformed_map_still_sends_the_alert(self) -> None:
+        record = _record(verdict={"status": "failed", "phase": "window_15m", "reasons": ["x"]})
+        with (
+            mock.patch.object(rv, "PEOPLE_FILE", self.missing),
+            mock.patch.dict(os.environ, {"RELEASE_PEOPLE_JSON": '{"slack_ids": null, "fallback": 3}'}),
+            mock.patch("sys.stderr"),
+        ):
+            text, _ = rv.rollback_alert(SERVICE, record, None, "gs://x")
+        self.assertTrue(text)
+        self.assertNotIn("<@", text)
+
+    def test_logs_never_show_slack_ids(self) -> None:
+        self.assertEqual(rr.redact_slack_ids("<@U095N7BBQKD> and <@UFALL> failed"), "<@...> and <@...> failed")
+        with mock.patch.dict(os.environ, {"RELEASE_SLACK_DISABLED": "1"}), mock.patch("builtins.print") as printed:
+            self.assertFalse(rr.post_slack("<@U095N7BBQKD> release failed"))
+        self.assertIn("<@...> release failed", printed.call_args[0][0])
+        self.assertNotIn("U095N7BBQKD", printed.call_args[0][0])
+
+    def test_public_builds_read_the_secret(self) -> None:
+        import test_release_vercel as tv  # noqa: PLC0415
+
+        services = [
+            SERVICE,
+            rl.parse_light(light_data("cloud_run")),
+            rl.parse_light(light_data("composer")),
+            rl.parse_light(tv.vercel_data()),
+        ]
+        private: dict[str, str] = {}
+        public: dict[str, str] = {}
+        for service in services:
+            with mock.patch.object(kit, "people_vendored", return_value=True):
+                private.update(kit.rendered(service))
+            with mock.patch.object(kit, "people_vendored", return_value=False):
+                public.update(kit.rendered(service))
+        self.assertGreaterEqual(len(public), 3)
+        for name, text in public.items():
+            with self.subTest(name=name):
+                self.assertNotIn("RELEASE_PEOPLE_JSON", private[name])
+                webhook_steps = text.count('"WEBHOOK_ORBIT"]') + text.count('"WEBHOOK_ORBIT", ')
+                self.assertGreater(webhook_steps, 0)
+                for line in text.splitlines():
+                    if "secretEnv:" in line and "WEBHOOK_ORBIT" in line:
+                        self.assertIn('"RELEASE_PEOPLE_JSON"', line)
+                self.assertEqual(
+                    text.count("secrets/release-people-json/versions/latest"),
+                    text.count("secrets/slack-webhook-workspace-orbit/versions/latest"),
+                )
+                self.assertEqual(kit.with_people_secret(text), text)  # idempotent
+                self.assertEqual(kit.prod_build_problems(name, text), kit.prod_build_problems(name, private[name]))
+
+    def test_visibility_from_the_flag_or_the_event(self) -> None:
+        event = self.tmp / "event.json"
+        event.write_text(json.dumps({"repository": {"private": False}}))
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event)}):
+            self.assertTrue(kit.repository_is_public())
+            self.assertFalse(kit.repository_is_public("private"))
+        event.write_text(json.dumps({"repository": {"private": True}}))
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event)}):
+            self.assertFalse(kit.repository_is_public())
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": ""}):
+            self.assertIsNone(kit.repository_is_public())
+
+    def test_check_refuses_a_map_in_a_public_repo(self) -> None:
+        kit_dir = self.tmp / "release"
+        kit_dir.mkdir()
+        people = kit_dir / kit.PEOPLE_FILE
+        people.write_text("{}")
+        pinned = {kit.PEOPLE_FILE: kit.digest(people)}
+        with mock.patch.object(kit, "KIT_DIR", kit_dir):
+            self.assertEqual(kit.people_problems(pinned, public=False), [])
+            self.assertEqual(kit.people_problems(pinned, public=None), [])
+            refused = kit.people_problems(pinned, public=True)
+            self.assertEqual(len(refused), 1)
+            self.assertIn("must not be in a public repository", refused[0])
+            people.write_text('{"edited": true}')
+            self.assertIn("differs from KIT.json", kit.people_problems(pinned, public=False)[0])
+            people.unlink()
+            self.assertIn("is missing but KIT.json pins it", kit.people_problems(pinned, public=False)[0])
+            self.assertEqual(kit.people_problems({}, public=True), [])
+            self.assertEqual(kit.people_problems(pinned, public=True), [])
+
+    def test_sync_leaves_the_map_out_of_public_repositories(self) -> None:
+        if not (HERE.parent / "sync.py").is_file():
+            self.skipTest("sync.py lives in orbit-infrastructure/release-kit, not in a consuming repository")
+        sys.path.insert(0, str(HERE.parent))
+        import sync  # noqa: PLC0415
+
+        repo = self.tmp / "repo"
+        with mock.patch("builtins.print"):
+            sync.sync(repo, "private")
+        self.assertTrue((repo / "release" / kit.PEOPLE_FILE).is_file())
+        pin = json.loads((repo / "release" / "KIT.json").read_text())
+        self.assertEqual(pin["visibility"], "private")
+        self.assertIn(kit.PEOPLE_FILE, pin["files"])
+        with mock.patch("builtins.print"):
+            sync.sync(repo, "public")  # re-sync as public deletes it
+        self.assertFalse((repo / "release" / kit.PEOPLE_FILE).exists())
+        public_pin = json.loads((repo / "release" / "KIT.json").read_text())
+        self.assertEqual(public_pin["visibility"], "public")
+        self.assertNotIn(kit.PEOPLE_FILE, public_pin["files"])
+        self.assertEqual(public_pin["version"], pin["version"])  # one kit version for both
+        # Later syncs without --visibility keep the saved visibility.
+        self.assertEqual(sync.detect_visibility(repo), "public")
+
+    def test_sync_detects_known_public_repositories(self) -> None:
+        if not (HERE.parent / "sync.py").is_file():
+            self.skipTest("sync.py lives in orbit-infrastructure/release-kit, not in a consuming repository")
+        sys.path.insert(0, str(HERE.parent))
+        import sync  # noqa: PLC0415
+
+        repo = self.tmp / "mcp"
+        (repo / "release" / "services").mkdir(parents=True)
+        (repo / "release" / "services" / "orbit-mcp.json").write_text(
+            json.dumps({"github_repo": "orbit-search/orbit-mcp"})
+        )
+        self.assertEqual(sync.detect_visibility(repo), "public")
+        (repo / "release" / "services" / "orbit-mcp.json").write_text(json.dumps({"github_repo": "orbit-search/digit"}))
+        self.assertEqual(sync.detect_visibility(repo), "private")
 
 
 if __name__ == "__main__":

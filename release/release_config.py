@@ -477,7 +477,8 @@ def config_path(name: str | None = None) -> Path:
 
 
 def config_kind(name: str | None = None) -> str:
-    """The deploy kind of a service config: "gke" (the default), "cloud_run" or "composer"."""
+    """The deploy kind of a service config: "gke" (the default), "cloud_run", "composer", "vercel", "railway" or
+    "static_site"."""
     path = config_path(name)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -487,7 +488,7 @@ def config_kind(name: str | None = None) -> str:
 
 
 def load_any_service(name: str | None = None) -> object:
-    """The service of any kind: a GKE Service, or a release_light.LightService (kinds cloud_run, composer).
+    """The service of any kind: a GKE Service, or a release_light.LightService (cloud_run, composer, vercel).
 
     The release gate, the rollback commands and release_kit.py take both; the light kinds give the
     same names (prod, dev, rollback_trigger, kit_command, ...), so one code path serves them.

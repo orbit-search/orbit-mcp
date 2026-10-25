@@ -30,7 +30,8 @@ _EXPECT_LATEST so that it refuses when prod moved on).
 
 Services that are not GKE Deployments (release_light.py, tier full) use the same
 commands. A Cloud Run rollback sends the traffic back to the revisions of the
-target release; a Composer rollback syncs the target commit's DAGs to dags/.
+target release; a Composer rollback syncs the target commit's DAGs to dags/; a
+Vercel rollback points the production domains back at the target's deployment.
 The lock, the record, `_EXPECT_LATEST` and the hold are the same code.
 
 Part of the release kit (orbit-infrastructure/release-kit); ported from
