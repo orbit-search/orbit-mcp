@@ -2821,6 +2821,11 @@ def cmd_watch(
             and not ro.needs_final_decision(current, receipt, last)
         ):
             print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
+            if (current.get("verdict") or {}).get("status") == "failed":
+                # Another check (a manual `check --phase window`) completed it with a failed verdict after
+                # this watch's first read. That check only records and alerts: the watch acts on it.
+                on_failure(service, store, current, dd)
+                return EXIT_OK if require_owner(store, rr.read_record(store, record["release_id"])) else EXIT_FAILED
             continue
         due = finished + timedelta(minutes=minutes)
         wait = (due - datetime.now(rr.UTC)).total_seconds()

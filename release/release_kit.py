@@ -899,12 +899,42 @@ def rendered_vercel(service: object) -> dict[str, str]:
         "wait_seconds": (service.deployment_wait_minutes + 5) * 60,  # type: ignore[attr-defined]
         "build_seconds": (service.deployment_wait_minutes + 60) * 60,  # type: ignore[attr-defined]
     }
-    return {
+    files = {
         service.release_build_config: VERCEL_RELEASE_TEMPLATE.format(**values),  # type: ignore[attr-defined]
         service.promote_build_config: VERCEL_PROMOTE_TEMPLATE.format(**values),  # type: ignore[attr-defined]
         service.window_config: VERCEL_WINDOW_TEMPLATE.format(**values),  # type: ignore[attr-defined]
         service.rollback_config: VERCEL_ROLLBACK_TEMPLATE.format(**values),  # type: ignore[attr-defined]
     }
+    import release_vercel as rvc
+
+    if service.github_token_secret == rvc.CONNECTION_TOKEN:  # type: ignore[attr-defined]
+        files = {name: without_github_secret(text) for name, text in files.items()}
+    return files
+
+
+_GITHUB_SECRET_BLOCK = re.compile(
+    r"(?m)^[ \t]*# The kit's GitHub token \(release_record.*\n(?:[ \t]*#.*\n)*"
+    r"[ \t]*- versionName: projects/\$PROJECT_ID/secrets/connection/versions/latest\n"
+    r"[ \t]*env: \"GITHUB_TOKEN\"\n"
+)
+_GITHUB_SECRET_ENV = re.compile(r'"GITHUB_TOKEN", |, "GITHUB_TOKEN"')
+_GITHUB_ONLY_SECRET_ENV = re.compile(r'(?m)^[ \t]*secretEnv: \["GITHUB_TOKEN"\]\n')
+CONNECTION_TOKEN_NOTE = (
+    '        # No GitHub token secret (github_token_secret "connection"): reads use the Cloud Build\n'
+    "        # connection's read token; each commit status mints a read-write token of the connection.\n"
+)
+
+
+def without_github_secret(text: str) -> str:
+    """A rendered vercel build without the GITHUB_TOKEN secret: the kit mints tokens from the connection."""
+    text, blocks = _GITHUB_SECRET_BLOCK.subn(CONNECTION_TOKEN_NOTE, text)
+    if blocks != 1:
+        raise rc.ConfigError("the vercel secrets block changed; update without_github_secret")
+    text = _GITHUB_ONLY_SECRET_ENV.sub("", text)
+    text = _GITHUB_SECRET_ENV.sub("", text)
+    if "GITHUB_TOKEN" in text:
+        raise rc.ConfigError("a rendered vercel build still names GITHUB_TOKEN; update without_github_secret")
+    return text
 
 
 def load_config(path: Path) -> object:

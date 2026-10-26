@@ -367,6 +367,10 @@ A late repair of an older checkpoint, also with `--final`, never replaces a late
 terminal verdict unless it finds a failure. Only a replaced release (a newer
 record or a rollback) supersedes open checkpoints; while another build only runs,
 the check records nothing and its checkpoint stays open.
+A manual check only records and alerts. When it completes a checkpoint with a
+failed verdict while the watch runs, the watch starts the rollback itself (or
+pings the author, by tier): at the next checkpoint it skips, and after its own
+checks of the checkpoint it is on (they passed, but the saved verdict is failed).
 
 ### Prod build contract
 
@@ -387,6 +391,10 @@ the check records nothing and its checkpoint stays open.
   unfinished record.
   The finish refuses (and changes nothing) once a newer release or rollback is
   latest, so a late recovery never hides it.
+  When the build passed `--failed-step-file`, the recovery finish command carries
+  the step itself (`--failed-step '<json>'`, or `''` when no step was named), so a
+  hand finish after the build ended still records `failed_step` and
+  `deploy_steps_named`.
 
 Cloud Run/Composer use the same ownership fields through
 `python3 release/release_light.py --service <service> own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`.
@@ -460,7 +468,7 @@ release (control by version):
 A failed release rolls back on its own: the rollback build points the domains
 back at the deployment that served before the release
 (`POST /v9/projects/<id>/rollback/<dpl>`, an alias switch in seconds), turns
-the rolled-back commit's status to `failure` (a redeploy of it must not go
+the status of every commit it removes to `failure` (a redeploy of one must not go
 live), and writes the rollback record with the hold. Vercel then turns
 auto-assignment off: its own hold. The next promote that the kit's hold lets
 through (a revert, `Fixes-release:`, or `release_gate.py resume`) promotes by
@@ -485,20 +493,27 @@ Config:
 
 `vercel` also takes `check_context` (default `orbit-release/<service>`),
 `token_secret` (default `vercel-release-token`), `github_token_secret`
-(default `release-kit-github-token`), `deployment_wait_minutes`
+(default `connection`), `deployment_wait_minutes`
 (30), `assign_wait_seconds` (180) and `log_settle_seconds` (30). Every smoke
 URL must be `https://<a configured domain>/...`. `release_kit.py render`
 writes all four builds: `<service>.release.yaml` (dev, push trigger),
 `<service>.promote.yaml` (prod, manual trigger), `<service>.release-verify.yaml`
 (window) and `<service>.rollback.yaml`.
 
-Credentials: the builds read three Secret Manager secrets:
-`slack-webhook-workspace-orbit`, `release-kit-github-token` into the env
-`GITHUB_TOKEN` (the kit's GitHub token path; it must read the repository and
-write commit statuses) and the team-scoped Vercel token
-(`vercel-release-token`, env `VERCEL_RELEASE_TOKEN`). On a laptop
-`release_vercel.py` reads the Vercel token from Secret Manager with the gcloud
-identity. The token is never printed and never on a command line.
+Credentials: the builds read two Secret Manager secrets:
+`slack-webhook-workspace-orbit` and the team-scoped Vercel token
+(`vercel-release-token`, env `VERCEL_RELEASE_TOKEN`). GitHub needs no
+secret: reads use the read token of the Cloud Build connection (as for every
+kind), and each commit status uses a read-write token of the connection's
+GitHub App (Google Cloud Build: commit statuses write), minted for that status
+and never stored. So the repository must be linked in the connection
+(`connected_repository`), and the build identity needs
+`roles/cloudbuild.tokenAccessor` on the connection. A `github_token_secret`
+other than `connection` names a Secret Manager secret that the builds put in
+`GITHUB_TOKEN` instead (a token that reads the repository and writes commit
+statuses). On a laptop `release_vercel.py` reads the Vercel token from Secret
+Manager with the gcloud identity, and `GITHUB_TOKEN`, when set, is used for
+the status. No token is printed or put on a command line.
 
 What differs from GKE:
 
@@ -634,5 +649,9 @@ staged build and no rollback API, so the kit watches and pings:
 }
 ```
 
-The builds read `GITHUB_TOKEN` from `static_site.github_token_secret` (default
-`release-kit-github-token`; read-only: contents, commits, check runs).
+The builds read GitHub (contents, commits, the publisher's check runs) with a
+read token of the service's Cloud Build connection link (`connected_repository`),
+like the GKE kinds; the build identity needs `roles/cloudbuild.readTokenAccessor`
+on the connection. No GitHub secret is needed (`github_token_secret` defaults to
+`connection`, as for kind `vercel`). Any other value names a secret that the builds
+put in `GITHUB_TOKEN`.
