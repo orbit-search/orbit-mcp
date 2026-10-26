@@ -132,6 +132,9 @@ class Metric:
     # The samples of this metric count as "judged" for the final verdict.
     judged: bool = False
     unit: str = ""
+    # The queries can be grouped by the Datadog `version` tag (DD_VERSION is the commit): an exceeded
+    # rate is then compared with the other versions that served in the same window.
+    versioned: bool = False
 
 
 @dataclass(frozen=True)
@@ -390,10 +393,13 @@ def parse_service(data: dict, path: Path | None = None) -> Service:
             spread=bool(item.get("spread")),
             judged=bool(item.get("judged")),
             unit=str(item.get("unit") or ("rate" if item.get("kind") == "rate" else "s")),
+            versioned=bool(item.get("versioned")),
         )
         for item in verify.get("metrics") or []
     )
     for metric in metrics:
+        if metric.versioned and metric.kind != "rate":
+            raise ConfigError(f"{where}: metric {metric.name} is versioned, but only rate metrics can be")
         if metric.kind == "rate" and not (metric.numerator and metric.denominator):
             raise ConfigError(f"{where}: rate metric {metric.name} needs numerator and denominator")
         if metric.kind == "value" and not (metric.value and metric.samples):
@@ -451,6 +457,47 @@ def service_files() -> list[Path]:
 def single_service() -> bool:
     """Whether the repository has exactly one service config."""
     return len(service_files()) == 1
+
+
+def config_path(name: str | None = None) -> Path:
+    """The config file of the service named by --service or RELEASE_SERVICE, else the repository's only one."""
+    name = name or os.environ.get("RELEASE_SERVICE", "").strip() or None
+    files = service_files()
+    if name:
+        path = SERVICES_DIR / f"{name}.json"
+        if not path.exists():
+            raise ConfigError(f"no service config {path}")
+        return path
+    if len(files) == 1:
+        return files[0]
+    raise ConfigError(
+        f"{len(files)} service configs in {SERVICES_DIR}; name one with --service "
+        f"({', '.join(item.stem for item in files) or 'none'})"
+    )
+
+
+def config_kind(name: str | None = None) -> str:
+    """The deploy kind of a service config: "gke" (the default), "cloud_run", "composer", "vercel", "railway" or
+    "static_site"."""
+    path = config_path(name)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"{path}: {error}") from None
+    return str(data.get("kind") or "gke")
+
+
+def load_any_service(name: str | None = None) -> object:
+    """The service of any kind: a GKE Service, or a release_light.LightService (cloud_run, composer, vercel).
+
+    The release gate, the rollback commands and release_kit.py take both; the light kinds give the
+    same names (prod, dev, rollback_trigger, kit_command, ...), so one code path serves them.
+    """
+    if config_kind(name) == "gke":
+        return load_service(name)
+    import release_light  # noqa: PLC0415 - release_light imports this module
+
+    return release_light.load_light(config_path(name).stem)
 
 
 def load_service(name: str | None = None) -> Service:

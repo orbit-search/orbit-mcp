@@ -38,9 +38,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Protocol
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import release_capacity  # noqa: E402
 import release_config as rc  # noqa: E402
 from promote_release_guard import ONGOING_STATUSES, GoogleApi, GuardError, _http_json, github_compare_status  # noqa: E402
 
@@ -111,7 +113,11 @@ def release_id_for(started_at: str, commit: str) -> str:
 # --------------------------------------------------------------------------- commands
 
 
-Runner = Callable[[list[str]], str]
+class Runner(Protocol):
+    """Runs one CLI command and returns its stdout. Every runner takes the optional timeout in seconds:
+    the window check bounds each command by its remaining observation budget (release_verify.read_fresh)."""
+
+    def __call__(self, args: list[str], /, timeout: float = 120) -> str: ...
 
 
 def run_command(args: list[str], timeout: float = 120) -> str:
@@ -146,15 +152,42 @@ class Clients:
         return json.loads(self.runner(command))
 
 
-def wait_rollouts(clients: Clients, names: list[str], timeout_seconds: int = 900) -> list[str]:
-    """Wait for Deployment rollouts in parallel; return one line per rollout that did not complete."""
+def scaled_rollout_timeouts(
+    clients: Clients, names: list[str], *, minimum: int = 0, factor: int = 1, elapsed: float = 0
+) -> dict[str, int]:
+    """Rule 3: each Deployment's rollout timeout (release_capacity.rollout_timeout) times factor, less the
+    seconds already spent, and at least `minimum`. A Deployment that cannot be read gets the base timeout."""
+    out = {}
+    for name in names:
+        try:
+            seconds = release_capacity.rollout_timeout(clients.kubectl_json("get", "deployment", name))
+        except (RecordError, ValueError, KeyError, TypeError) as error:
+            print(f"WARNING: deployment/{name} unreadable, base rollout timeout: {error}", file=sys.stderr, flush=True)
+            seconds = release_capacity.ROLLOUT_BASE_SECONDS
+        out[name] = max(int(minimum), round(seconds * factor - elapsed))
+    return out
+
+
+def wait_rollouts(
+    clients: Clients,
+    names: list[str],
+    timeout_seconds: int = 900,
+    *,
+    timeouts: dict[str, int] | None = None,
+    popen: Callable[..., subprocess.Popen] | None = None,
+) -> list[str]:
+    """Wait for Deployment rollouts in parallel; return one line per rollout that did not complete.
+
+    timeouts: seconds per Deployment (scaled_rollout_timeouts); the others wait timeout_seconds.
+    """
     processes = {}
     failures = []
     for name in names:
         command = [*clients.kubectl_base(), "-n", clients.env.namespace, "rollout", "status", f"deployment/{name}"]
+        seconds = (timeouts or {}).get(name, timeout_seconds)
         try:
-            processes[name] = subprocess.Popen(
-                [*command, f"--timeout={timeout_seconds}s"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            processes[name] = (popen or subprocess.Popen)(
+                [*command, f"--timeout={seconds}s"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
             )
         except OSError as error:
             failures.append(f"deployment/{name} rollout could not be watched: {error}")
@@ -241,6 +274,19 @@ def _pod_summary(pods: list[dict], container: str) -> dict:
             if reason in BAD_WAITING_REASONS:
                 bad.append(f"{pod['metadata']['name']}: {reason}")
     return {
+        "pod_observations": [
+            {
+                "name": pod["metadata"]["name"],
+                "created_at": pod["metadata"].get("creationTimestamp"),
+                "phase": (pod.get("status") or {}).get("phase"),
+                "reason": (pod.get("status") or {}).get("reason"),
+                "conditions": [
+                    {key: condition.get(key) for key in ("type", "status", "reason", "lastTransitionTime")}
+                    for condition in (pod.get("status") or {}).get("conditions") or []
+                ],
+            }
+            for pod in pods[:100]
+        ],
         "live_pods": live,
         "ready_pods": ready,
         "running_digests": sorted(digests),
@@ -260,16 +306,24 @@ def live_pods(clients: Clients, deployment: rc.Deployment) -> list[dict]:
     ]
 
 
-def snapshot_workloads(clients: Clients) -> dict[str, dict]:
+def snapshot_workloads(clients: Clients, *, missing_ok: bool = False, resolve_tags: bool = True) -> dict[str, dict]:
     """Read the image of every Deployment that the deploy build moves to the release image.
 
     Keys: deployment/<name>. "image" is the template reference and "digest"
     the digest that the Deployment is set to (the template digest, or for a
-    tag-only template the one digest its live pods run).
+    tag-only template the one digest its live pods run). missing_ok: a
+    Deployment that does not exist yet (the first deploy of a new environment)
+    is left out instead of failing.
     """
     workloads: dict[str, dict] = {}
     for item in clients.env.deployments:
-        deployment = clients.kubectl_json("get", "deployment", item.name)
+        try:
+            deployment = clients.kubectl_json("get", "deployment", item.name)
+        except RecordError as error:
+            if missing_ok and "NotFound" in str(error):
+                print(f"deployment/{item.name} does not exist yet (first deploy)", flush=True)
+                continue
+            raise
         pods = clients.kubectl_json("get", "pods", "-l", item.selector)["items"]
         replica_sets = clients.kubectl_json("get", "replicasets", "-l", item.selector)["items"]
         container = _container(deployment["spec"]["template"]["spec"], item.container)
@@ -280,7 +334,7 @@ def snapshot_workloads(clients: Clients) -> dict[str, dict]:
         digest = digest_of(container["image"])
         if digest is None and len(summary["running_digests"]) == 1:
             digest = summary["running_digests"][0]
-        if digest is None:
+        if digest is None and resolve_tags:
             digest = tag_digest(clients.env, container["image"])
         workloads[f"deployment/{item.name}"] = {
             "kind": "deployment",
@@ -579,6 +633,48 @@ def update_record(
     return update_object(store, record_name(release_id), change)
 
 
+def newer_latest(store: Store, release_id: str) -> str | None:
+    """The release (or rollback) latest.json names when it is newer than release_id, else None.
+
+    Release ids start with their UTC start time (release_id_for), so a later id is a newer release."""
+    pointer, _ = store.read("latest.json")
+    current = str((pointer or {}).get("release_id") or "")
+    return current if current and current != release_id and current > release_id else None
+
+
+def point_latest_unless_newer(store: Store, record: dict) -> None:
+    """Point latest.json at a finished record, unless a newer release or rollback is latest by then.
+
+    A finish that runs late (a recovery from the alert) must never hide a newer release or rollback
+    record, or a later promote would miss its hold. The check runs inside the conditional write."""
+
+    def change(current: dict | None) -> dict:
+        """The new pointer; refuse when the pointer names a newer release."""
+        named = str((current or {}).get("release_id") or "")
+        if named and named != record["release_id"] and named > record["release_id"]:
+            raise RecordError(
+                f"latest.json names the newer release {named}; finishing {record['release_id']} would hide it"
+            )
+        return {
+            "release_id": record["release_id"],
+            "commit": record["commit"],
+            "kind": record["kind"],
+            "object": store.location(record_name(record["release_id"])),
+            "updated_at": utc_now(),
+        }
+
+    update_object(store, "latest.json", change)
+
+
+def refuse_newer_latest(store: Store, release_id: str) -> None:
+    """Raise RecordError when a newer release or rollback is latest: a finish must not touch the old record."""
+    if newer := newer_latest(store, release_id):
+        raise RecordError(
+            f"latest.json names the newer release {newer}; {release_id} is no longer what runs, so its record "
+            "is left as it is (finish it only while it is the newest release)"
+        )
+
+
 def point_latest(store: Store, record: dict) -> None:
     """Point latest.json at the record."""
     update_object(
@@ -649,6 +745,11 @@ def commits_between(repo: str, base: str | None, head: str, token: str) -> tuple
 # --------------------------------------------------------------------------- Slack
 
 
+def redact_slack_ids(text: str) -> str:
+    """The text for a log: Slack member mentions become <@...>, so ids never reach build or CI logs."""
+    return re.sub(r"<@[A-Z0-9]+>", "<@...>", text)
+
+
 def post_slack(text: str, blocks: list[dict] | None = None) -> bool:
     """Post one line (and optional Block Kit blocks) to the Orbit workspace webhook when WEBHOOK_ORBIT is set.
 
@@ -659,7 +760,7 @@ def post_slack(text: str, blocks: list[dict] | None = None) -> bool:
     if os.environ.get("RELEASE_SLACK_DISABLED", "").strip() == "1":
         webhook = ""
     if not webhook:
-        print(f"Slack (not sent, no WEBHOOK_ORBIT): {text}", flush=True)
+        print(f"Slack (not sent, no WEBHOOK_ORBIT): {redact_slack_ids(text)}", flush=True)
         return False
     request = urllib.request.Request(
         webhook,
@@ -771,7 +872,8 @@ def _read_text(path: str | None) -> str | None:
 def cmd_begin(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
     """Before the first change to the cluster: snapshot what runs now and write a "deploying" record."""
     started_at = utc_now()
-    before = snapshot_workloads(clients)
+    # The first deploy of a new environment creates its Deployments: before it, nothing runs.
+    before = snapshot_workloads(clients, missing_ok=True)
     previous = previous_release(store, env, before)
     image = _read_text(args.image_file)
     if not digest_of(image):
@@ -806,22 +908,119 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     release_id = _read_text(args.release_id_file) if args.release_id_file else args.release_id
     if not release_id:
         raise RecordError("no release id; release-record-begin did not run")
+    refuse_newer_latest(store, release_id)
     after = snapshot_workloads(clients)
+    step_file = getattr(args, "failed_step_file", None)
+    failed_step = read_failed_step(step_file) if args.status == "deploy_failed" else None
 
     def finish(record: dict) -> None:
-        """Write the snapshot, the status and the deploy finish time on the record."""
+        """Write the snapshot, the status, the failed step and the deploy finish time on the record."""
         record["workloads"] = after
+        keep_finish_time(record, args.status)
         record["status"] = args.status
-        record.setdefault("times", {})["deploy_finished"] = utc_now()
+        if failed_step:
+            record["failed_step"] = failed_step
+        if step_file:
+            # This build names every failed deploy step (release_kit.py prod build contract): an unnamed
+            # deploy_failed is then never a capacity wait (release_verify.deploy_capacity).
+            record["deploy_steps_named"] = True
 
     saved = update_record(store, release_id, finish, args.status)
-    point_latest(store, saved)
+    point_latest_unless_newer(store, saved)
     print(f"Release {release_id}: {args.status}; {store.location('latest.json')} points at it", flush=True)
     # The deploy is over: a rollback may start now. A build that ends frees the lock too.
     try:
         release_lock(store, (saved.get("build") or {}).get("id"))
     except (RecordError, GuardError, OSError) as error:
         print(f"WARNING: could not free the prod lock; it ends with this build: {error}", file=sys.stderr, flush=True)
+    return 0
+
+
+def read_failed_step(path: str | None) -> dict | None:
+    """The failed deploy step that release_capacity.py rollout-wait wrote ({"id", "deployments"}), else None."""
+    text = _read_text(path) if path and Path(path).is_file() else None
+    if not text:
+        return None
+    try:
+        step = json.loads(text)
+    except ValueError:
+        return {"id": text.strip()[:80]}
+    return step if isinstance(step, dict) and step.get("id") else None
+
+
+def keep_finish_time(record: dict, status: str) -> None:
+    """Set the deploy finish time; a retried finish of the same status keeps the first one (the window's clock)."""
+    times = record.setdefault("times", {})
+    if not (record.get("status") == status and times.get("deploy_finished")):
+        times["deploy_finished"] = utc_now()
+
+
+# Waits between the attempts of a prod record finish (release_record.py / release_light.py finish --attempts).
+FINISH_RETRY_SECONDS = 15.0
+FINISH_ERRORS = (RecordError, GuardError, subprocess.SubprocessError, KeyError, OSError, ValueError)
+
+
+def finish_recovery(tool: str, service: str, env: str, release_id: str, status: str) -> list[str]:
+    """The commands that finish a release record by hand, then run the checks the build skipped."""
+    rid = release_id or "<release id>"
+    if tool == "light":
+        base = f"python3 release/release_light.py --service {service}"
+        return [
+            f"{base} finish --env {env} --release-id {rid} --status {status}",
+            f"{base} check --env {env} --release-id {rid}",
+            f'{base} schedule-window --release-id {rid} --source-dir "$(mktemp -d)"',
+        ]
+    return [
+        f"python3 release/release_record.py finish --service {service} --env {env} --release-id {rid} --status {status}",
+        f"python3 release/release_verify.py check --service {service} --env {env} --phase deploy --release-id {rid} "
+        "--wait-rollouts-seconds 300",
+        f"python3 release/release_verify.py schedule-window --service {service} --env {env} --release-id {rid} "
+        '--source-dir "$(mktemp -d)"',
+    ]
+
+
+def finish_with_retries(
+    finish: Callable[[], int],
+    *,
+    attempts: int,
+    title: str,
+    env: str,
+    release_id: str,
+    recovery: list[str],
+    sleep: Callable[[float], None] | None = None,
+) -> int:
+    """Run a record finish up to `attempts` times; return its exit code, or 1 when every attempt failed.
+
+    The deploy has changed prod by now. A finish that still fails leaves the new image without smoke
+    checks and watch window, so the alert (prod) gives the exact recovery commands, in order.
+    """
+    attempts = max(1, attempts)
+    error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return finish()
+        except FINISH_ERRORS as failure:
+            error = failure
+            print(f"release record finish, attempt {attempt}/{attempts}: {failure}", file=sys.stderr, flush=True)
+            if attempt < attempts:
+                (sleep or time.sleep)(FINISH_RETRY_SECONDS * attempt)
+    steps = " ".join(f"{index}) `{command}`" for index, command in enumerate(recovery, 1))
+    text = (
+        f":rotating_light: {title} {env} release {release_id or '(unknown id)'}: the deploy changed {env}, but "
+        f"the release record was not finished after {attempts} attempt(s): {str(error)[:300]}. The new image "
+        "runs UNCHECKED (no smoke checks, no +15/+60 watch window, no automatic rollback) and this build ends "
+        f"red. From a checkout of this commit with {env} access, run in order: {steps}. The finish refuses "
+        "once a newer release or rollback is latest; then this release no longer runs and needs no checks."
+    )
+    print(text, file=sys.stderr, flush=True)
+    if env == "prod":
+        post_slack(text)
+    return 1
+
+
+def cmd_unlock(args: argparse.Namespace, env: Environment, store: Store, clients: Clients) -> int:
+    """Release only this build's prod lock after a skipped or unrecorded deployment path ends."""
+    release_lock(store, args.build_id)
     return 0
 
 
@@ -983,6 +1182,14 @@ def main(argv: list[str] | None = None) -> int:
     finish.add_argument("--release-id-file")
     finish.add_argument("--release-id")
     finish.add_argument("--status", required=True, choices=["deployed", "deploy_failed"])
+    finish.add_argument("--attempts", type=int, default=1, help="retry a failed finish; the last failure alerts")
+    finish.add_argument(
+        "--failed-step-file", help="the failed step (release_capacity.py rollout-wait), kept with deploy_failed"
+    )
+
+    unlock = commands.add_parser("unlock", help="free the prod lock only if this build holds it")
+    add_common_args(unlock)
+    unlock.add_argument("--build-id", required=True)
 
     show = commands.add_parser("show", help="print a record")
     add_common_args(show)
@@ -994,9 +1201,25 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument("--previous-build-id")
 
     args = parser.parse_args(argv)
-    handlers = {"begin": cmd_begin, "finish": cmd_finish, "show": cmd_show, "backfill": cmd_backfill}
+    handlers = {
+        "begin": cmd_begin,
+        "finish": cmd_finish,
+        "unlock": cmd_unlock,
+        "show": cmd_show,
+        "backfill": cmd_backfill,
+    }
     try:
-        _, env, store, clients = open_from_args(args)
+        service, env, store, clients = open_from_args(args)
+        if args.command == "finish":
+            release_id = (_read_text(args.release_id_file) if args.release_id_file else args.release_id) or ""
+            return finish_with_retries(
+                lambda: cmd_finish(args, env, store, clients),
+                attempts=args.attempts,
+                title=service.title,
+                env=args.env,
+                release_id=release_id,
+                recovery=finish_recovery("gke", service.name, args.env, release_id, args.status),
+            )
         return handlers[args.command](args, env, store, clients)
     except (RecordError, GuardError, rc.ConfigError, subprocess.SubprocessError, KeyError, OSError) as error:
         print(f"release record: {error}", file=sys.stderr, flush=True)

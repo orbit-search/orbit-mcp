@@ -1,0 +1,269 @@
+{
+ "schema_version": 1,
+ "id": "2026-10-23-smp-46c1f85ec-preempted-pods",
+ "title": "SMP 46c1f85ec rolled back at +15: GKE preempted both pods at 20:21:27, the replacements started at 20:21:32 and the check sampled 0/2 available at 20:21:34",
+ "kind": "checkpoint",
+ "links": [
+  "https://github.com/orbit-search/orbit-infrastructure/pull/484",
+  "gs://orbit-search-release-records/slipi-management-portal/prod/releases/20261023T200531Z-46c1f85ec.json"
+ ],
+ "fixed_by": "orbit-infrastructure #484 (77e0965): the window check reads workloads again after the slow reads and leaves a replica shortage it cannot confirm inconclusive",
+ "service": {
+  "service": "slipi-management-portal",
+  "title": "SMP",
+  "tier": "full",
+  "github_repo": "orbit-search/slipi-management-portal",
+  "connected_repository": "orbit-search-slipi-management-portal",
+  "release_branch": "main",
+  "docs": "docs/RELEASE_PIPELINE.md",
+  "image": {
+   "repository": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal",
+   "registry_location": "us-central1",
+   "registry_repository": "slipi-management-portal",
+   "package": "slipi-management-portal"
+  },
+  "triggers": {
+   "dev": [
+    "slipi-management-portal-deploy-dev"
+   ],
+   "prod": [
+    "slipi-management-portal-prod",
+    "slipi-management-portal-deploy-prod"
+   ],
+   "rollback": "slipi-management-portal-rollback"
+  },
+  "environments": {
+   "prod": {
+    "cluster": "prod",
+    "namespace": "smp",
+    "deployments": [
+     {
+      "name": "prod-smp-deployment",
+      "container": "smp",
+      "selector": "app=prod-smp-deployment"
+     }
+    ],
+    "smoke": [
+     {
+      "type": "http_pod",
+      "name": "readiness",
+      "deployment": "prod-smp-deployment",
+      "port": 3000,
+      "path": "/api/readyz",
+      "expect_status": [
+       200
+      ],
+      "contains": "ok"
+     },
+     {
+      "type": "http_pod",
+      "name": "access gate",
+      "deployment": "prod-smp-deployment",
+      "port": 3000,
+      "path": "/",
+      "expect_status": [
+       401
+      ],
+      "contains": "Cloudflare Access assertion required",
+      "all_pods": false
+     }
+    ]
+   },
+   "dev": {
+    "cluster": "dev",
+    "namespace": "smp",
+    "deployments": [
+     {
+      "name": "dev-smp-deployment",
+      "container": "smp",
+      "selector": "app=dev-smp-deployment"
+     }
+    ],
+    "smoke": [
+     {
+      "type": "http_pod",
+      "name": "readiness",
+      "deployment": "dev-smp-deployment",
+      "port": 3000,
+      "path": "/api/readyz",
+      "expect_status": [
+       200
+      ],
+      "contains": "ok"
+     },
+     {
+      "type": "http_pod",
+      "name": "access gate",
+      "deployment": "dev-smp-deployment",
+      "port": 3000,
+      "path": "/",
+      "expect_status": [
+       401
+      ],
+      "contains": "Cloudflare Access assertion required",
+      "all_pods": false
+     }
+    ]
+   }
+  },
+  "verify": {
+   "checkpoints": [
+    15,
+    60
+   ],
+   "signals": {
+    "log_containers": [
+     "smp"
+    ]
+   }
+  },
+  "code": {
+   "source_prefixes": [
+    "app/",
+    "components/",
+    "lib/",
+    "hooks/",
+    "utils/",
+    "types/",
+    "plugins/",
+    "middleware.ts",
+    "next.config.js"
+   ],
+   "extensions": [
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs"
+   ]
+  }
+ },
+ "decision": {
+  "phase": "window",
+  "now": "2026-10-23T20:21:34Z",
+  "checkpoint_minutes": 15
+ },
+ "record": {
+  "schema_version": 1,
+  "release_id": "20261023T200531Z-46c1f85ec",
+  "service": "slipi-management-portal",
+  "environment": "prod",
+  "kind": "promote",
+  "commit": "46c1f85ecaf906d5872f701fc9c16ddb23a2b23a",
+  "previous": {
+   "commit": "c222f8630ac92324f4f5fd10a6ec8bdea85796c2",
+   "deploy_finished": "2026-10-23T19:10:21Z",
+   "images": {
+    "app": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal@sha256:5952f85ed2dc2a26f4abc8d71ab6e7347306f7baa6672fd4cf74a45da02e763d"
+   },
+   "recorded": true,
+   "release_id": "20261023T190937Z-c222f8630",
+   "workloads": {
+    "deployment/prod-smp-deployment": {
+     "available_replicas": 2,
+     "bad_pods": [],
+     "container": "smp",
+     "digest": "sha256:5952f85ed2dc2a26f4abc8d71ab6e7347306f7baa6672fd4cf74a45da02e763d",
+     "image": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal:c222f8630ac92324f4f5fd10a6ec8bdea85796c2@sha256:5952f85ed2dc2a26f4abc8d71ab6e7347306f7baa6672fd4cf74a45da02e763d",
+     "kind": "deployment",
+     "live_pods": 2,
+     "name": "prod-smp-deployment",
+     "ready_pods": 2,
+     "replicas": 2,
+     "restarts": 0,
+     "rollout_current": true,
+     "running_digests": [
+      "sha256:5952f85ed2dc2a26f4abc8d71ab6e7347306f7baa6672fd4cf74a45da02e763d"
+     ],
+     "selector": "app=prod-smp-deployment",
+     "updated_replicas": 2
+    }
+   }
+  },
+  "times": {
+   "build_created": "2026-10-23T20:05:02.804443Z",
+   "deploy_finished": "2026-10-23T20:06:32Z",
+   "deploy_started": "2026-10-23T20:05:31Z"
+  },
+  "images": {
+   "app": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal@sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb"
+  },
+  "workloads": {
+   "deployment/prod-smp-deployment": {
+    "available_replicas": 2,
+    "bad_pods": [],
+    "container": "smp",
+    "digest": "sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb",
+    "image": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal:46c1f85ecaf906d5872f701fc9c16ddb23a2b23a@sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb",
+    "kind": "deployment",
+    "live_pods": 2,
+    "name": "prod-smp-deployment",
+    "ready_pods": 2,
+    "replicas": 2,
+    "restarts": 0,
+    "rollout_current": true,
+    "running_digests": [
+     "sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb"
+    ],
+    "selector": "app=prod-smp-deployment",
+    "updated_replicas": 2
+   }
+  },
+  "status": "deployed",
+  "commits": [
+   {
+    "sha": "5edfeeca8d63198ec67d5a829b8c24573913dde8",
+    "pr": 768,
+    "title": "release: check Cloud Build before retrying an unrecorded watch (#768)"
+   },
+   {
+    "sha": "46c1f85ecaf906d5872f701fc9c16ddb23a2b23a",
+    "pr": 769,
+    "title": "AGENTS.md: reuse Slack connections and explain per-person authentication (#769)"
+   }
+  ]
+ },
+ "inputs": {
+  "note": "Kubernetes events: both pods Preempted at 20:21:27 UTC; the two replacements were scheduled at 20:21:28 and started at 20:21:32 (readiness probe still failing at 20:21:48). The record keeps only the line 'deployment/prod-smp-deployment: 0/2 replicas available' of the 20:21:34 sample, so the sample is the deploy snapshot with those counts (2 live replacement pods, none Ready). No later sample was kept; replay sees this sample on every fresh read and does not invent a recovery. The new-error log check found 0 new errors at the time; it is not replayed (no store in the case).",
+  "workloads": [
+   {
+    "at": "2026-10-23T20:21:34Z",
+    "workloads": {
+     "deployment/prod-smp-deployment": {
+      "available_replicas": 0,
+      "bad_pods": [],
+      "container": "smp",
+      "digest": "sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb",
+      "image": "us-central1-docker.pkg.dev/orbit-search/slipi-management-portal/slipi-management-portal:46c1f85ecaf906d5872f701fc9c16ddb23a2b23a@sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb",
+      "kind": "deployment",
+      "live_pods": 2,
+      "name": "prod-smp-deployment",
+      "ready_pods": 0,
+      "replicas": 2,
+      "restarts": 0,
+      "rollout_current": true,
+      "running_digests": [
+       "sha256:f0952f94853b136bdb6420699e2bd222ea3a11b56dbca9764bc5256d98a7edeb"
+      ],
+      "selector": "app=prod-smp-deployment",
+      "updated_replicas": 2
+     }
+    }
+   }
+  ]
+ },
+ "expected": {
+  "verdict": "inconclusive",
+  "rolls_back": false,
+  "checks": {
+   "images": "inconclusive"
+  }
+ },
+ "at_the_time": {
+  "verdict": "failed",
+  "rolled_back_by": "20261023T202242Z-2b6f67744",
+  "regressions": [
+   "images: deployment/prod-smp-deployment: 0/2 replicas available"
+  ]
+ }
+}

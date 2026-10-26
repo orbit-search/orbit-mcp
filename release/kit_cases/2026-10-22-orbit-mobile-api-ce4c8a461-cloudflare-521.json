@@ -1,0 +1,287 @@
+{
+ "schema_version": 1,
+ "id": "2026-10-22-orbit-mobile-api-ce4c8a461-cloudflare-521",
+ "title": "orbit-mobile-api ce4c8a461 rolled back at its deploy check: Cloudflare answered 521 while the load balancer moved to the new pods; a minute later the URL answered 200",
+ "kind": "checkpoint",
+ "links": [
+  "https://github.com/orbit-search/orbit-infrastructure/pull/465",
+  "gs://orbit-search-release-records/orbit-mobile-api/prod/releases/20261022T053817Z-ce4c8a461.json"
+ ],
+ "fixed_by": "orbit-infrastructure #465 (d31a740): a public smoke check retries edge and gateway errors for 2 minutes",
+ "service": {
+  "service": "orbit-mobile-api",
+  "title": "orbit-mobile-api",
+  "tier": "full",
+  "github_repo": "orbit-search/orbit-flutter-backend",
+  "connected_repository": "orbit-search-orbit-flutter-backend",
+  "release_branch": "main",
+  "docs": "docs/RELEASE_PIPELINE.md",
+  "image": {
+   "repository": "us-central1-docker.pkg.dev/orbit-search/orbit/orbit-flutter-backend",
+   "registry_location": "us-central1",
+   "registry_repository": "orbit",
+   "package": "orbit-flutter-backend"
+  },
+  "triggers": {
+   "dev": [
+    "orbit-mobile-api-dev",
+    "orbit-flutter-backend-dev"
+   ],
+   "prod": [
+    "orbit-mobile-api-prod",
+    "orbit-flutter-backend-prod"
+   ],
+   "rollback": "orbit-mobile-api-rollback"
+  },
+  "environments": {
+   "prod": {
+    "cluster": "prod",
+    "namespace": "orbit-mobile-api",
+    "deployments": [
+     {
+      "name": "prod-orbit-mobile-api",
+      "container": "api",
+      "selector": "app=orbit-mobile-api,component=api,orbitsearch.com/deployment=prod-orbit-mobile-api"
+     }
+    ],
+    "smoke": [
+     {
+      "type": "http_pod",
+      "name": "readiness",
+      "deployment": "prod-orbit-mobile-api",
+      "port": 8080,
+      "path": "/readyz",
+      "expect_status": [
+       200,
+       204
+      ]
+     },
+     {
+      "type": "http_pod",
+      "name": "health",
+      "deployment": "prod-orbit-mobile-api",
+      "port": 8080,
+      "path": "/healthz",
+      "expect_status": [
+       200
+      ]
+     },
+     {
+      "type": "http_public",
+      "name": "public health",
+      "url": "https://mobile-api.orbitsearch.com/healthz",
+      "expect_status": [
+       200
+      ]
+     }
+    ]
+   },
+   "dev": {
+    "cluster": "dev",
+    "namespace": "orbit-mobile-api",
+    "deployments": [
+     {
+      "name": "dev-orbit-mobile-api",
+      "container": "api",
+      "selector": "app=orbit-mobile-api,component=api,orbitsearch.com/deployment=dev-orbit-mobile-api"
+     }
+    ],
+    "smoke": [
+     {
+      "type": "http_pod",
+      "name": "readiness",
+      "deployment": "dev-orbit-mobile-api",
+      "port": 8080,
+      "path": "/readyz",
+      "expect_status": [
+       200,
+       204
+      ]
+     },
+     {
+      "type": "http_pod",
+      "name": "health",
+      "deployment": "dev-orbit-mobile-api",
+      "port": 8080,
+      "path": "/healthz",
+      "expect_status": [
+       200
+      ]
+     }
+    ]
+   }
+  },
+  "verify": {
+   "checkpoints": [
+    15,
+    60
+   ],
+   "signals": {
+    "log_containers": [
+     "api"
+    ]
+   }
+  },
+  "code": {
+   "source_prefixes": [
+    "cmd/",
+    "internal/"
+   ],
+   "extensions": [
+    ".go"
+   ]
+  }
+ },
+ "decision": {
+  "phase": "deploy",
+  "now": "2026-10-22T05:39:13Z"
+ },
+ "record": {
+  "schema_version": 1,
+  "release_id": "20261022T053817Z-ce4c8a461",
+  "service": "orbit-mobile-api",
+  "environment": "prod",
+  "kind": "promote",
+  "commit": "ce4c8a46127214eaffcc7b31c38a10a5525ba861",
+  "previous": {
+   "commit": "84df8294e01d08fad2d4e6b40db722538642615c",
+   "images": {
+    "app": "us-central1-docker.pkg.dev/orbit-search/orbit/orbit-flutter-backend@sha256:43d8fde4e29bae7c11b3859167530d7ae5ab2d889945174307d396ad64189a07"
+   },
+   "recorded": false,
+   "release_id": null,
+   "workloads": {
+    "deployment/prod-orbit-mobile-api": {
+     "available_replicas": 2,
+     "bad_pods": [],
+     "container": "api",
+     "digest": "sha256:43d8fde4e29bae7c11b3859167530d7ae5ab2d889945174307d396ad64189a07",
+     "image": "us-central1-docker.pkg.dev/orbit-search/orbit/orbit-flutter-backend:84df8294e01d08fad2d4e6b40db722538642615c",
+     "kind": "deployment",
+     "live_pods": 2,
+     "name": "prod-orbit-mobile-api",
+     "ready_pods": 2,
+     "replicas": 2,
+     "restarts": 0,
+     "rollout_current": true,
+     "running_digests": [
+      "sha256:43d8fde4e29bae7c11b3859167530d7ae5ab2d889945174307d396ad64189a07"
+     ],
+     "selector": "app=orbit-mobile-api,component=api,orbitsearch.com/deployment=prod-orbit-mobile-api",
+     "updated_replicas": 2
+    }
+   }
+  },
+  "times": {
+   "build_created": "2026-10-22T05:37:57.156845Z",
+   "deploy_finished": "2026-10-22T05:39:10Z",
+   "deploy_started": "2026-10-22T05:38:17Z"
+  },
+  "images": {
+   "app": "us-central1-docker.pkg.dev/orbit-search/orbit/orbit-flutter-backend@sha256:452a2280e1cff3193d2789d7dace72732940361625452e7843fc524f16539431"
+  },
+  "workloads": {
+   "deployment/prod-orbit-mobile-api": {
+    "available_replicas": 2,
+    "bad_pods": [],
+    "container": "api",
+    "digest": "sha256:452a2280e1cff3193d2789d7dace72732940361625452e7843fc524f16539431",
+    "image": "us-central1-docker.pkg.dev/orbit-search/orbit/orbit-flutter-backend:ce4c8a46127214eaffcc7b31c38a10a5525ba861@sha256:452a2280e1cff3193d2789d7dace72732940361625452e7843fc524f16539431",
+    "kind": "deployment",
+    "live_pods": 2,
+    "name": "prod-orbit-mobile-api",
+    "ready_pods": 2,
+    "replicas": 2,
+    "restarts": 0,
+    "rollout_current": true,
+    "running_digests": [
+     "sha256:452a2280e1cff3193d2789d7dace72732940361625452e7843fc524f16539431"
+    ],
+    "selector": "app=orbit-mobile-api,component=api,orbitsearch.com/deployment=prod-orbit-mobile-api",
+    "updated_replicas": 2
+   }
+  },
+  "status": "deployed",
+  "commits": [
+   {
+    "sha": "ce4c8a46127214eaffcc7b31c38a10a5525ba861",
+    "pr": 97,
+    "title": "Merge deploys, release check and automatic rollback for the mobile API (release kit) (#97)"
+   }
+  ]
+ },
+ "inputs": {
+  "note": "The pod answers and the first public answer (HTTP 521, first 120 characters of the page) are the release record's deploy check (2026-10-22 05:39:13 UTC). The 200 at +60 s is the observation in the fix's commit (b3744ae: 'a minute later the URL answered 200'). The successor 20261022T060936Z-003a0b37d, which shipped the same commit, saw the same edge errors and passed on its third try.",
+  "pods": {
+   "prod-orbit-mobile-api": [
+    {
+     "name": "prod-orbit-mobile-api-59966d4545-5rdbc",
+     "ready": true
+    },
+    {
+     "name": "prod-orbit-mobile-api-59966d4545-95pmv",
+     "ready": true
+    }
+   ]
+  },
+  "http": {
+   "pod prod-orbit-mobile-api-59966d4545-5rdbc:8080/readyz": [
+    {
+     "after_seconds": 0,
+     "status": 204,
+     "body": ""
+    }
+   ],
+   "pod prod-orbit-mobile-api-59966d4545-5rdbc:8080/healthz": [
+    {
+     "after_seconds": 0,
+     "status": 200,
+     "body": ""
+    }
+   ],
+   "pod prod-orbit-mobile-api-59966d4545-95pmv:8080/readyz": [
+    {
+     "after_seconds": 0,
+     "status": 204,
+     "body": ""
+    }
+   ],
+   "pod prod-orbit-mobile-api-59966d4545-95pmv:8080/healthz": [
+    {
+     "after_seconds": 0,
+     "status": 200,
+     "body": ""
+    }
+   ],
+   "https://mobile-api.orbitsearch.com/healthz": [
+    {
+     "after_seconds": 0,
+     "status": 521,
+     "body": "<!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class"
+    },
+    {
+     "after_seconds": 60,
+     "status": 200,
+     "body": ""
+    }
+   ]
+  },
+  "rollout_failures": []
+ },
+ "expected": {
+  "verdict": "passed",
+  "rolls_back": false,
+  "checks": {
+   "public health": "passed",
+   "readiness": "passed",
+   "health": "passed"
+  }
+ },
+ "at_the_time": {
+  "verdict": "failed",
+  "rolled_back_by": "20261022T054030Z-84df8294e",
+  "regressions": [
+   "public health: GET https://mobile-api.orbitsearch.com/healthz: HTTP 521 (expected 200), 121 ms"
+  ]
+ }
+}

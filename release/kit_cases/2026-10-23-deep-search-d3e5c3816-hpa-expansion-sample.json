@@ -1,0 +1,177 @@
+{
+ "schema_version": 1,
+ "id": "2026-10-23-deep-search-d3e5c3816-hpa-expansion-sample",
+ "title": "deep-search d3e5c3816 rolled back at +15 on one pod-availability sample: the HPA scaled candidate-backfill 10 -> 15 at 20:23:45 and the check sampled 11/15 available at 20:24:04",
+ "kind": "checkpoint",
+ "links": [
+  "https://github.com/orbit-search/orbit-infrastructure/pull/484",
+  "gs://orbit-search-release-records/deep-search/prod/releases/20261023T200056Z-d3e5c3816.json"
+ ],
+ "fixed_by": "orbit-infrastructure #484 (77e0965): the window check reads workloads again after the slow reads and leaves a replica shortage it cannot confirm inconclusive",
+ "service": {
+  "service": "deep-search",
+  "title": "Deep Search",
+  "tier": "check_rollback",
+  "github_repo": "orbit-search/deep-search",
+  "connected_repository": "orbit-search-deep-search",
+  "release_branch": "main",
+  "docs": "docs/RELEASE_PIPELINE.md",
+  "image": {
+   "repository": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app",
+   "registry_location": "us-central1",
+   "registry_repository": "deep-search-app",
+   "package": "deep-search-app"
+  },
+  "triggers": {
+   "prod": [
+    "deep-search-prod"
+   ],
+   "rollback": "deep-search-rollback"
+  },
+  "environments": {
+   "prod": {
+    "cluster": "prod",
+    "namespace": "default",
+    "deployments": [
+     {
+      "name": "prod-deep-search-v3-worker-deployment-candidate-backfill",
+      "container": "deep-search-v3-worker",
+      "selector": "app=prod-deep-search-v3-worker-deployment-candidate-backfill"
+     }
+    ]
+   }
+  },
+  "verify": {
+   "checkpoints": [
+    15,
+    60
+   ]
+  },
+  "code": {
+   "source_prefixes": [
+    "src/"
+   ],
+   "extensions": [
+    ".py"
+   ]
+  }
+ },
+ "decision": {
+  "phase": "window",
+  "now": "2026-10-23T20:24:04Z",
+  "checkpoint_minutes": 15
+ },
+ "record": {
+  "schema_version": 1,
+  "release_id": "20261023T200056Z-d3e5c3816",
+  "service": "deep-search",
+  "environment": "prod",
+  "kind": "promote",
+  "commit": "d3e5c3816f04d9f7acc588f1338f0860372c4bf8",
+  "previous": {
+   "commit": "92f88a2cdc93e35d048c8d38f2464083b7b4b395",
+   "deploy_finished": "2026-10-23T19:57:59Z",
+   "images": {
+    "app": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app@sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66"
+   },
+   "recorded": true,
+   "release_id": "20261023T194714Z-92f88a2cd",
+   "workloads": {
+    "deployment/prod-deep-search-v3-worker-deployment-candidate-backfill": {
+     "available_replicas": 5,
+     "bad_pods": [],
+     "container": "deep-search-v3-worker",
+     "digest": "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+     "image": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app:92f88a2cdc93e35d048c8d38f2464083b7b4b395@sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+     "kind": "deployment",
+     "live_pods": 5,
+     "name": "prod-deep-search-v3-worker-deployment-candidate-backfill",
+     "replicas": 5,
+     "restarts": 0,
+     "rollout_current": true,
+     "running_digests": [
+      "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66"
+     ],
+     "updated_replicas": 5
+    }
+   }
+  },
+  "times": {
+   "build_created": "2026-10-23T19:59:10.654047Z",
+   "deploy_finished": "2026-10-23T20:09:01Z",
+   "deploy_started": "2026-10-23T20:00:56Z"
+  },
+  "images": {
+   "app": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app@sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66"
+  },
+  "workloads": {
+   "deployment/prod-deep-search-v3-worker-deployment-candidate-backfill": {
+    "available_replicas": 5,
+    "bad_pods": [],
+    "container": "deep-search-v3-worker",
+    "digest": "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+    "image": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app:d3e5c3816f04d9f7acc588f1338f0860372c4bf8@sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+    "kind": "deployment",
+    "live_pods": 5,
+    "name": "prod-deep-search-v3-worker-deployment-candidate-backfill",
+    "replicas": 5,
+    "restarts": 0,
+    "rollout_current": true,
+    "running_digests": [
+     "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66"
+    ],
+    "updated_replicas": 5
+   }
+  },
+  "status": "deployed",
+  "commits": [
+   {
+    "sha": "d3e5c3816f04d9f7acc588f1338f0860372c4bf8",
+    "pr": 2361,
+    "title": "AGENTS.md: reuse Slack connections and explain per-person authentication (#2361)"
+   }
+  ]
+ },
+ "inputs": {
+  "note": "deep-search runs its own release pipeline (bin/); this case replays the same sample against the kit's GKE window check, which every kit service runs. The service config is built for this replay: only the Deployment, its container and the image are deep-search's; tier check_rollback (no dev environment here) rolls back on its own like deep-search's full tier. The record keeps only the Deployment that failed (the other 23 workloads passed). Kubernetes events: the HPA set 15 replicas at 20:23:45 UTC; the last missing pod started at 20:24:43. The record keeps only the line '11/15 replicas available' of the 20:24:04 sample, so the sample is the deploy snapshot with those counts. No later sample was kept; replay sees this sample on every fresh read and does not invent a recovery. The failed release and its rollback target ran identical images.",
+  "workloads": [
+   {
+    "at": "2026-10-23T20:24:04Z",
+    "workloads": {
+     "deployment/prod-deep-search-v3-worker-deployment-candidate-backfill": {
+      "available_replicas": 11,
+      "bad_pods": [],
+      "container": "deep-search-v3-worker",
+      "digest": "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+      "image": "us-central1-docker.pkg.dev/orbit-search/deep-search-app/deep-search-app:d3e5c3816f04d9f7acc588f1338f0860372c4bf8@sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66",
+      "kind": "deployment",
+      "live_pods": 15,
+      "name": "prod-deep-search-v3-worker-deployment-candidate-backfill",
+      "replicas": 15,
+      "restarts": 0,
+      "rollout_current": true,
+      "running_digests": [
+       "sha256:b6bea0ab83a7f23288365926071ac19cce5b3118da468d721cf96baee8571d66"
+      ],
+      "updated_replicas": 15,
+      "ready_pods": 11
+     }
+    }
+   }
+  ]
+ },
+ "expected": {
+  "verdict": "inconclusive",
+  "rolls_back": false,
+  "checks": {
+   "images": "inconclusive"
+  }
+ },
+ "at_the_time": {
+  "verdict": "failed",
+  "rolled_back_by": "20261023T202735Z-92f88a2cd",
+  "regressions": [
+   "images: deployment/prod-deep-search-v3-worker-deployment-candidate-backfill: 11/15 replicas available"
+  ]
+ }
+}

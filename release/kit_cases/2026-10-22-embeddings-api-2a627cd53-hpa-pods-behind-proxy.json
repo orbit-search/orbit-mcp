@@ -1,0 +1,315 @@
+{
+ "schema_version": 1,
+ "id": "2026-10-22-embeddings-api-2a627cd53-hpa-pods-behind-proxy",
+ "title": "embeddings-api 2a627cd53 rolled back at its deploy check: the API server proxy could not reach the two pods the HPA had just added; the app was healthy on every pod a minute later",
+ "kind": "checkpoint",
+ "links": [
+  "https://github.com/orbit-search/orbit-infrastructure/pull/465",
+  "gs://orbit-search-release-records/embeddings-api/prod/releases/20261022T053511Z-2a627cd53.json"
+ ],
+ "fixed_by": "orbit-infrastructure #465 (d31a740): smoke checks call only Ready pods and retry a pod the API server proxy cannot reach",
+ "service": {
+  "service": "embeddings-api",
+  "title": "embeddings-api",
+  "tier": "check_rollback",
+  "github_repo": "orbit-search/embeddings-api",
+  "connected_repository": "orbit-search-embeddings-api",
+  "release_branch": "main",
+  "docs": "docs/RELEASE_PIPELINE.md",
+  "image": {
+   "repository": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api",
+   "registry_location": "us-central1",
+   "registry_repository": "embeddings-api",
+   "package": "embeddings-api"
+  },
+  "triggers": {
+   "prod": [
+    "embeddings-api-prod"
+   ],
+   "rollback": "embeddings-api-rollback"
+  },
+  "environments": {
+   "prod": {
+    "cluster": "prod",
+    "namespace": "embeddings",
+    "deployments": [
+     {
+      "name": "prod-embeddings-api-deployment",
+      "container": "embeddings-api",
+      "selector": "app=prod-embeddings-api-deployment"
+     },
+     {
+      "name": "prod-embeddings-worker",
+      "container": "embeddings-worker",
+      "selector": "app=prod-embeddings-worker"
+     }
+    ],
+    "smoke": [
+     {
+      "type": "http_pod",
+      "name": "api root",
+      "deployment": "prod-embeddings-api-deployment",
+      "port": 3000,
+      "path": "/",
+      "expect_status": [
+       200
+      ],
+      "contains": "Hello World"
+     },
+     {
+      "type": "pods_ready",
+      "deployment": "prod-embeddings-worker"
+     }
+    ]
+   }
+  },
+  "verify": {
+   "checkpoints": [
+    15,
+    60
+   ],
+   "min_judged": 500,
+   "metrics": [
+    {
+     "name": "worker_message_error_rate",
+     "kind": "rate",
+     "scope": "service:embeddings-worker",
+     "numerator": "sum:trace.pubsub.receive.errors{service:embeddings-worker,env:prod}.as_count()",
+     "denominator": "sum:trace.pubsub.receive.hits{service:embeddings-worker,env:prod}.as_count()",
+     "ratio": 2,
+     "absolute": 0.02,
+     "min_samples": 500,
+     "spread": true,
+     "judged": true
+    },
+    {
+     "name": "api_request_error_rate",
+     "kind": "rate",
+     "scope": "service:embeddings-api",
+     "numerator": "sum:trace.express.request.errors{service:embeddings-api,env:prod}.as_count()",
+     "denominator": "sum:trace.express.request.hits{service:embeddings-api,env:prod}.as_count()",
+     "ratio": 2,
+     "absolute": 0.05,
+     "min_samples": 200
+    }
+   ],
+   "signals": {
+    "log_containers": [
+     "embeddings-api",
+     "embeddings-worker"
+    ],
+    "monitors": "source:alert (service:embeddings-api OR service:embeddings-worker)",
+    "error_tracking": [
+     "embeddings-api",
+     "embeddings-worker"
+    ],
+    "datadog_env": "prod"
+   }
+  },
+  "code": {
+   "source_prefixes": [
+    "src/"
+   ],
+   "extensions": [
+    ".ts",
+    ".js"
+   ]
+  }
+ },
+ "decision": {
+  "phase": "deploy",
+  "now": "2026-10-22T05:37:21Z"
+ },
+ "record": {
+  "schema_version": 1,
+  "release_id": "20261022T053511Z-2a627cd53",
+  "service": "embeddings-api",
+  "environment": "prod",
+  "kind": "promote",
+  "commit": "2a627cd53c0a16fdbef8524acee51c21d4aadc53",
+  "previous": {
+   "commit": "a5d03d2e99b1553ea2d25f9a99a7013764f1c5b2",
+   "images": {
+    "app": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api@sha256:26e920a21fabce94f4765a6d7f3a62e7fb4c6f355a879a38515d803026bf5c83"
+   },
+   "recorded": false,
+   "release_id": null,
+   "workloads": {
+    "deployment/prod-embeddings-api-deployment": {
+     "available_replicas": 5,
+     "bad_pods": [],
+     "container": "embeddings-api",
+     "digest": "sha256:26e920a21fabce94f4765a6d7f3a62e7fb4c6f355a879a38515d803026bf5c83",
+     "image": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api:a5d03d2e99b1553ea2d25f9a99a7013764f1c5b2",
+     "kind": "deployment",
+     "live_pods": 5,
+     "name": "prod-embeddings-api-deployment",
+     "ready_pods": 5,
+     "replicas": 5,
+     "restarts": 0,
+     "rollout_current": true,
+     "running_digests": [
+      "sha256:26e920a21fabce94f4765a6d7f3a62e7fb4c6f355a879a38515d803026bf5c83"
+     ],
+     "selector": "app=prod-embeddings-api-deployment",
+     "updated_replicas": 5
+    },
+    "deployment/prod-embeddings-worker": {
+     "available_replicas": 6,
+     "bad_pods": [],
+     "container": "embeddings-worker",
+     "digest": "sha256:26e920a21fabce94f4765a6d7f3a62e7fb4c6f355a879a38515d803026bf5c83",
+     "image": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api:a5d03d2e99b1553ea2d25f9a99a7013764f1c5b2",
+     "kind": "deployment",
+     "live_pods": 6,
+     "name": "prod-embeddings-worker",
+     "ready_pods": 6,
+     "replicas": 6,
+     "restarts": 0,
+     "rollout_current": true,
+     "running_digests": [
+      "sha256:26e920a21fabce94f4765a6d7f3a62e7fb4c6f355a879a38515d803026bf5c83"
+     ],
+     "selector": "app=prod-embeddings-worker",
+     "updated_replicas": 6
+    }
+   }
+  },
+  "times": {
+   "build_created": "2026-10-22T05:27:40.114733Z",
+   "deploy_finished": "2026-10-22T05:37:17Z",
+   "deploy_started": "2026-10-22T05:35:11Z"
+  },
+  "images": {
+   "app": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api@sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795"
+  },
+  "workloads": {
+   "deployment/prod-embeddings-api-deployment": {
+    "available_replicas": 5,
+    "bad_pods": [],
+    "container": "embeddings-api",
+    "digest": "sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795",
+    "image": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api:2a627cd53c0a16fdbef8524acee51c21d4aadc53@sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795",
+    "kind": "deployment",
+    "live_pods": 5,
+    "name": "prod-embeddings-api-deployment",
+    "ready_pods": 5,
+    "replicas": 5,
+    "restarts": 0,
+    "rollout_current": true,
+    "running_digests": [
+     "sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795"
+    ],
+    "selector": "app=prod-embeddings-api-deployment",
+    "updated_replicas": 5
+   },
+   "deployment/prod-embeddings-worker": {
+    "available_replicas": 6,
+    "bad_pods": [],
+    "container": "embeddings-worker",
+    "digest": "sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795",
+    "image": "us-central1-docker.pkg.dev/orbit-search/embeddings-api/embeddings-api:2a627cd53c0a16fdbef8524acee51c21d4aadc53@sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795",
+    "kind": "deployment",
+    "live_pods": 6,
+    "name": "prod-embeddings-worker",
+    "ready_pods": 6,
+    "replicas": 6,
+    "restarts": 0,
+    "rollout_current": true,
+    "running_digests": [
+     "sha256:3664ce88c0fc725d0205f8b6d071ba8de4e73b171999131f3bbfc99fb105f795"
+    ],
+    "selector": "app=prod-embeddings-worker",
+    "updated_replicas": 6
+   }
+  },
+  "status": "deployed",
+  "commits": [
+   {
+    "sha": "2a627cd53c0a16fdbef8524acee51c21d4aadc53",
+    "pr": 94,
+    "title": "Release check and automatic rollback for embeddings-api and embeddings-api-go (release kit) (#94)"
+   }
+  ]
+ },
+ "inputs": {
+  "note": "The pods and answers are the release record's deploy check (2026-10-22 05:37:21 UTC). The deploy snapshot counted 5/5 pods Ready, so all five are Ready here. The record keeps the first 120 characters of the proxy's answer ('{\"kind\":\"Status\",...\"message\":\"error trying to reach service: dial tcp 1'); the rest of that Kubernetes Status body is rebuilt with the pod address redacted. No later answer was recorded, so the two pods answer the proxy error on every try: replay never invents a recovery. The successor 20261022T061124Z-aa97275fa (same code plus the kit fix) answered 200 on all five pods.",
+  "pods": {
+   "prod-embeddings-api-deployment": [
+    {
+     "name": "prod-embeddings-api-deployment-54655dfd4b-6nn2x",
+     "ready": true
+    },
+    {
+     "name": "prod-embeddings-api-deployment-54655dfd4b-f6ddg",
+     "ready": true
+    },
+    {
+     "name": "prod-embeddings-api-deployment-54655dfd4b-jm9f2",
+     "ready": true
+    },
+    {
+     "name": "prod-embeddings-api-deployment-54655dfd4b-l644f",
+     "ready": true
+    },
+    {
+     "name": "prod-embeddings-api-deployment-54655dfd4b-nrknt",
+     "ready": true
+    }
+   ]
+  },
+  "http": {
+   "pod prod-embeddings-api-deployment-54655dfd4b-6nn2x:3000/": [
+    {
+     "after_seconds": 0,
+     "status": 200,
+     "body": "Hello World!!"
+    }
+   ],
+   "pod prod-embeddings-api-deployment-54655dfd4b-f6ddg:3000/": [
+    {
+     "after_seconds": 0,
+     "status": 200,
+     "body": "Hello World!!"
+    }
+   ],
+   "pod prod-embeddings-api-deployment-54655dfd4b-jm9f2:3000/": [
+    {
+     "after_seconds": 0,
+     "status": 200,
+     "body": "Hello World!!"
+    }
+   ],
+   "pod prod-embeddings-api-deployment-54655dfd4b-l644f:3000/": [
+    {
+     "after_seconds": 0,
+     "status": 503,
+     "body": "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"error trying to reach service: dial tcp <pod address redacted>:3000: connect: connection refused\",\"reason\":\"ServiceUnavailable\",\"code\":503}"
+    }
+   ],
+   "pod prod-embeddings-api-deployment-54655dfd4b-nrknt:3000/": [
+    {
+     "after_seconds": 0,
+     "status": 503,
+     "body": "{\"kind\":\"Status\",\"apiVersion\":\"v1\",\"metadata\":{},\"status\":\"Failure\",\"message\":\"error trying to reach service: dial tcp <pod address redacted>:3000: connect: connection refused\",\"reason\":\"ServiceUnavailable\",\"code\":503}"
+    }
+   ]
+  },
+  "rollout_failures": []
+ },
+ "expected": {
+  "verdict": "passed",
+  "rolls_back": false,
+  "checks": {
+   "api root": "passed",
+   "images": "passed"
+  }
+ },
+ "at_the_time": {
+  "verdict": "failed",
+  "rolled_back_by": "20261022T053834Z-a5d03d2e9",
+  "regressions": [
+   "api root: 2 of 5 pods: GET /: HTTP 503 (expected 200): error trying to reach service (the API server proxy, not the app)"
+  ]
+ }
+}

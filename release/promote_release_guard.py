@@ -99,6 +99,7 @@ class Build:
 
     # Status of each step by id ("release-record-begin" runs right before a deploy's first cluster change).
     step_status: tuple[tuple[str, str], ...] = ()
+    started_steps: tuple[str, ...] = ()
 
     @classmethod
     def from_api(cls, payload: dict) -> Build:
@@ -120,7 +121,24 @@ class Build:
             step_status=tuple(
                 (str(step.get("id") or ""), str(step.get("status") or "")) for step in payload.get("steps") or []
             ),
+            started_steps=tuple(
+                str(step.get("id") or "")
+                for step in payload.get("steps") or []
+                if (step.get("timing") or {}).get("startTime")
+            ),
         )
+
+    @property
+    def confirmed_noop(self) -> bool:
+        """Only an explicit guard receipt proves that this build skipped all cluster mutations."""
+        for output in self.step_outputs:
+            try:
+                value = json.loads(output)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, dict) and value.get("release_deploy") == "skipped_before_mutation":
+                return True
+        return False
 
     @property
     def changing_cluster(self) -> bool:
@@ -129,11 +147,13 @@ class Build:
         A deploy build before its "release-record-begin" step only builds, waits for its turn or
         checks the gate, and waits for a running rollback; it changes nothing yet.
         """
+        if self.confirmed_noop:
+            return False
         statuses = dict(self.step_status)
         marker = statuses.get(DEPLOY_MARKER_STEP)
         if marker is None:
             return True
-        return marker not in ("", "PENDING", "QUEUED", "STATUS_UNKNOWN")
+        return marker not in ("", "PENDING", "QUEUED", "STATUS_UNKNOWN") or DEPLOY_MARKER_STEP in self.started_steps
 
     def recorded_digest(self, key: str = RECORDED_DIGEST_KEY) -> str:
         """Return the digest a build step wrote as {key: digest} to $BUILDER_OUTPUT/output, or ""."""
@@ -423,9 +443,14 @@ class Guard:
     # The merge trigger. A build of it that promotes is replaced only by a newer one that
     # promotes too, so a manual dev deploy (_AUTO_PROMOTE=false) never drops a merged release.
     promoting_trigger: str = ""
+    # Order only: no newer build replaces this one; it waits for the older ones (a check that must run
+    # for every commit, such as a static site's publish check).
+    wait_only: bool = False
 
     def _can_supersede(self, own: Build) -> Callable[[Build], bool] | None:
         """Which builds may replace this one: newer promoting builds of the merge trigger, else None (all)."""
+        if self.wait_only:
+            return lambda _build: False
 
         def promotes(build: Build) -> bool:
             """Whether a build is a merge trigger build that promotes."""
@@ -488,14 +513,29 @@ class Guard:
             )
         print(f"On {branch}: {self.commit} is reachable from {repo}@{branch} ({status})", flush=True)
 
-    def wait_for_dev(self, own: Build, dev_triggers: tuple[str, ...], timeout_seconds: float, branch: str) -> Build:
-        """Wait for a successful dev build of the commit and return it; raise GuardError when it fails or times out."""
+    def wait_for_dev(
+        self,
+        own: Build,
+        dev_triggers: tuple[str, ...],
+        timeout_seconds: float,
+        branch: str,
+        *,
+        allow_overlap: bool = False,
+    ) -> Build:
+        """Wait for a successful dev build of the commit and return it; raise GuardError when it fails or times out.
+
+        allow_overlap: the prod build does not read the :<commit> tag (the light kinds take their
+        artifacts from the dev verify index), so two dev builds of the commit that overlapped are fine.
+        """
         dev_trigger = dev_triggers[0]
         deadline = self.clock() + timeout_seconds
         last_seen = ""
         while True:
             self.check_superseded(own)
-            decision, dev_build = decide_dev(self.api.commit_builds(dev_triggers, self.commit))
+            dev_builds = self.api.commit_builds(dev_triggers, self.commit)
+            decision, dev_build = decide_dev(dev_builds)
+            if decision == "overlap" and allow_overlap:
+                decision, dev_build = "ok", max(dev_builds, key=lambda b: b.order_key)
             if decision == "ok" and dev_build is not None:
                 print(f"Dev first: {dev_trigger} build {dev_build.describe()} succeeded", flush=True)
                 return dev_build

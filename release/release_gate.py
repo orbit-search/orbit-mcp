@@ -9,6 +9,11 @@ the same commit (trigger <service>-prod, `--sha`). The prod build runs
 Tiers without a dev stage: the prod build of a merge runs `check-direct`
 before it changes anything: the freeze and the hold apply, dev verify does not.
 
+The same gate serves the services that are not GKE Deployments (release_light.py,
+kinds cloud_run and composer, tier full): their dev stage is a no-traffic Cloud
+Run revision or a Composer candidate folder, and `check-prod --artifacts-file`
+compares what the prod build promotes with what dev verify checked.
+
 A promote goes ahead only when all of these hold:
 
 - No freeze: a human can stop every automatic prod deploy (`freeze`) and start
@@ -27,6 +32,11 @@ A promote goes ahead only when all of these hold:
   its descendants pass (`promote_hold.fixed_by` records it); the hold ends for
   good when a deploy replaces the rollback as the newest record, or when a
   human resumes.
+- No forward-only hold: a failed release that changed the database schema
+  (kind railway with a migrations rule) is not rolled back; its own record (the
+  newest prod record) carries `promote_hold` with `forward_only`. It holds like
+  a rollback, but only a `Fixes-release: <release id>` commit or `resume` ends
+  it: a revert does not undo a migration.
 
     python3 release/release_gate.py status
     python3 release/release_gate.py freeze --reason "<why>"
@@ -43,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import sys
@@ -127,10 +138,41 @@ def resume_hint(service: rc.Service, release_id: str, prs: list[dict]) -> str:
     )
 
 
+def inferred_forward_hold(service: rc.Service, record: dict) -> dict | None:
+    """The forward-only hold of a failed release whose own range changes the schema, before the kit saved one.
+
+    The deploy check or the watch saves it right after the failed verdict; the gate holds from the verdict on.
+    resume and a Fixes-release commit save this hold (released, or with fixed_by), so it never comes back.
+    """
+    if record.get("kind") == "rollback" or record.get("promote_hold"):
+        return None
+    migrations = record.get("migrations") or {}
+    changed = bool(migrations.get("migrations")) or "unknown" in migrations
+    if not changed or (record.get("verdict") or {}).get("status") != "failed":
+        return None
+    release_id = record["release_id"]
+    return {
+        "status": "held",
+        "forward_only": True,
+        "since": (record.get("verdict") or {}).get("at") or rr.utc_now(),
+        "rolled_back_release": release_id,
+        "rolled_back_commit": record.get("commit"),
+        "prs": [],
+        "migrations": migrations,
+        "resume": (
+            f"merge a forward fix whose commit message has the trailer `Fixes-release: {release_id}`, or run "
+            f"`{service.kit_command('release_gate.py', 'resume')} --reason '<why>'`"
+        ),
+    }
+
+
 def hold_of(service: rc.Service, rollback: dict) -> dict:
-    """The hold of a rollback record; a rollback without the field holds too."""
+    """The hold of a rollback record (a rollback without the field holds too), or of a failed forward-only release."""
     if rollback.get("promote_hold"):
         return rollback["promote_hold"]
+    inferred = inferred_forward_hold(service, rollback)
+    if inferred is not None:
+        return inferred
     rolled_back = (rollback.get("rollback") or {}).get("rolled_back_release") or ""
     return {
         "status": "held",
@@ -260,13 +302,32 @@ def _frozen(stores: Stores) -> Decision | None:
     )
 
 
+def forward_hold_record(stores: Stores, pointer: dict | None) -> dict | None:
+    """The newest prod record when it is a failed forward-only release that holds (not a rollback), else None.
+
+    Its hold is the saved promote_hold, or the one inferred from its failed verdict and migrations before
+    the kit saved it (hold_of); release_hold and note_fix save that hold with its forward_only mark.
+    """
+    if not pointer or pointer.get("kind") == "rollback":
+        return None
+    record = rr.read_record(stores.prod, pointer["release_id"])
+    return record if hold_of(stores.service, record).get("forward_only") else None
+
+
+def holding_record(stores: Stores, pointer: dict | None) -> dict | None:
+    """The record whose promote_hold decides: the newest rollback, or a failed forward-only release; else None."""
+    if pointer and pointer.get("kind") == "rollback":
+        return rr.read_record(stores.prod, pointer["release_id"])
+    return forward_hold_record(stores, pointer)
+
+
 def _hold(stores: Stores, commit: str, token: str, pointer: dict | None) -> Decision:
-    """The hold part of the gate: go when the newest prod record is no rollback or the hold ended."""
+    """The hold part of the gate: go when the newest prod record holds nothing or its hold ended."""
     service = stores.service
     repo = service.github_repo
-    if not pointer or pointer.get("kind") != "rollback":
+    rollback = holding_record(stores, pointer)
+    if rollback is None:
         return Decision("go", "no hold")
-    rollback = rr.read_record(stores.prod, pointer["release_id"])
     hold = hold_of(service, rollback)
     if hold.get("status") == "released":
         released = hold.get("released") or {}
@@ -283,6 +344,12 @@ def _hold(stores: Stores, commit: str, token: str, pointer: dict | None) -> Deci
         ended = hold_ended_by(hold, rollback["release_id"], commit_messages(repo, base, commit, token), repo)
     if ended:
         return Decision("go", f"{ended}; the hold ends for this commit", fix_seen=(rollback["release_id"], ended))
+    if hold.get("forward_only"):
+        return Decision(
+            "held",
+            f"prod release {rollback['release_id']} failed and changed the database schema (forward-only, no rollback)",
+            hold.get("resume") or "",
+        )
     return Decision(
         "held",
         f"prod release {hold.get('rolled_back_release')} was rolled back ({rollback['release_id']})",
@@ -290,11 +357,15 @@ def _hold(stores: Stores, commit: str, token: str, pointer: dict | None) -> Deci
     )
 
 
-def decide(stores: Stores, commit: str, token: str, images: dict | None = None) -> Decision:
+def decide(
+    stores: Stores, commit: str, token: str, images: dict | None = None, artifacts: dict | None = None
+) -> Decision:
     """Whether the commit may be promoted to prod now (full tier).
 
     images (the prod build): the image it is about to deploy; it must be the digest that dev
-    verify checked.
+    verify checked. artifacts (the prod build of a light kind): what it is about to promote (Cloud
+    Run revisions with their digests, a Composer candidate folder's content hash); they must be the
+    ones that dev verify checked.
     """
     repo = stores.service.github_repo
     if frozen := _frozen(stores):
@@ -312,6 +383,16 @@ def decide(stores: Stores, commit: str, token: str, images: dict | None = None) 
         ]
         if moved:
             return Decision("unverified", f"prod would deploy images that dev verify did not check: {'; '.join(moved)}")
+    if artifacts is not None:
+        verified = index.get("artifacts") or {}
+        moved = [
+            f"{name} {artifacts.get(name)} (dev verified {verified.get(name)})"
+            for name in sorted(set(artifacts) | set(verified))
+            if artifacts.get(name) != verified.get(name)
+        ]
+        if moved or not artifacts:
+            what = "; ".join(moved) or "nothing"
+            return Decision("unverified", f"prod would promote artifacts that dev verify did not check: {what}")
     pointer, _ = stores.prod.read("latest.json")
     prod_commit = (pointer or {}).get("commit")
     if pointer and pointer.get("kind") != "rollback" and prod_commit and contains(repo, commit, prod_commit, token):
@@ -473,12 +554,15 @@ def _skip(args: argparse.Namespace, decision: Decision) -> None:
 def cmd_check_prod(args: argparse.Namespace, stores: Stores) -> int:
     """Prod build of the full tier, after preflight: 0 go, 4 skip (frozen, held, stale), 1 blocked.
 
-    The image preflight resolved must be the digest that dev verify checked. With --build-id the
-    build takes the prod lock first and keeps it on go, until `release_record.py finish`.
+    The image preflight resolved must be the digest that dev verify checked (--image-file, GKE);
+    for the light kinds the artifacts preflight read live must be the ones dev verify checked
+    (--artifacts-file). With --build-id the build takes the prod lock first and keeps it on go,
+    until the record's `finish`.
     """
-    images = {rr.IMAGE_ROLE: Path(args.image_file).read_text(encoding="utf-8").strip()}
+    images = {rr.IMAGE_ROLE: Path(args.image_file).read_text(encoding="utf-8").strip()} if args.image_file else None
+    artifacts = json.loads(Path(args.artifacts_file).read_text(encoding="utf-8")) if args.artifacts_file else None
     with gate_lock(stores, args.build_id) as lock:
-        decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images)
+        decision = decide(stores, args.commit, rr.github_token(stores.service.prod), images=images, artifacts=artifacts)
         print(f"Gate: {decision.status}: {decision.reason}", flush=True)
         if decision.go:
             lock.keep()
@@ -610,9 +694,13 @@ def cmd_status(args: argparse.Namespace, stores: Stores) -> int:
     print(f"freeze: {'FROZEN' if freeze.get('frozen') else 'off'} {freeze if freeze.get('by') else ''}")
     pointer, _ = stores.prod.read("latest.json")
     print(f"prod:   {(pointer or {}).get('release_id')} ({(pointer or {}).get('kind')})")
-    if pointer and pointer.get("kind") == "rollback":
-        hold = hold_of(service, rr.read_record(stores.prod, pointer["release_id"]))
-        print(f"hold:   {hold.get('status')} after {hold.get('rolled_back_release')}; resume: {hold.get('resume')}")
+    holder = holding_record(stores, pointer)
+    if holder is not None:
+        hold = hold_of(service, holder)
+        what = "forward-only release" if hold.get("forward_only") else "rollback of"
+        print(
+            f"hold:   {hold.get('status')} after {what} {hold.get('rolled_back_release')}; resume: {hold.get('resume')}"
+        )
     else:
         print("hold:   none")
     if stores.dev is not None:
@@ -647,8 +735,8 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
     if not args.reason.strip():
         raise rr.RecordError("--reason is required")
     pointer, _ = stores.prod.read("latest.json")
-    if not pointer or pointer.get("kind") != "rollback":
-        print("No hold: the newest prod record is not a rollback.")
+    if holding_record(stores, pointer) is None:
+        print("No hold: the newest prod record is not a rollback or a failed forward-only release.")
         return EXIT_GO
     release_hold(stores, pointer["release_id"], f"resumed by a human: {args.reason}", _who(args))
     after = (
@@ -656,8 +744,9 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
         if service.has_dev
         else "the next merge deploys."
     )
+    what = "rollback" if pointer.get("kind") == "rollback" else "forward-only release"
     rr.post_slack(
-        f":arrow_forward: {service.title} automatic prod deploys resumed by {_who(args)} after rollback "
+        f":arrow_forward: {service.title} automatic prod deploys resumed by {_who(args)} after {what} "
         f"{pointer['release_id']}: {args.reason[:200]}. The next merge deploys; {after}"
     )
     print(f"Hold after {pointer['release_id']} released.")
@@ -706,7 +795,9 @@ def main(argv: list[str] | None = None) -> int:
     check = commands.add_parser("check-prod", help="full-tier prod build: 0 go, 4 skip, 1 blocked")
     check.add_argument("--commit", required=True)
     check.add_argument("--skip-reason-file")
-    check.add_argument("--image-file", required=True, help="the image (repo@digest) preflight resolved")
+    promoted = check.add_mutually_exclusive_group(required=True)
+    promoted.add_argument("--image-file", help="GKE: the image (repo@digest) preflight resolved")
+    promoted.add_argument("--artifacts-file", help="light kinds: the artifacts (JSON) preflight read live")
     check.add_argument("--build-id", default="", help="the prod build ($BUILD_ID): it takes the prod lock")
 
     direct = commands.add_parser("check-direct", help="prod build without a dev stage: 0 go, 4 skip")
@@ -729,7 +820,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"release-gate: --commit must be a full 40-character sha, got {commit!r}", file=sys.stderr)
         return EXIT_ERROR
     try:
-        service = rc.load_service(args.service)
+        service = rc.load_any_service(args.service)
+        if not service.has_gate:
+            raise rc.ConfigError(f"{service.name} is tier {service.tier}: it has no release gate")
         stores = open_stores(service, args.store, args.dry_run_dir)
         if args.command == "request-promote":
             return cmd_request_promote(args, stores)
