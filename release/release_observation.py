@@ -179,13 +179,20 @@ def note_early_check(record: dict, result: dict, key: str) -> None:
     del early[:-EARLY_CHECKS_KEPT]
 
 
-def phase_result(record: dict, phase: str) -> dict | None:
-    """The saved check result of a verdict phase: record["checks"][phase], or the early check of that key."""
+def phase_result(record: dict, phase: str, at: str | None = None) -> dict | None:
+    """The saved check result of a verdict phase: record["checks"][phase], or an early check of that key.
+
+    Early keys round to whole minutes, so two early checks can share one. With at (the verdict's time),
+    the early check of that exact time is the one; without a match, the first failed one of the key (a
+    failed verdict stays, so it is the one that set it), else the last one."""
     saved = (record.get("checks") or {}).get(phase)
     if saved is not None:
         return saved
     early = [item for item in (record.get("followup") or {}).get("early_checks") or [] if item.get("key") == phase]
-    return early[-1].get("check") if early else None
+    exact = [item for item in early if at and item.get("at") == at]
+    failed = [item for item in early if item.get("result") == "failed"]
+    chosen = (exact or failed[:1] or early[-1:] or [None])[0]
+    return chosen.get("check") if chosen else None
 
 
 def later_terminal(verdict: dict, checkpoint: str) -> bool:

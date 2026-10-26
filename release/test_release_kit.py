@@ -4901,6 +4901,15 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         record["checks"]["window_15m"] = {"regressions": []}
         self.assertEqual(rv.ro.phase_result(record, "window_15m"), {"regressions": []})
         self.assertIsNone(rv.ro.phase_result(record, "window_60m"))
+        # Two early checks in one rounded minute: the verdict's time picks the failure that set it.
+        failing = {"at": "t1", "result": "failed", "regressions": [{"kind": "metric"}, {"kind": "check"}]}
+        later = {"at": "t2", "result": "failed", "regressions": [{"kind": "metric"}]}
+        same = {"checks": {}, "followup": {}}
+        rv.ro.note_early_check(same, failing, "early_3m")
+        rv.ro.note_early_check(same, later, "early_3m")
+        rv.ro.note_early_check(same, {"at": "t3", "result": "passed", "regressions": []}, "early_3m")
+        self.assertEqual(rv.ro.phase_result(same, "early_3m", "t1"), failing)
+        self.assertEqual(rv.ro.phase_result(same, "early_3m"), failing)
 
 
 def step_script(block: str) -> str:

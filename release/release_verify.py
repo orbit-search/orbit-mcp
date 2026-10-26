@@ -627,8 +627,9 @@ def _watch_rollback(
     """watch_rollback without the catch-all."""
     release_id = record["release_id"]
     current = rr.read_record(store, release_id)
-    phase = (current.get("verdict") or {}).get("phase", "")
-    regressions = (ro.phase_result(current, phase) or {}).get("regressions") or []
+    verdict = current.get("verdict") or {}
+    phase = verdict.get("phase", "")
+    regressions = (ro.phase_result(current, phase, verdict.get("at")) or {}).get("regressions") or []
     items = [item for item in regressions if item.get("kind") == "metric"]
     metrics = {metric.name: metric for metric in service.metrics}
     # Spread metrics need the baseline's hourly values; the check after a rollback does not judge them.
