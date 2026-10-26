@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -911,7 +912,13 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     refuse_newer_latest(store, release_id)
     after = snapshot_workloads(clients)
     step_file = getattr(args, "failed_step_file", None)
-    failed_step = read_failed_step(step_file) if args.status == "deploy_failed" else None
+    step_text = getattr(args, "failed_step", None)
+    # --failed-step carries the step itself (the recovery command from the alert, after the build's
+    # /workspace is gone); "" means the build named its steps and none failed by name.
+    steps_named = bool(step_file) or step_text is not None
+    failed_step = None
+    if args.status == "deploy_failed":
+        failed_step = parse_failed_step(step_text) if step_text is not None else read_failed_step(step_file)
 
     def finish(record: dict) -> None:
         """Write the snapshot, the status, the failed step and the deploy finish time on the record."""
@@ -920,7 +927,7 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
         record["status"] = args.status
         if failed_step:
             record["failed_step"] = failed_step
-        if step_file:
+        if steps_named:
             # This build names every failed deploy step (release_kit.py prod build contract): an unnamed
             # deploy_failed is then never a capacity wait (release_verify.deploy_capacity).
             record["deploy_steps_named"] = True
@@ -938,8 +945,12 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
 
 def read_failed_step(path: str | None) -> dict | None:
     """The failed deploy step that release_capacity.py rollout-wait wrote ({"id", "deployments"}), else None."""
-    text = _read_text(path) if path and Path(path).is_file() else None
-    if not text:
+    return parse_failed_step(_read_text(path) if path and Path(path).is_file() else None)
+
+
+def parse_failed_step(text: str | None) -> dict | None:
+    """A failed step from its file text or a --failed-step value (JSON, or a bare step id), else None."""
+    if not text or not text.strip():
         return None
     try:
         step = json.loads(text)
@@ -960,8 +971,21 @@ FINISH_RETRY_SECONDS = 15.0
 FINISH_ERRORS = (RecordError, GuardError, subprocess.SubprocessError, KeyError, OSError, ValueError)
 
 
-def finish_recovery(tool: str, service: str, env: str, release_id: str, status: str) -> list[str]:
-    """The commands that finish a release record by hand, then run the checks the build skipped."""
+def finish_recovery(
+    tool: str,
+    service: str,
+    env: str,
+    release_id: str,
+    status: str,
+    *,
+    failed_step: dict | None = None,
+    steps_named: bool = False,
+) -> list[str]:
+    """The commands that finish a release record by hand, then run the checks the build skipped.
+
+    A GKE build that names its failed steps (--failed-step-file) passes them on: the recovery runs after
+    the build's /workspace is gone, so the command carries the step itself (--failed-step). Without it,
+    the hand finish would write an unnamed deploy_failed, which the release check may excuse as capacity."""
     rid = release_id or "<release id>"
     if tool == "light":
         base = f"python3 release/release_light.py --service {service}"
@@ -970,8 +994,14 @@ def finish_recovery(tool: str, service: str, env: str, release_id: str, status: 
             f"{base} check --env {env} --release-id {rid}",
             f'{base} schedule-window --release-id {rid} --source-dir "$(mktemp -d)"',
         ]
+    finish = (
+        f"python3 release/release_record.py finish --service {service} --env {env} --release-id {rid} --status {status}"
+    )
+    if steps_named:
+        step = json.dumps(failed_step, separators=(",", ":"), sort_keys=True) if failed_step else ""
+        finish += f" --failed-step {shlex.quote(step)}"
     return [
-        f"python3 release/release_record.py finish --service {service} --env {env} --release-id {rid} --status {status}",
+        finish,
         f"python3 release/release_verify.py check --service {service} --env {env} --phase deploy --release-id {rid} "
         "--wait-rollouts-seconds 300",
         f"python3 release/release_verify.py schedule-window --service {service} --env {env} --release-id {rid} "
@@ -1186,6 +1216,11 @@ def main(argv: list[str] | None = None) -> int:
     finish.add_argument(
         "--failed-step-file", help="the failed step (release_capacity.py rollout-wait), kept with deploy_failed"
     )
+    finish.add_argument(
+        "--failed-step",
+        help="the failed step itself (JSON or a step id; '' = none named), as the recovery command in the alert "
+        "passes it after the build ended",
+    )
 
     unlock = commands.add_parser("unlock", help="free the prod lock only if this build holds it")
     add_common_args(unlock)
@@ -1218,7 +1253,23 @@ def main(argv: list[str] | None = None) -> int:
                 title=service.title,
                 env=args.env,
                 release_id=release_id,
-                recovery=finish_recovery("gke", service.name, args.env, release_id, args.status),
+                recovery=finish_recovery(
+                    "gke",
+                    service.name,
+                    args.env,
+                    release_id,
+                    args.status,
+                    failed_step=(
+                        (
+                            parse_failed_step(args.failed_step)
+                            if args.failed_step is not None
+                            else read_failed_step(args.failed_step_file)
+                        )
+                        if args.status == "deploy_failed"
+                        else None
+                    ),
+                    steps_named=bool(args.failed_step_file) or args.failed_step is not None,
+                ),
             )
         return handlers[args.command](args, env, store, clients)
     except (RecordError, GuardError, rc.ConfigError, subprocess.SubprocessError, KeyError, OSError) as error:

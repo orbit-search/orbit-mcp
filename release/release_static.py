@@ -47,8 +47,11 @@ import release_config as rc  # noqa: E402
 import release_record as rr  # noqa: E402
 
 USER_AGENT = "orbit-release-kit"
-# The Secret Manager secret the builds put in GITHUB_TOKEN: reads the repository, its commits and check runs.
-DEFAULT_GITHUB_SECRET = "release-kit-github-token"
+# github_token_secret "connection" (the default, as for kind vercel): the builds read GitHub (the repository,
+# its commits and check runs) with a read token of the service's Cloud Build connection link
+# (release_record.github_token), like the GKE kinds; no GitHub secret. Any other value names a Secret Manager
+# secret that the builds put in GITHUB_TOKEN.
+CONNECTION_TOKEN = "connection"
 # Check run conclusions: published, nothing published, failed.
 PUBLISHED = frozenset({"success"})
 NOTHING = frozenset({"skipped", "neutral"})
@@ -72,7 +75,7 @@ class Site:
     page_extensions: tuple[str, ...] = (".mdx",)
     # Repository folders that are never pages (snippets, scripts, the kit).
     not_pages: tuple[str, ...] = ("snippets/", "scripts/", "release/", ".github/", ".agents/", ".claude/")
-    github_token_secret: str = DEFAULT_GITHUB_SECRET
+    github_token_secret: str = CONNECTION_TOKEN
     max_links: int = 300
     # The publisher's ignore file in the repository (gitignore-like): files it lists are never pages.
     ignore_file: str = ".mintignore"
@@ -95,7 +98,7 @@ def parse_site(data: dict, where: str) -> Site:
         required_paths=paths,
         page_extensions=tuple(data.get("page_extensions") or (".mdx",)),
         not_pages=tuple(data.get("not_pages") or Site.not_pages),
-        github_token_secret=str(data.get("github_token_secret") or DEFAULT_GITHUB_SECRET),
+        github_token_secret=str(data.get("github_token_secret") or CONNECTION_TOKEN),
         max_links=int(data.get("max_links", 300)),
         ignore_file=str(data.get("ignore_file", ".mintignore")),
     )
@@ -298,6 +301,16 @@ def page_routes(repo: str, commit: str, site: Site, token: str) -> set[str]:
     return routes
 
 
+def parent_commit(repo: str, commit: str, token: str) -> str | None:
+    """The first parent of a commit, or None when GitHub cannot say."""
+    try:
+        payload = rr.github_json(f"repos/{repo}/commits/{commit}", token)
+    except Exception:  # noqa: BLE001 - GuardError, HTTP and network errors all mean unknown
+        return None
+    parents = payload.get("parents") or [] if isinstance(payload, dict) else []
+    return str(parents[0].get("sha") or "") or None if parents else None
+
+
 def changed_pages(
     repo: str, base: str | None, head: str, site: Site, token: str | None, read: Callable[[str], str | None]
 ) -> Changes:
@@ -452,6 +465,10 @@ availableSecrets:
     secretManager:
         - versionName: projects/$PROJECT_ID/secrets/slack-webhook-workspace-orbit/versions/latest
           env: "WEBHOOK_ORBIT"
+{github_secret_entry}"""
+
+# Only with a named static_site.github_token_secret; with "connection" the steps mint a read token instead.
+GITHUB_SECRET_ENTRY = """\
         # The kit's GitHub token (release_record.github_token reads GITHUB_TOKEN): reads the repository,
         # its commits and the publisher's check runs. Read-only.
         - versionName: projects/$PROJECT_ID/secrets/{github_secret}/versions/latest
@@ -489,8 +506,7 @@ steps:
     - name: "gcr.io/cloud-builders/gcloud"
       id: "static-wait"
       entrypoint: "bash"
-      secretEnv: ["GITHUB_TOKEN"]
-      args:
+{github_env_line}      args:
           - "-c"
           - |
               if [ -f /workspace/nothing_published ]; then exit 0; fi
@@ -504,8 +520,7 @@ steps:
     - name: "gcr.io/cloud-builders/gcloud"
       id: "release-record-begin"
       entrypoint: "bash"
-      secretEnv: ["GITHUB_TOKEN"]
-      args:
+{github_env_line}      args:
           - "-c"
           - |
               if [ -f /workspace/nothing_published ]; then exit 0; fi
@@ -516,8 +531,7 @@ steps:
     - name: "gcr.io/cloud-builders/gcloud"
       id: "release-record-finish"
       entrypoint: "bash"
-      secretEnv: ["GITHUB_TOKEN"]
-      args:
+{github_env_line}      args:
           - "-c"
           - |
               if [ -f /workspace/nothing_published ] || [ ! -s /workspace/release_id ]; then exit 0; fi
@@ -531,7 +545,7 @@ steps:
     - name: "gcr.io/cloud-builders/gcloud"
       id: "release-verify-deploy"
       entrypoint: "bash"
-      secretEnv: ["WEBHOOK_ORBIT", "GITHUB_TOKEN"]
+      secretEnv: [{slack_github_env}]
       args:
           - "-c"
           - |
@@ -594,7 +608,7 @@ steps:
                 --checkpoints "${{_CHECKPOINTS}}"
       env:
           - "RELEASE_SLACK_DISABLED=${{_SLACK_DISABLED}}"
-      secretEnv: ["WEBHOOK_ORBIT", "GITHUB_TOKEN"]
+      secretEnv: [{slack_github_env}]
       timeout: "13800s"
 
 substitutions:
@@ -618,6 +632,7 @@ options:
 def rendered(service: object) -> dict[str, str]:
     """The generated builds of a kind static_site service: the merge build and the watch window."""
     site: Site = service.site  # type: ignore[attr-defined]
+    secret = site.github_token_secret != CONNECTION_TOKEN
     values = {
         "service": service.name,  # type: ignore[attr-defined]
         "project": service.project,  # type: ignore[attr-defined]
@@ -628,7 +643,9 @@ def rendered(service: object) -> dict[str, str]:
         "checkpoints": " ".join(str(value) for value in service.checkpoints),  # type: ignore[attr-defined]
         "publisher_check": site.publisher_check,
         "url": site.url,
-        "github_secret": site.github_token_secret,
+        "github_secret_entry": GITHUB_SECRET_ENTRY.format(github_secret=site.github_token_secret) if secret else "",
+        "github_env_line": '      secretEnv: ["GITHUB_TOKEN"]\n' if secret else "",
+        "slack_github_env": '"WEBHOOK_ORBIT", "GITHUB_TOKEN"' if secret else '"WEBHOOK_ORBIT"',
         "wait_minutes": site.publisher_wait_minutes,
         "wait_seconds": (site.publisher_wait_minutes + 5) * 60,
         "build_seconds": (site.publisher_wait_minutes + 160) * 60,

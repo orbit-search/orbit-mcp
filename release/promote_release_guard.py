@@ -319,9 +319,21 @@ class GoogleApi:
 
     def repository_read_token(self, connection: str, repository: str) -> str:
         """Mint a read-only GitHub token for a repository linked to a Cloud Build connection."""
+        return self._repository_token(connection, repository, "accessReadToken", "roles/cloudbuild.readTokenAccessor")
+
+    def repository_read_write_token(self, connection: str, repository: str) -> str:
+        """Mint a read-write GitHub token (the connection's GitHub App: commit statuses and checks) for a repository.
+
+        It lives about an hour, so callers mint one for each write and never store it.
+        """
+        return self._repository_token(connection, repository, "accessReadWriteToken", "roles/cloudbuild.tokenAccessor")
+
+    def _repository_token(self, connection: str, repository: str, method: str, role: str) -> str:
+        """POST <repository>:<method> on the connection and return its token."""
+        kind = "read" if method == "accessReadToken" else "read-write"
         url = (
             f"https://cloudbuild.googleapis.com/v2/projects/{self.project}/locations/{self.region}"
-            f"/connections/{connection}/repositories/{repository}:accessReadToken"
+            f"/connections/{connection}/repositories/{repository}:{method}"
         )
         request = urllib.request.Request(
             url,
@@ -333,12 +345,12 @@ class GoogleApi:
             token = str(_http_json(request).get("token", ""))
         except GuardError as error:
             raise GuardError(
-                f"could not get a read token for connection {connection} repository {repository} "
+                f"could not get a {kind} token for connection {connection} repository {repository} "
                 "(the repository must be linked in that connection and the build identity needs "
-                f"roles/cloudbuild.readTokenAccessor on the connection): {error}"
+                f"{role} on the connection): {error}"
             ) from None
         if not token:
-            raise GuardError(f"connection {connection} returned no read token for repository {repository}")
+            raise GuardError(f"connection {connection} returned no {kind} token for repository {repository}")
         return token
 
     def _builds_url(self) -> str:

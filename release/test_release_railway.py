@@ -854,10 +854,12 @@ import urllib.parse  # noqa: E402
 
 class StaticSiteTest(unittest.TestCase):
     def setUp(self) -> None:
-        """Block the network."""
+        """Block the network. Render as a private repository (a vendored people map), so the expected secret
+        lists hold in a public repository's copy too (sync deletes the map there)."""
         self.patches = [
             mock.patch.object(urllib.request, "urlopen", side_effect=_no_network),
             mock.patch.object(subprocess, "run", side_effect=_no_network),
+            mock.patch.object(kit, "people_vendored", return_value=True),
         ]
         for patch in self.patches:
             patch.start()
@@ -869,7 +871,7 @@ class StaticSiteTest(unittest.TestCase):
             patch.stop()
 
     def test_parse_and_render(self) -> None:
-        """Tier check_only only; the merge build and the window read the GitHub token secret."""
+        """Tier check_only only; by default the builds read GitHub with the connection link's read token."""
         self.assertFalse(DOCS.has_gate or DOCS.auto_rollback)
         self.assertEqual(DOCS.site.publisher_check, "Mintlify Deployment")
         for bad in (
@@ -884,8 +886,26 @@ class StaticSiteTest(unittest.TestCase):
             sorted(files), ["release/services/docs.release-verify.yaml", "release/services/docs.release.yaml"]
         )
         for text in files.values():
-            self.assertIn("secrets/release-kit-github-token/versions/latest", text)
+            self.assertNotIn("GITHUB_TOKEN", text)
+            self.assertIn("secrets/slack-webhook-workspace-orbit/versions/latest", text)
+            self.assertIn('secretEnv: ["WEBHOOK_ORBIT"]', text)
+            self.assertNotIn("{", text.split("steps:")[0])  # every template field was filled
         self.assertIn("static-wait --commit", files["release/services/docs.release.yaml"])
+        self.assertEqual(DOCS.connected_repository, "orbit-search-docs")
+        explicit = static_data()
+        explicit["static_site"] = {**explicit["static_site"], "github_token_secret": "connection"}
+        self.assertEqual(kit.rendered(rl.parse_light(explicit)), files)
+
+    def test_named_github_secret_renders_into_every_step(self) -> None:
+        """A named github_token_secret goes into GITHUB_TOKEN of every step that reads GitHub."""
+        data = static_data()
+        data["static_site"] = {**data["static_site"], "github_token_secret": "docs-github-token"}
+        files = kit.rendered(rl.parse_light(data))
+        release = files["release/services/docs.release.yaml"]
+        self.assertEqual(release.count('secretEnv: ["GITHUB_TOKEN"]'), 3)
+        self.assertEqual(release.count('secretEnv: ["WEBHOOK_ORBIT", "GITHUB_TOKEN"]'), 1)
+        for text in files.values():
+            self.assertIn("secrets/docs-github-token/versions/latest", text)
 
     def test_routes_and_titles(self) -> None:
         """Repository files map to routes; snippets and scripts are not pages; frontmatter titles parse."""
@@ -1120,6 +1140,43 @@ class ReviewFixesTest(RailwayCase):
         self.assertEqual(record["previous"]["commit"], OLD_COMMIT)
         self.assertEqual(record["previous"]["recorded_commit"], FIX_COMMIT)
         self.assertEqual(read.call_args.args[1], OLD_COMMIT)
+
+    def test_first_release_compares_with_its_parent(self) -> None:
+        """No earlier release: the changed pages are the release commit's own (its parent is the base), so the
+        check is complete; a later window that judges it compares from the oldest commit's parent to the newest."""
+        record = {"release_id": "r1", "commit": COMMIT, "status": "deployed", "previous": {}}
+        seen = []
+
+        def github(path, token):
+            """The parent, the compare and the trees."""
+            seen.append(path)
+            if path.endswith(f"/commits/{COMMIT}"):
+                return {"parents": [{"sha": OLD_COMMIT}]}
+            if "/compare/" in path:
+                return {"files": [{"filename": "guides/setup.mdx", "status": "modified"}]}
+            return {"tree": [{"path": "guides/setup.mdx", "type": "blob"}]}
+
+        with (
+            mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rr, "github_json", side_effect=github),
+        ):
+            result = rl.static_pages(DOCS, self.prod, record, strict_content=True, get=FakeSite())
+        self.assertIn(f"repos/orbit-search/docs/compare/{OLD_COMMIT}...{COMMIT}?per_page=300", seen)
+        self.assertTrue(result.complete)
+        self.assertFalse([w for w in result.warnings if "changed pages are unknown" in w])
+        # A later window that judges the first release: the parent of the oldest commit, up to the newest.
+        newer = {"release_id": "r2", "commit": FIX_COMMIT, "status": "deployed", "previous": {"release_id": "r1"}}
+        seen.clear()
+        with (
+            mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rr, "github_json", side_effect=github),
+        ):
+            later = rl.static_pages(DOCS, self.prod, newer, strict_content=True, get=FakeSite(), base=record)
+        self.assertIn(f"repos/orbit-search/docs/commits/{COMMIT}", seen)
+        self.assertIn(f"repos/orbit-search/docs/compare/{OLD_COMMIT}...{FIX_COMMIT}?per_page=300", seen)
+        self.assertTrue(later.complete)
+        with mock.patch.object(rr, "github_json", side_effect=guard.GuardError("HTTP 500")):
+            self.assertIsNone(rst.parent_commit("orbit-search/docs", COMMIT, "t"))
 
     def test_static_base_skips_failed_publishes(self) -> None:
         """A failed publish is never the comparison base of the next release; the merge build has single flight."""

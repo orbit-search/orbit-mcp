@@ -1196,8 +1196,20 @@ def snapshot_vercel(service: LightService, api: rvc.VercelApi) -> dict[str, dict
 
 
 def status_token(service: LightService) -> str:
-    """The kit's GitHub token (GITHUB_TOKEN in the builds); a read-only connection token cannot set a status."""
-    return rr.github_token(service.env)
+    """A GitHub token that can set a commit status: GITHUB_TOKEN when set (a named github_token_secret), else a
+    read-write token of the Cloud Build connection, minted for this status (a read token cannot set one)."""
+    if token := os.environ.get("GITHUB_TOKEN", "").strip():
+        return token
+    if service.github_token_secret != rvc.CONNECTION_TOKEN:
+        raise rr.RecordError(
+            f"GITHUB_TOKEN is not set; the builds put Secret Manager {service.github_token_secret} in it"
+        )
+    try:
+        return guard.GoogleApi(service.env.project, service.env.region).repository_read_write_token(
+            service.env.connection, service.env.connected_repository
+        )
+    except (guard.GuardError, subprocess.SubprocessError) as error:
+        raise rr.RecordError(f"no GitHub token for the commit status: {error}") from None
 
 
 def post_commit_status(service: LightService, commit: str, state: str, description: str, target_url: str = "") -> None:
@@ -2208,14 +2220,13 @@ def static_pages(
         except OSError:
             return None
 
-    changes = rst.changed_pages(
-        service.github_repo,
-        (base.get("previous") or {}).get("commit"),
-        record["commit"],
-        site,
-        rr_token(service),
-        read,
-    )
+    token = rr_token(service)
+    base_commit = (base.get("previous") or {}).get("commit")
+    if not base_commit and not previous_id and token:
+        # The first release of the service has no earlier release: its commit's parent is the base, so its
+        # changed pages are checked, and the windows of later releases that judge it get a base too.
+        base_commit = rst.parent_commit(service.github_repo, base["commit"], token)
+    changes = rst.changed_pages(service.github_repo, base_commit, record["commit"], site, token, read)
     return rst.check_pages(
         site, record["commit"], changes, previous_count, strict_content=strict_content, get=get or rst.http_get
     )
@@ -2546,6 +2557,9 @@ def cmd_begin(args: argparse.Namespace, service: LightService, store: rr.Store, 
         # never served. The commits since, the migration range and the rollback check start at what serves.
         previous["recorded_commit"] = previous["commit"]
         previous["commit"] = serving_commit
+    if service.kind == "vercel" and not previous["commit"]:
+        # The first release has no record before it: the commits since start at what the domains serve.
+        previous["commit"] = (before.get(vercel_key(service)) or {}).get("commit") or None
     if not previous["commit"] and args.previous_commit:
         previous["commit"] = args.previous_commit
     if service.has_gate and not dev:
@@ -2606,7 +2620,9 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
     release_id = (
         Path(args.release_id_file).read_text(encoding="utf-8").strip() if args.release_id_file else args.release_id
     )
-    rr.refuse_newer_latest(store, release_id)
+    if args.env != "dev":
+        # Prod: a late finish must never touch a record that a newer release or rollback replaced.
+        rr.refuse_newer_latest(store, release_id)
     artifacts: dict[str, str] = {}
     problem = ""
     if args.env == "dev":
@@ -2635,7 +2651,16 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
                 record["artifacts_error"] = problem
 
     saved = rr.update_record(store, release_id, finish, args.status)
-    rr.point_latest_unless_newer(store, saved)
+    try:
+        rr.point_latest_unless_newer(store, saved)
+    except rr.RecordError:
+        if args.env != "dev" or not rr.newer_latest(store, release_id):
+            # Only the refusal to hide a newer dev record is expected; any other failure surfaces.
+            raise
+        # Dev builds run side by side (Vercel builds several commits at once) and begin their records in the
+        # order their waits end. An older one still finishes and verifies; latest.json keeps the newer record.
+        print(f"Release {release_id}: {args.status}; latest.json keeps the newer dev record", flush=True)
+        return 0
     print(f"Release {release_id}: {args.status}", flush=True)
     if service.has_gate and args.env == "prod":
         # The promote is over: a rollback may start now. A build that ends frees the lock too.
@@ -3078,6 +3103,14 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             and not rv.ro.needs_final_decision(current, receipt, last)
         ):
             print(f"Checkpoint +{minutes} min already completed; preserved", flush=True)
+            if (current.get("verdict") or {}).get("status") == "failed":
+                # A manual check completed it with a failed verdict after this watch's first read: act on it.
+                on_failed(service, store, current)
+                return (
+                    rv.EXIT_OK
+                    if rv.require_owner(store, rr.read_record(store, record["release_id"]))
+                    else rv.EXIT_FAILED
+                )
             continue
         wait = (finished + timedelta(minutes=minutes) - datetime.now(rr.UTC)).total_seconds()
         if wait > 0:
@@ -3184,6 +3217,11 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             saved = _fail(service, store, saved, key, regressions, new_errors)
             on_failed(service, store, saved)
             return rv.EXIT_OK if owner_ok else rv.EXIT_FAILED
+        if (saved.get("verdict") or {}).get("status") == "failed":
+            # A manual check failed the release while this watch slept or checked. That check only records
+            # and alerts, so the watch acts on it, as release_verify does after apply_result.
+            on_failed(service, store, saved)
+            return rv.EXIT_OK if owner_ok else rv.EXIT_FAILED
         if fresh:
             rv.post_warnings(service, store, saved, fresh, command=rollback_command(service, saved))
         if last:
@@ -3201,7 +3239,11 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                     }
                 rv.ro.note_checkpoint(current, result, key)
 
-            rr.update_record(store, record["release_id"], done, "verify_final", {"status": status})
+            final = rr.update_record(store, record["release_id"], done, "verify_final", {"status": status})
+            if (final.get("verdict") or {}).get("status") == "failed":
+                # A manual check failed the release after this checkpoint's save; the final write kept it.
+                on_failed(service, store, final)
+                return rv.EXIT_OK if rv.require_owner(store, final) else rv.EXIT_FAILED
             icon = ":white_check_mark:" if checked else ":grey_question:"
             rr.post_slack(
                 f"{icon} {service.title} release-verify {record['commit'][:9]} {status}. "
@@ -3850,6 +3892,33 @@ def check_rollback(service: LightService, plan: rb.Plan, after: dict) -> rv.Chec
     return rv.Check("rollback", "failed" if problems else "passed", [f"{len(plan.steps)} changes checked", *problems])
 
 
+def removed_commits(store: rr.Store, latest: dict, target: dict) -> list[str]:
+    """The commits a rollback removes, newest first: the newest record's, then each earlier record's back to (not
+    including) the target release, by the records' previous.release_id. A window that judged several releases
+    together rolls back past all of them, so each of their commits loses its passed Deployment Check. The walk
+    goes all the way to the target (a release seen twice ends it)."""
+    commits: list[str] = []
+    record: dict | None = latest
+    seen: set[str] = set()
+    while record:
+        release_id = str(record.get("release_id") or "")
+        if not release_id or release_id == target.get("release_id") or release_id in seen:
+            break
+        seen.add(release_id)
+        commit = str(record.get("commit") or "")
+        if commit and commit != target.get("commit") and commit not in commits:
+            commits.append(commit)
+        earlier = (record.get("previous") or {}).get("release_id")
+        if not earlier:
+            break
+        try:
+            record = rr.read_record(store, str(earlier))
+        except (rr.RecordError, GuardError, OSError) as error:
+            print(f"WARNING: cannot read release {earlier}: {str(error)[:200]}", file=sys.stderr, flush=True)
+            break
+    return commits
+
+
 def cmd_rollback_apply(
     args: argparse.Namespace,
     service: LightService,
@@ -3887,15 +3956,19 @@ def _rollback_apply(args: argparse.Namespace, service: LightService, store: rr.S
         after = snapshot_railway(service, railway_api(service, "prod"))
     elif service.kind == "vercel":
         after = snapshot_vercel(service, vercel_api(service))
-        if latest.get("commit") and latest.get("commit") != target.get("commit"):
-            # The commit this rollback removes (a release, or the target of an earlier rollback) must not go
-            # live again through its old success status, by a redeploy or a deploy hook.
+        # Every commit this rollback removes (the releases since the target, or the target of an earlier
+        # rollback) must not go live again through its old success status, by a redeploy or a deploy hook.
+        for commit in removed_commits(store, latest, target):
             try:
                 post_commit_status(
-                    service, latest["commit"], "failure", f"rolled back: release {latest.get('release_id')} failed"
+                    service, commit, "failure", f"rolled back: release {latest.get('release_id')} failed"
                 )
             except (rr.RecordError, GuardError) as error:
-                print(f"WARNING: the commit status stays success: {str(error)[:200]}", file=sys.stderr, flush=True)
+                print(
+                    f"WARNING: the commit status of {commit[:9]} stays success: {str(error)[:200]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     elif service.kind == "cloud_run":
         failed_candidates = {
             name: str(artifact).partition("@")[0]

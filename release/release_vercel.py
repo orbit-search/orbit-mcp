@@ -19,7 +19,9 @@ This module holds the Vercel parts that release_light.py uses:
 The Vercel token is team-scoped. In Cloud Build it comes from the environment
 (VERCEL_RELEASE_TOKEN, the secretEnv of the Secret Manager secret
 vercel-release-token); elsewhere it is read from Secret Manager with the
-gcloud identity. It is never printed and never put on a command line.
+gcloud identity. It is never printed and never put on a command line. The
+commit status uses GITHUB_TOKEN when it is set, else a read-write token of the
+Cloud Build connection, minted for each status.
 
 Part of the release kit (orbit-infrastructure/release-kit). Stdlib only (Python 3.10).
 """
@@ -49,8 +51,12 @@ API = "https://api.vercel.com"
 LOGS_API = "https://vercel.com"
 TOKEN_ENV = "VERCEL_RELEASE_TOKEN"
 DEFAULT_TOKEN_SECRET = "vercel-release-token"
-# The Secret Manager secret the builds put in GITHUB_TOKEN: a token that can write commit statuses.
-DEFAULT_GITHUB_SECRET = "release-kit-github-token"
+# github_token_secret "connection" (the default): the builds get no GITHUB_TOKEN secret. Reads use the read
+# token of the Cloud Build connection; each commit status uses a read-write token of the connection's GitHub
+# App (minted for that write, about an hour long, never stored). Any other value names a Secret Manager secret
+# that the builds put in GITHUB_TOKEN: a token that can write commit statuses.
+CONNECTION_TOKEN = "connection"
+DEFAULT_GITHUB_SECRET = CONNECTION_TOKEN
 BYPASS_HEADER = "x-vercel-protection-bypass"
 BYPASS_SCOPE = "automation-bypass"
 # GitHub cuts a commit status description at 140 characters.

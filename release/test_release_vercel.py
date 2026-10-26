@@ -291,7 +291,7 @@ class VercelConfigTest(unittest.TestCase):
         self.assertEqual(WEB.vercel_domains, (DOMAIN,))
         self.assertEqual(WEB.check_context, "orbit-release/demo-web")
         self.assertEqual(WEB.token_secret, "vercel-release-token")
-        self.assertEqual(WEB.github_token_secret, "release-kit-github-token")
+        self.assertEqual(WEB.github_token_secret, "connection")
         other = rl.parse_light(vercel_data(vercel={**vercel_data()["vercel"], "github_token_secret": "GITHUB_TOKEN"}))
         self.assertIn(
             "secrets/GITHUB_TOKEN/versions/latest", kit.rendered(other)["release/services/demo-web.rollback.yaml"]
@@ -301,6 +301,79 @@ class VercelConfigTest(unittest.TestCase):
         self.assertEqual(WEB.rollback_trigger, "demo-web-rollback")
         self.assertEqual(WEB.log_settle_seconds, 0)
         self.assertEqual(WEB.log_filter, "")
+
+    def test_named_github_secret_renders_it_everywhere(self) -> None:
+        """A named github_token_secret puts that secret in GITHUB_TOKEN of every build and every status step."""
+        named = rl.parse_light(
+            vercel_data(vercel={**vercel_data()["vercel"], "github_token_secret": "release-kit-github-token"})
+        )
+        for name, text in kit.rendered(named).items():
+            self.assertIn("secrets/release-kit-github-token/versions/latest", text, name)
+            self.assertIn('env: "GITHUB_TOKEN"', text, name)
+        release = kit.rendered(named)["release/services/demo-web.release.yaml"]
+        default = kit.rendered(WEB)["release/services/demo-web.release.yaml"]
+        self.assertEqual(release.count('secretEnv: ["GITHUB_TOKEN"]'), 3)
+        # The steps that had only GITHUB_TOKEN lose their secretEnv line; no step is lost.
+        self.assertEqual(default.count("    - name:"), release.count("    - name:"))
+        self.assertNotIn("secretEnv: []", default)
+
+    def test_status_token_sources(self) -> None:
+        """GITHUB_TOKEN first; else a read-write connection token per status; a named secret needs GITHUB_TOKEN."""
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "env-token"}):
+            self.assertEqual(rl.status_token(WEB), "env-token")
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": ""}),
+            mock.patch.object(guard.GoogleApi, "repository_read_write_token", return_value="rw-token") as mint,
+        ):
+            self.assertEqual(rl.status_token(WEB), "rw-token")
+            self.assertEqual(rl.status_token(WEB), "rw-token")
+            self.assertEqual(mint.call_count, 2)  # minted for each status, never cached
+            mint.assert_called_with("orbit-search", "orbit-search-demo-web")
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": ""}),
+            mock.patch.object(guard.GoogleApi, "repository_read_write_token", side_effect=guard.GuardError("no role")),
+        ):
+            with self.assertRaisesRegex(rr.RecordError, "no GitHub token for the commit status: no role"):
+                rl.status_token(WEB)
+        named = rl.parse_light(vercel_data(vercel={**vercel_data()["vercel"], "github_token_secret": "gh-secret"}))
+        with (
+            mock.patch.dict(os.environ, {"GITHUB_TOKEN": ""}),
+            mock.patch.object(guard.GoogleApi, "repository_read_write_token") as mint,
+        ):
+            with self.assertRaisesRegex(rr.RecordError, "gh-secret"):
+                rl.status_token(named)
+            mint.assert_not_called()
+
+    def test_read_write_token_request(self) -> None:
+        """The read-write token comes from accessReadWriteToken of the linked repository."""
+        api = guard.GoogleApi("orbit-search", "us-central1")
+        seen = []
+
+        def fake_http(request):
+            seen.append((request.get_method(), request.full_url))
+            return {"token": "rw-token"}
+
+        with (
+            mock.patch.object(api, "_access_token", return_value="gcloud-token"),
+            mock.patch.object(guard, "_http_json", side_effect=fake_http),
+        ):
+            self.assertEqual(api.repository_read_write_token("orbit-search", "orbit-search-demo-web"), "rw-token")
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "POST",
+                    "https://cloudbuild.googleapis.com/v2/projects/orbit-search/locations/us-central1/connections/"
+                    "orbit-search/repositories/orbit-search-demo-web:accessReadWriteToken",
+                )
+            ],
+        )
+        with (
+            mock.patch.object(api, "_access_token", return_value="gcloud-token"),
+            mock.patch.object(guard, "_http_json", side_effect=guard.GuardError("HTTP 403")),
+        ):
+            with self.assertRaisesRegex(guard.GuardError, "roles/cloudbuild.tokenAccessor"):
+                api.repository_read_write_token("orbit-search", "orbit-search-demo-web")
 
     def test_bad_configs(self) -> None:
         """Wrong tier, a smoke URL off the domains, no smoke check, a bad team, domain or trigger list."""
@@ -329,7 +402,9 @@ class VercelConfigTest(unittest.TestCase):
 
     def test_render(self) -> None:
         """The kit renders all four builds; each reads the three secrets and names the service."""
-        files = kit.rendered(WEB)
+        # As a private repository (a vendored people map): a public repository's copy has none.
+        with mock.patch.object(kit, "people_vendored", return_value=True):
+            files = kit.rendered(WEB)
         self.assertEqual(
             sorted(files),
             [
@@ -341,8 +416,10 @@ class VercelConfigTest(unittest.TestCase):
         )
         for name, text in files.items():
             self.assertIn("secrets/vercel-release-token/versions/latest", text, name)
-            self.assertIn("secrets/release-kit-github-token/versions/latest", text, name)
-            self.assertIn('env: "GITHUB_TOKEN"', text, name)
+            # Default github_token_secret "connection": no GitHub token secret in any build.
+            self.assertNotIn("GITHUB_TOKEN", text, name)
+            self.assertNotIn("secrets/connection/", text, name)
+            self.assertIn('secretEnv: ["WEBHOOK_ORBIT", "VERCEL_RELEASE_TOKEN"]', text, name)
             self.assertNotIn("kubectl", text, name)
             self.assertNotIn(TOKEN, text, name)
         release = files["release/services/demo-web.release.yaml"]
@@ -556,6 +633,51 @@ class VercelDevTest(VercelCase):
             args = _args(env="dev", release_id=release_id, failed_marker=str(self.root / "failed"))
             return rl.cmd_dev_verify(args, WEB, self.dev, None)
 
+    def test_an_older_dev_record_still_finishes_when_a_newer_one_is_latest(self) -> None:
+        """Dev builds overlap: when a newer dev record is latest, an older one finishes (and can verify) and
+        latest.json keeps the newer one. Prod still refuses a late finish."""
+        self.assertEqual(self._wait(), rv.EXIT_OK)
+        ids = []
+        started = "2026-10-23T11:00:00Z"
+        for name, commit in (("older", COMMIT), ("newer", NEWER_COMMIT)):
+            id_file = self.root / f"{name}_id"
+            args = _args(
+                env="dev",
+                commit=commit,
+                images_file=str(self.root / "vercel_deployment.json"),
+                release_id_file=str(id_file),
+            )
+            with mock.patch.object(rr, "utc_now", return_value=started):
+                self.assertEqual(rl.cmd_begin(args, WEB, self.dev, None), 0)
+            ids.append(id_file.read_text().strip())
+        older, newer = ids
+        self.assertGreater(newer, older)  # same start second: the commit orders them
+        self.assertEqual(rl.cmd_finish(_args(env="dev", release_id=newer), WEB, self.dev, None), 0)
+        self.assertEqual(rl.cmd_finish(_args(env="dev", release_id=older), WEB, self.dev, None), 0)
+        self.assertEqual(rr.read_record(self.dev, older)["status"], "deployed")
+        self.assertEqual(rr.read_record(self.dev, older)["artifacts"], {"demo-web": "dpl_new"})
+        self.assertEqual(self.dev.read("latest.json")[0]["release_id"], newer)
+        # Any other failure to move latest.json still fails the dev finish.
+        with (
+            mock.patch.object(rr, "point_latest_unless_newer", side_effect=rr.RecordError("write retries exhausted")),
+            self.assertRaisesRegex(rr.RecordError, "write retries exhausted"),
+        ):
+            rl.cmd_finish(_args(env="dev", release_id=newer), WEB, self.dev, None)
+        self.prod.write("latest.json", {"release_id": "99991231T000000Z-x", "commit": COMMIT, "kind": "promote"}, 0)
+        rr.create_record(
+            self.prod,
+            {
+                "release_id": "20261023T110000Z-c",
+                "kind": "promote",
+                "commit": COMMIT,
+                "status": "deploying",
+                "previous": {},
+            },
+            "deploy_started",
+        )
+        with self.assertRaisesRegex(rr.RecordError, "newer release"):
+            rl.cmd_finish(_args(env="prod", release_id="20261023T110000Z-c"), WEB, self.prod, None)
+
     def test_wait_outcomes(self) -> None:
         """READY writes the deployment; a cancel by the Ignored Build Step is "not affected" (exit 5, success); any other
         cancel and ERROR fail."""
@@ -664,6 +786,17 @@ class VercelProdTest(VercelCase):
         self.assertIn("Undo Rollback", str(raised.exception))
         self.prod.write("latest.json", {"release_id": "r1", "commit": OLD_COMMIT, "kind": "rollback"}, 0)
         rl.vercel_hold_guard(WEB, self.prod, self.api)
+
+    def test_first_release_starts_its_commits_at_what_serves(self) -> None:
+        """With no record before it, the prod record's previous commit is the commit the primary domain serves."""
+        artifacts = self.root / "artifacts.json"
+        artifacts.write_text(json.dumps({"demo-web": "dpl_new"}))
+        id_file = self.root / "release_id"
+        args = _args(env="prod", artifacts_file=str(artifacts), release_id_file=str(id_file))
+        self.assertEqual(rl.cmd_begin(args, WEB, self.prod, None), 0)
+        record = rr.read_record(self.prod, id_file.read_text().strip())
+        self.assertEqual(record["previous"]["commit"], OLD_COMMIT)
+        self.assertIsNone(record["previous"]["release_id"])
 
     def test_promote_by_status(self) -> None:
         """The status success comes first; when Vercel assigns the domains, nothing else is called."""
@@ -812,6 +945,68 @@ class VercelRollbackTest(VercelCase):
             with mock.patch.object(rl, "resolve_target", return_value=(rollback, same)):
                 rl._rollback_apply(args, WEB, self.prod, None)
             self.assertEqual(len(self.statuses), count)
+
+    def test_rollback_past_several_releases_marks_each_removed_commit(self) -> None:
+        """A window that judged releases A and B together rolls back past A: both commits get failure, not the
+        target's, and a chain that ends without a target release stops at the first record."""
+        a_commit, b_commit = "a" * 40, NEWER_COMMIT
+        first = {
+            "release_id": "r1",
+            "kind": "promote",
+            "commit": a_commit,
+            "status": "deployed",
+            "previous": {"release_id": "r0", "commit": OLD_COMMIT},
+        }
+        second = {
+            "release_id": "r2",
+            "kind": "promote",
+            "commit": b_commit,
+            "status": "deployed",
+            "previous": {"release_id": "r1", "commit": a_commit},
+        }
+        zero = {"release_id": "r0", "kind": "promote", "commit": OLD_COMMIT, "status": "deployed", "previous": {}}
+        for record in (zero, first, second):
+            rr.create_record(self.prod, dict(record), "deploy_started")
+        target = {"release_id": "r0", "commit": OLD_COMMIT}
+        self.assertEqual(rl.removed_commits(self.prod, second, target), [b_commit, a_commit])
+        self.assertEqual(rl.removed_commits(self.prod, second, {"release_id": "r1", "commit": a_commit}), [b_commit])
+        self.assertEqual(
+            rl.removed_commits(self.prod, second, {"release_id": None, "commit": "f" * 40}),
+            [b_commit, a_commit, OLD_COMMIT],
+        )
+        # A long chain is walked to its target, with no cap.
+        previous = "r0"
+        for number in range(1, 31):
+            rr.create_record(
+                self.prod,
+                {
+                    "release_id": f"s{number:02d}",
+                    "kind": "promote",
+                    "commit": f"{number:040d}",
+                    "status": "deployed",
+                    "previous": {"release_id": previous},
+                },
+                "deploy_started",
+            )
+            previous = f"s{number:02d}"
+        chain = rl.removed_commits(self.prod, rr.read_record(self.prod, "s30"), target)
+        self.assertEqual(len(chain), 30)
+        self.assertEqual(chain[-1], f"{1:040d}")
+        self.vercel.aliases = {DOMAIN: "dpl_new"}
+        args = argparse.Namespace(build_id="rb1", target="previous-of:r1", dry_run=False, expect_latest="")
+        with (
+            mock.patch.object(rb, "assert_alone"),
+            mock.patch.object(
+                rl,
+                "resolve_target",
+                return_value=(second, {**target, "workloads": {"vercel/demo-web": {"deployment": "dpl_old"}}}),
+            ),
+            mock.patch.object(rb, "create_rollback_record", return_value={"release_id": "rb"}),
+            mock.patch.object(rb, "finish_rollback", return_value=0),
+        ):
+            self.assertEqual(rl._rollback_apply(args, WEB, self.prod, None), 0)
+        failed = [(commit, state) for commit, _, state, _ in self.statuses]
+        self.assertEqual(failed, [(b_commit, "failure"), (a_commit, "failure")])
 
     def test_any_domain_off_target_makes_the_call(self) -> None:
         """The primary domain already serves the target but another does not: the rollback still runs."""

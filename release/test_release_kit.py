@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -5144,6 +5146,214 @@ class PeopleMapTest(unittest.TestCase):
         self.assertEqual(sync.detect_visibility(repo), "public")
         (repo / "release" / "services" / "orbit-mcp.json").write_text(json.dumps({"github_repo": "orbit-search/digit"}))
         self.assertEqual(sync.detect_visibility(repo), "private")
+
+
+class LateFailedReceiptAndRecoveryTest(unittest.TestCase):
+    """Greptile P1s on orbit-flutter-backend #110: each test fails on the kit before the fix."""
+
+    @staticmethod
+    def _failed_final_receipt(store) -> dict:
+        """A manual window check completed +60 with a failed verdict after the watch's first read."""
+        record = _record()
+        check = {"at": "2026-10-21T11:05:00Z", "result": "failed", "regressions": ["new error line"]}
+        record["checks"]["window_60m"] = check
+        rv.ro.note_checkpoint(record, check, "window_60m")
+        record["verdict"] = {"status": "failed", "at": "2026-10-21T11:05:00Z", "phase": "window_60m"}
+        _save(store, record)
+        return record
+
+    @staticmethod
+    def _first_read_still_pending():
+        """read_record that answers the watch's first read from before the manual check."""
+        original = rr.read_record
+        reads = []
+
+        def read(store, release_id):
+            current = original(store, release_id)
+            reads.append(release_id)
+            if len(reads) == 1:
+                current = {**current, "verdict": {"status": "pending"}}
+                current["followup"] = {"owner": current["followup"]["owner"]}
+            return current
+
+        return read
+
+    def test_watch_rolls_back_a_failed_final_receipt_it_skips(self) -> None:
+        """The watch skips a completed checkpoint, but a failed verdict on it still starts the rollback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            self._failed_final_receipt(store)
+            args = argparse.Namespace(
+                release_id=_record()["release_id"],
+                checkpoints="60",
+                extend_minutes=15,
+                max_window_minutes=180,
+                retry_completed=False,
+            )
+            with (
+                mock.patch.object(rr, "read_record", side_effect=self._first_read_still_pending()),
+                mock.patch.object(rv, "_datadog", return_value=(None, None)),
+                mock.patch.object(rv, "_token", return_value=None),
+                mock.patch.object(rv.rs, "CloudLogging"),
+                mock.patch.object(rv, "GoogleApi"),
+                mock.patch.object(rv, "wait_until_settled", return_value=None),
+                mock.patch.object(rv, "evaluate") as evaluate,
+                mock.patch.object(rv, "on_failure") as on_failure,
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock())
+            evaluate.assert_not_called()
+            on_failure.assert_called_once()
+            self.assertEqual(on_failure.call_args[0][2]["verdict"]["status"], "failed")
+
+    def test_light_watch_rolls_back_a_failed_final_receipt_it_skips(self) -> None:
+        """The same for Cloud Run, Composer, Vercel and Railway services."""
+        service = rl.parse_light(light_data("cloud_run"))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            self._failed_final_receipt(store)
+            args = argparse.Namespace(release_id=_record()["release_id"], checkpoints="60", retry_completed=False)
+            with (
+                mock.patch.object(rr, "read_record", side_effect=self._first_read_still_pending()),
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window") as evaluate,
+                mock.patch.object(rl, "on_failed") as on_failed,
+                mock.patch.object(rr, "post_slack", return_value=True),
+            ):
+                rl.cmd_watch(args, service, store, mock.Mock())
+            evaluate.assert_not_called()
+            on_failed.assert_called_once()
+
+    def test_light_watch_rolls_back_a_failure_a_manual_check_saves_during_its_checks(self) -> None:
+        """Greptile P1 on company-intelligence-research #41: the manual check fails the release while the watch
+        sleeps or checks, and the watch's own checks pass. The watch still starts the rollback and posts no pass."""
+        service = rl.parse_light(light_data("cloud_run"))
+        clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+        for checkpoints in ("60", "15 60"):
+            with self.subTest(checkpoints=checkpoints), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                _save(store, record)
+                first = f"window_{checkpoints.split()[0]}m"
+
+                def manual_failure_then_clean(*_args, key: str = first, **_kwargs) -> dict:
+                    """A manual window check completes this checkpoint with a failed verdict during the watch's checks."""
+
+                    def fail(current: dict) -> None:
+                        """The manual check's write: its result, its receipt and the failed verdict."""
+                        check = {"at": "2026-10-21T11:05:00Z", "result": "failed", "regressions": ["new error"]}
+                        current["checks"][key] = check
+                        rv.ro.note_checkpoint(current, check, key)
+                        current["verdict"] = {"status": "failed", "at": "2026-10-21T11:05:00Z", "phase": key}
+
+                    rr.update_record(store, record["release_id"], fail, "verify_manual")
+                    return clean
+
+                args = argparse.Namespace(
+                    release_id=record["release_id"], checkpoints=checkpoints, retry_completed=False
+                )
+                with (
+                    mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                    mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                    mock.patch.object(rl, "replaced_by", return_value=None),
+                    mock.patch.object(rl, "evaluate_window", side_effect=manual_failure_then_clean) as evaluate,
+                    mock.patch.object(rl, "on_failed") as on_failed,
+                    mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                ):
+                    self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_OK)
+                evaluate.assert_called_once()
+                on_failed.assert_called_once()
+                self.assertEqual(on_failed.call_args[0][2]["verdict"]["status"], "failed")
+                self.assertFalse([call for call in slack.call_args_list if "passed" in str(call)])
+                self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "failed")
+
+    def test_light_watch_rolls_back_a_failure_saved_before_its_final_write(self) -> None:
+        """Greptile P1 on orbit-flutter-backend #111 and orbit-chatgpt-app #121: the manual failure lands after
+        the final checkpoint's result is saved and before the final verdict write. The final write keeps the
+        failure; the watch acts on the record it returns and posts no pass."""
+        service = rl.parse_light(light_data("cloud_run"))
+        clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            original_owner = rv.require_owner
+            writes = []
+
+            def owner_then_manual_failure(store_, saved):
+                """The owner read after the checkpoint's save; the manual check writes its failure right then."""
+                if not writes:
+                    writes.append(1)
+
+                    def fail(current: dict) -> None:
+                        """The manual check's write: its result and the failed verdict."""
+                        check = {"at": "2026-10-21T11:05:00Z", "result": "failed", "regressions": ["new error"]}
+                        current["checks"]["window_60m"] = check
+                        current["verdict"] = {"status": "failed", "at": "2026-10-21T11:05:00Z", "phase": "window_60m"}
+
+                    rr.update_record(store, record["release_id"], fail, "verify_manual")
+                return original_owner(store_, saved)
+
+            args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+            with (
+                mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+                mock.patch.object(rl, "wait_for_deploys", return_value=None),
+                mock.patch.object(rl, "replaced_by", return_value=None),
+                mock.patch.object(rl, "evaluate_window", return_value=clean),
+                mock.patch.object(rv, "require_owner", side_effect=owner_then_manual_failure),
+                mock.patch.object(rl, "on_failed") as on_failed,
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            ):
+                self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_OK)
+            on_failed.assert_called_once()
+            self.assertEqual(on_failed.call_args[0][2]["verdict"]["status"], "failed")
+            self.assertFalse([call for call in slack.call_args_list if "passed" in str(call)])
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "failed")
+
+    def test_finish_recovery_keeps_the_failed_step_guard(self) -> None:
+        """The alert's finish command, run after the build ended, still names the failed step."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _save(store, _record(release_id="20261020T100000Z-bbbbbbbbb"))
+            pending = _record(status="deploying", build={"id": "deploy1"})
+            _save(store, pending, latest=False)
+            Path(tmp, "release_id").write_text(pending["release_id"] + "\n", encoding="utf-8")
+            step_file = Path(tmp, "deploy_failed_step")
+            step_file.write_text('{"id": "deploy", "deployments": ["prod-demo"]}\n', encoding="utf-8")
+            clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+            with (
+                mock.patch.object(rr, "open_from_args", return_value=(SERVICE, PROD, store, clients)),
+                mock.patch.object(rr, "snapshot_workloads", side_effect=rr.RecordError("kubectl timed out")),
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                mock.patch.object(rr.time, "sleep"),
+            ):
+                code = rr.main(
+                    ["finish", "--env", "prod", "--attempts", "3", "--release-id-file", f"{tmp}/release_id"]
+                    + ["--status", "deploy_failed", "--failed-step-file", str(step_file)]
+                )
+            self.assertEqual(code, 1)
+            finish = re.search(r"1\) `([^`]+)`", slack.call_args[0][0]).group(1)
+            # The build is over: its /workspace is gone. A human runs the command from the alert.
+            step_file.unlink()
+            argv = shlex.split(finish)
+            self.assertEqual(argv[:3], ["python3", "release/release_record.py", "finish"])
+            with mock.patch.object(rr, "open_from_args", return_value=(SERVICE, PROD, store, clients)):
+                self.assertEqual(rr.main(argv[2:]), 0)
+            saved = rr.read_record(store, pending["release_id"])
+            self.assertEqual(saved["status"], "deploy_failed")
+            self.assertEqual(saved["failed_step"]["id"], "deploy")
+            self.assertTrue(saved["deploy_steps_named"])
+
+    def test_finish_recovery_without_a_named_step_still_marks_steps_named(self) -> None:
+        """A build that passes the step file but named no step: the recovery keeps deploy_steps_named."""
+        recovery = rr.finish_recovery("gke", "demo", "prod", "r1", "deploy_failed", failed_step=None, steps_named=True)
+        argv = shlex.split(recovery[0])
+        self.assertIn("--failed-step", argv)
+        self.assertEqual(argv[argv.index("--failed-step") + 1], "")
+        plain = rr.finish_recovery("gke", "demo", "prod", "r1", "deployed")
+        self.assertNotIn("--failed-step", plain[0])
 
 
 if __name__ == "__main__":
