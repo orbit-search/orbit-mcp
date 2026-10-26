@@ -4519,6 +4519,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         return outcome, rr.read_record(store, record["release_id"])
 
     def test_early_manual_check_completes_no_scheduled_checkpoint(self) -> None:
+        """Early manual check completes no scheduled checkpoint."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record()
@@ -4560,6 +4561,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertEqual(final["verdict"]["phase"], "window_60m")
 
     def test_early_check_failure_still_fails_the_release(self) -> None:
+        """Early check failure still fails the release."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record()
@@ -4573,6 +4575,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertNotIn("checkpoints", saved["followup"])
 
     def test_older_checkpoint_never_replaces_a_later_terminal_verdict(self) -> None:
+        """Older checkpoint never replaces a later terminal verdict."""
         cases = [
             (dict(result="inconclusive", availability={"status": "unconfirmed"}), False),
             (dict(result="passed"), True),
@@ -4598,6 +4601,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertEqual(saved["verdict"]["status"], "failed")
 
     def test_older_checkpoint_error_keeps_a_later_terminal_verdict(self) -> None:
+        """Older checkpoint error keeps a later terminal verdict."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(verdict={"status": "passed", "phase": "window_60m"})
@@ -4608,6 +4612,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["state"], "error")
 
     def test_light_older_final_checkpoint_keeps_the_later_verdict(self) -> None:
+        """Light older final checkpoint keeps the later verdict."""
         service = rl.parse_light(light_data("cloud_run"))
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -4627,6 +4632,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertEqual((saved["verdict"]["status"], saved["verdict"]["phase"]), ("passed", "window_60m"))
 
     def test_busy_prod_leaves_checkpoints_open_and_only_a_replacement_supersedes(self) -> None:
+        """Busy prod leaves checkpoints open and only a replacement supersedes."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record()
@@ -4646,6 +4652,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertEqual({receipt["state"] for receipt in receipts.values()}, {"superseded"})
 
     def test_window_check_with_an_injected_runner_passes_its_deadline(self) -> None:
+        """Window check with an injected runner passes its deadline."""
         timeouts: list[float] = []
 
         class TimedCluster(FakeCluster):
@@ -4673,6 +4680,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertTrue(all(0 < value <= 120 for value in timeouts), timeouts)
 
     def test_finish_retries_then_alerts_with_the_recovery_commands(self) -> None:
+        """Finish retries then alerts with the recovery commands."""
         calls = []
 
         def flaky() -> int:
@@ -4711,6 +4719,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertIn("schedule-window --release-id r1", light[2])
 
     def test_retried_finish_keeps_the_first_finish_time(self) -> None:
+        """Retried finish keeps the first finish time."""
         record = {"status": "deployed", "times": {"deploy_finished": "2026-10-21T10:05:00Z"}}
         rr.keep_finish_time(record, "deployed")
         self.assertEqual(record["times"]["deploy_finished"], "2026-10-21T10:05:00Z")
@@ -4719,6 +4728,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertNotEqual(record["times"]["deploy_finished"], "2026-10-21T10:05:00Z")
 
     def test_finish_cli_retries_and_returns_red(self) -> None:
+        """Finish cli retries and returns red."""
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "release_id").write_text("r1\n", encoding="utf-8")
             with (
@@ -4735,6 +4745,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.assertIn("--release-id r1", slack.call_args[0][0])
 
     def test_prod_build_contract(self) -> None:
+        """Prod build contract."""
         good = """steps:
   - id: notify-promote-blocked
     args:
@@ -4809,6 +4820,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             self.skipTest("no prod build file next to the kit")
 
     def test_offline_launcher_nulls_credentials_and_blocks_live_clis(self) -> None:
+        """Offline launcher nulls credentials and blocks live clis."""
         import run_offline_checks as offline
 
         script = (
@@ -4828,6 +4840,67 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertEqual((seen["RELEASE_SLACK_DISABLED"], seen["HTTPS_PROXY"]), ("1", "http://127.0.0.1:9"))
         self.assertIsNone(seen["SECRET_TOKEN"])
         self.assertEqual((seen["kubectl"], seen["gcloud"]), (offline.BLOCKED_EXIT, offline.BLOCKED_EXIT))
+
+    def test_finish_refuses_to_hide_a_newer_release(self) -> None:
+        """A late finish (a recovery from the alert) leaves the old record and latest.json alone once a newer
+        release or rollback is latest; the build's own finish records that it names its failed steps."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            old = _record(status="deploying", build={"id": "deploy1"})
+            _save(store, old, latest=False)
+            newer = _record(release_id="20261021T120000Z-ccccccccc", kind="rollback")
+            _save(store, newer)
+            args = argparse.Namespace(
+                release_id_file=None, release_id=old["release_id"], status="deployed", failed_step_file=None
+            )
+            clients = rr.Clients(env=PROD, runner=FakeCluster(digest=NEW))
+            with self.assertRaises(rr.RecordError):
+                rr.cmd_finish(args, PROD, store, clients)
+            self.assertEqual(rr.read_record(store, old["release_id"])["status"], "deploying")
+            self.assertEqual(store.read("latest.json")[0]["release_id"], newer["release_id"])
+            with self.assertRaises(rr.RecordError):
+                rr.point_latest_unless_newer(store, old)
+            # The build's own finish (latest is older): it finishes and notes the named steps.
+            store2 = _store(f"{tmp}/own")
+            _save(store2, _record(release_id="20261020T100000Z-bbbbbbbbb"))
+            _save(store2, old, latest=False)
+            args.failed_step_file = f"{tmp}/deploy_failed_step"
+            rr.cmd_finish(args, PROD, store2, clients)
+            saved = rr.read_record(store2, old["release_id"])
+            self.assertEqual((saved["status"], saved["deploy_steps_named"]), ("deployed", True))
+            self.assertEqual(store2.read("latest.json")[0]["release_id"], old["release_id"])
+
+    def test_inconclusive_dev_verify_is_not_verified(self) -> None:
+        """A dev result that capacity left inconclusive is not a pass: the index blocks the promote."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(environment="dev", verdict={"status": "pending"})
+            _save(store, record)
+            result = self._result(
+                phase="deploy",
+                result="inconclusive",
+                checks=[{"name": "rollouts", "status": "environmental", "details": ["1 Deployments", "capacity"]}],
+            )
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                mock.patch.object(rv, "_point_verified") as pointed,
+            ):
+                saved = rv.finish_dev_verify(SERVICE, store, record, result, build_url="https://b")
+            self.assertEqual(saved["verdict"]["status"], "inconclusive")
+            self.assertIn("rollouts: 1 Deployments; capacity", saved["verdict"]["reason"])
+            index, _ = store.read(rg.dev_commit_index(record["commit"]))
+            self.assertEqual(index["verdict"]["status"], "inconclusive")
+            pointed.assert_not_called()
+            self.assertIn("dev verify inconclusive", slack.call_args[0][0])
+
+    def test_rollback_watch_reads_a_failed_early_check(self) -> None:
+        """A failed early check is the verdict's phase: its regressions stay readable after the rollback."""
+        record = {"checks": {}, "followup": {}}
+        rv.ro.note_early_check(record, {"at": "t", "result": "failed", "regressions": [{"kind": "metric"}]}, "early_4m")
+        self.assertEqual(rv.ro.phase_result(record, "early_4m")["regressions"], [{"kind": "metric"}])
+        record["checks"]["window_15m"] = {"regressions": []}
+        self.assertEqual(rv.ro.phase_result(record, "window_15m"), {"regressions": []})
+        self.assertIsNone(rv.ro.phase_result(record, "window_60m"))
 
 
 def step_script(block: str) -> str:

@@ -195,8 +195,24 @@ are not Ready. The verdict is `capacity` only when all four hold:
    3 nodes at >= 95%; probe kills on the old ReplicaSet, or in 2 other namespaces, in the last 2 hours.
 
 A failed step that the record names (`failed_step`) is never capacity: `rollout-wait` names a step only
-after a verdict that was not capacity, and a failed apply or script names its own step. An older build that
-wrote `deploy_failed` without a step has every Deployment on the release judged.
+after a verdict that was not capacity, and a failed apply or script names its own step. A build that passes
+`--failed-step-file` to `finish` names every failed step (the record says `deploy_steps_named`), so its
+`deploy_failed` without a step is never capacity either. Only an older build that wrote `deploy_failed`
+without a step, and without that flag, has every Deployment on the release judged.
+
+Every failure in a deploy step writes `/workspace/deploy_failed_step` before `deploy_failed` (keep the file
+that `rollout-wait` wrote):
+
+```bash
+deploy_step_failed() {
+  [ -s /workspace/deploy_failed_step ] || printf '{"id":"%s"}\n' "$1" > /workspace/deploy_failed_step
+  touch /workspace/deploy_failed
+}
+kubectl apply -f /workspace/k8-prod-rendered/ || { deploy_step_failed deploy-prod; exit 1; }
+```
+
+Dev verify passes only on a passed result. A dev rollout that capacity still holds back after the extended
+wait is `inconclusive`: the commit is not verified, prod does not promote it, and Slack gets one line.
 
 Capacity: the availability checks of those Deployments (images, rollouts, deploy, their `pods_ready`
 checks) get status `environmental`. No rollback, no suspected PRs, no hold, no author ping; one line goes to
@@ -369,6 +385,8 @@ the check records nothing and its checkpoint stays open.
   the recovery commands in order (finish the record, `check --phase deploy`,
   `schedule-window`) and the build ends red. Nothing below the finish runs on an
   unfinished record.
+  The finish refuses (and changes nothing) once a newer release or rollback is
+  latest, so a late recovery never hides it.
 
 Cloud Run/Composer use the same ownership fields through
 `python3 release/release_light.py --service <service> own --env prod --release-id <id> --thread-url <chat URL> --pr-url <PR URL>`.

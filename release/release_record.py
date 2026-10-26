@@ -633,6 +633,48 @@ def update_record(
     return update_object(store, record_name(release_id), change)
 
 
+def newer_latest(store: Store, release_id: str) -> str | None:
+    """The release (or rollback) latest.json names when it is newer than release_id, else None.
+
+    Release ids start with their UTC start time (release_id_for), so a later id is a newer release."""
+    pointer, _ = store.read("latest.json")
+    current = str((pointer or {}).get("release_id") or "")
+    return current if current and current != release_id and current > release_id else None
+
+
+def point_latest_unless_newer(store: Store, record: dict) -> None:
+    """Point latest.json at a finished record, unless a newer release or rollback is latest by then.
+
+    A finish that runs late (a recovery from the alert) must never hide a newer release or rollback
+    record, or a later promote would miss its hold. The check runs inside the conditional write."""
+
+    def change(current: dict | None) -> dict:
+        """The new pointer; refuse when the pointer names a newer release."""
+        named = str((current or {}).get("release_id") or "")
+        if named and named != record["release_id"] and named > record["release_id"]:
+            raise RecordError(
+                f"latest.json names the newer release {named}; finishing {record['release_id']} would hide it"
+            )
+        return {
+            "release_id": record["release_id"],
+            "commit": record["commit"],
+            "kind": record["kind"],
+            "object": store.location(record_name(record["release_id"])),
+            "updated_at": utc_now(),
+        }
+
+    update_object(store, "latest.json", change)
+
+
+def refuse_newer_latest(store: Store, release_id: str) -> None:
+    """Raise RecordError when a newer release or rollback is latest: a finish must not touch the old record."""
+    if newer := newer_latest(store, release_id):
+        raise RecordError(
+            f"latest.json names the newer release {newer}; {release_id} is no longer what runs, so its record "
+            "is left as it is (finish it only while it is the newest release)"
+        )
+
+
 def point_latest(store: Store, record: dict) -> None:
     """Point latest.json at the record."""
     update_object(
@@ -866,8 +908,10 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
     release_id = _read_text(args.release_id_file) if args.release_id_file else args.release_id
     if not release_id:
         raise RecordError("no release id; release-record-begin did not run")
+    refuse_newer_latest(store, release_id)
     after = snapshot_workloads(clients)
-    failed_step = read_failed_step(getattr(args, "failed_step_file", None)) if args.status == "deploy_failed" else None
+    step_file = getattr(args, "failed_step_file", None)
+    failed_step = read_failed_step(step_file) if args.status == "deploy_failed" else None
 
     def finish(record: dict) -> None:
         """Write the snapshot, the status, the failed step and the deploy finish time on the record."""
@@ -876,9 +920,13 @@ def cmd_finish(args: argparse.Namespace, env: Environment, store: Store, clients
         record["status"] = args.status
         if failed_step:
             record["failed_step"] = failed_step
+        if step_file:
+            # This build names every failed deploy step (release_kit.py prod build contract): an unnamed
+            # deploy_failed is then never a capacity wait (release_verify.deploy_capacity).
+            record["deploy_steps_named"] = True
 
     saved = update_record(store, release_id, finish, args.status)
-    point_latest(store, saved)
+    point_latest_unless_newer(store, saved)
     print(f"Release {release_id}: {args.status}; {store.location('latest.json')} points at it", flush=True)
     # The deploy is over: a rollback may start now. A build that ends frees the lock too.
     try:
@@ -961,7 +1009,8 @@ def finish_with_retries(
         f":rotating_light: {title} {env} release {release_id or '(unknown id)'}: the deploy changed {env}, but "
         f"the release record was not finished after {attempts} attempt(s): {str(error)[:300]}. The new image "
         "runs UNCHECKED (no smoke checks, no +15/+60 watch window, no automatic rollback) and this build ends "
-        f"red. From a checkout of this commit with {env} access, run in order: {steps}"
+        f"red. From a checkout of this commit with {env} access, run in order: {steps}. The finish refuses "
+        "once a newer release or rollback is latest; then this release no longer runs and needs no checks."
     )
     print(text, file=sys.stderr, flush=True)
     if env == "prod":

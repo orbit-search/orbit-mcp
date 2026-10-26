@@ -628,7 +628,7 @@ def _watch_rollback(
     release_id = record["release_id"]
     current = rr.read_record(store, release_id)
     phase = (current.get("verdict") or {}).get("phase", "")
-    regressions = ((current.get("checks") or {}).get(phase) or {}).get("regressions") or []
+    regressions = (ro.phase_result(current, phase) or {}).get("regressions") or []
     items = [item for item in regressions if item.get("kind") == "metric"]
     metrics = {metric.name: metric for metric in service.metrics}
     # Spread metrics need the baseline's hourly values; the check after a rollback does not judge them.
@@ -1298,6 +1298,17 @@ def deploy_capacity(
             "indicators": [],
             "deployments": names,
             "summary": f"not capacity: deploy step {step} failed (not a capacity wait)",
+        }
+    if record.get("status") == "deploy_failed" and record.get("deploy_steps_named"):
+        # This build names every failed step, and a capacity wait sets no deploy_failed at all: an unnamed
+        # failure (an apply, a script) is the release's, even while another workload lacks capacity.
+        return checks, {
+            "verdict": "not_capacity",
+            "status": "failed",
+            "blockers": ["deploy failed outside a rollout wait (the build names its failed steps)"],
+            "indicators": [],
+            "deployments": names,
+            "summary": "not capacity: deploy failed outside a rollout wait",
         }
     if not names and record.get("status") == "deploy_failed":
         # An older build failed a step without naming it: judge every Deployment on the release.
@@ -2283,6 +2294,16 @@ def newer_dev_build(env: rc.Environment, build_id: str) -> str | None:
     return None
 
 
+def inconclusive_reason(result: dict) -> str:
+    """Why a check result is inconclusive, in one line (the unresolved checks)."""
+    unresolved = [
+        f"{check['name']}: {'; '.join(check.get('details') or [])[:200]}"
+        for check in result.get("checks") or []
+        if check.get("status") not in ("passed", "failed")
+    ]
+    return ("; ".join(unresolved) or "the checks could not decide")[:500]
+
+
 def finish_dev_verify(
     service: rc.Service,
     store: rr.Store,
@@ -2302,7 +2323,9 @@ def finish_dev_verify(
     alert, the newer commit promotes instead. A test run alerts with a TEST RUN header, no mentions.
     """
     failed = result["result"] == "failed"
-    status = "passed"
+    # Only a passed result verifies the commit. An inconclusive one (a rollout that capacity holds back)
+    # is not verified: the gate refuses the promote until a dev build passes.
+    status = "passed" if result["result"] == "passed" else "inconclusive"
     if failed:
         status = "superseded" if superseded_by else "failed"
     verdict = {
@@ -2311,6 +2334,7 @@ def finish_dev_verify(
         "phase": "dev_verify",
         **({"reasons": [r["text"] for r in result["regressions"]]} if failed else {}),
         **({"superseded_by": superseded_by} if status == "superseded" else {}),
+        **({"reason": inconclusive_reason(result)} if status == "inconclusive" else {}),
     }
 
     def change(current: dict) -> None:
@@ -2336,6 +2360,14 @@ def finish_dev_verify(
         _point_verified(store, service.dev or service.prod, saved, token)
     elif status == "superseded":
         print(f"Dev verify superseded, nothing to promote: {superseded_by}", flush=True)
+    elif status == "inconclusive":
+        link = f" <{build_url}|the dev build>" if build_url else ""
+        line = (
+            f":grey_question: {service.title} dev verify inconclusive for `{saved['commit'][:9]}`: "
+            f"{verdict['reason']}. Not verified, so prod does not promote it; a later dev build that passes does.{link}"
+        )
+        print(line, flush=True)
+        rr.post_slack(line)
     else:
         location = store.location(rr.record_name(saved["release_id"]))
         rr.post_slack(*dev_verify_alert(service, saved, build_url, location, test_run))

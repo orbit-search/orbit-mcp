@@ -1640,21 +1640,12 @@ def railway_deploy(
     try:
         rwy.check_token_scope(api, service.railway_project_id, env_id, f"{env} ({label})")
         deployment_id = api.deploy(service.railway_service_id, env_id, commit)
-        print(f"Railway {label}: deployment {deployment_id} of {commit[:9]} started", flush=True)
-        deployment = rwy.wait_for_deployment(
-            api, deployment_id, service.deployment_wait_minutes * 60, sleep=sleep, clock=clock
-        )
     except (rr.RecordError, GuardError) as error:
         return None, [str(error)[:300]]
+    print(f"Railway {label}: deployment {deployment_id} of {commit[:9]} started", flush=True)
+    deployment = railway_wait_or_cancel(service, api, deployment_id, sleep=sleep, clock=clock)
     problems = []
     status = str(deployment.get("status") or "")
-    if status in rwy.BUILDING:
-        # It must not go live later, unchecked and after a rollback: cancel the kit's own deployment.
-        try:
-            api.cancel(str(deployment["id"]))
-            status = f"{status}, cancelled after {service.deployment_wait_minutes} min"
-        except (rr.RecordError, GuardError) as error:
-            status = f"{status} after {service.deployment_wait_minutes} min, and the cancel failed: {str(error)[:160]}"
     if status != rwy.SUCCESS:
         problems.append(f"Railway {label} deployment {deployment.get('id')} is {status}")
     if rwy.commit_of(deployment) != commit:
@@ -1663,6 +1654,37 @@ def railway_deploy(
         )
     print(f"Railway {label}: {rwy.describe(deployment)}", flush=True)
     return deployment, problems
+
+
+def railway_wait_or_cancel(
+    service: LightService,
+    api: rwy.RailwayApi,
+    deployment_id: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict:
+    """Wait for the kit's own deployment. One that still builds when the wait ends, or whose status can no
+    longer be read, is cancelled: it must not go live later, unchecked and after a rollback. Returns the
+    deployment (always with its id; status says what happened)."""
+    try:
+        deployment = rwy.wait_for_deployment(
+            api, deployment_id, service.deployment_wait_minutes * 60, sleep=sleep, clock=clock
+        )
+        status = str(deployment.get("status") or "")
+        if status not in rwy.BUILDING:
+            return deployment
+        why = f"{status} after {service.deployment_wait_minutes} min"
+    except (rr.RecordError, GuardError) as error:
+        deployment = {"id": deployment_id, "status": "UNKNOWN"}
+        why = f"status unreadable ({str(error)[:160]})"
+    try:
+        api.cancel(deployment_id)
+        status = f"{why}, cancelled"
+    except (rr.RecordError, GuardError) as error:
+        status = f"{why}, and the cancel failed: {str(error)[:160]}"
+    print(f"Railway deployment {deployment_id}: {status}", flush=True)
+    return {**deployment, "id": deployment.get("id") or deployment_id, "status": status}
 
 
 def cmd_railway_deploy(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2111,16 +2133,10 @@ def railway_rollback(service: LightService, api: rwy.RailwayApi, target: str, ta
         commit = rwy.commit_of(old) or str(target_commit or "")
         print(f"{target} can no longer be redeployed; rebuilding its commit {commit[:9]}", flush=True)
         new_id = api.deploy(service.railway_service_id, env_id, commit)
-    deployment = rwy.wait_for_deployment(api, new_id, service.deployment_wait_minutes * 60)
+    # It must not go live later, after the lock is free and without a record: the wait cancels it.
+    deployment = railway_wait_or_cancel(service, api, new_id)
     print(f"railway/{service.name}: {target} redeployed as {rwy.describe(deployment)}", flush=True)
     failures = []
-    if deployment.get("status") in rwy.BUILDING:
-        # It must not go live later, after the lock is free and without a record: cancel it.
-        try:
-            api.cancel(new_id)
-            deployment = {**deployment, "status": f"{deployment.get('status')}, cancelled after the wait"}
-        except (rr.RecordError, GuardError) as error:
-            deployment = {**deployment, "status": f"{deployment.get('status')}; the cancel failed: {str(error)[:160]}"}
     if deployment.get("status") != rwy.SUCCESS:
         failures.append(f"railway/{service.name}: the rollback deployment {new_id} is {deployment.get('status')}")
     if rwy.image_of(old) and rwy.image_of(deployment) and rwy.image_of(old) != rwy.image_of(deployment):
@@ -2590,6 +2606,7 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
     release_id = (
         Path(args.release_id_file).read_text(encoding="utf-8").strip() if args.release_id_file else args.release_id
     )
+    rr.refuse_newer_latest(store, release_id)
     artifacts: dict[str, str] = {}
     problem = ""
     if args.env == "dev":
@@ -2618,7 +2635,7 @@ def cmd_finish(args: argparse.Namespace, service: LightService, store: rr.Store,
                 record["artifacts_error"] = problem
 
     saved = rr.update_record(store, release_id, finish, args.status)
-    rr.point_latest(store, saved)
+    rr.point_latest_unless_newer(store, saved)
     print(f"Release {release_id}: {args.status}", flush=True)
     if service.has_gate and args.env == "prod":
         # The promote is over: a rollback may start now. A build that ends frees the lock too.

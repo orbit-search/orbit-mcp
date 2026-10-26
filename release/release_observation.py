@@ -179,6 +179,15 @@ def note_early_check(record: dict, result: dict, key: str) -> None:
     del early[:-EARLY_CHECKS_KEPT]
 
 
+def phase_result(record: dict, phase: str) -> dict | None:
+    """The saved check result of a verdict phase: record["checks"][phase], or the early check of that key."""
+    saved = (record.get("checks") or {}).get(phase)
+    if saved is not None:
+        return saved
+    early = [item for item in (record.get("followup") or {}).get("early_checks") or [] if item.get("key") == phase]
+    return early[-1].get("check") if early else None
+
+
 def later_terminal(verdict: dict, checkpoint: str) -> bool:
     """A late repair of an earlier checkpoint cannot erase a later terminal verdict.
 

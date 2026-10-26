@@ -995,6 +995,31 @@ class ReviewFixesTest(RailwayCase):
         self.assertIn("cancelled", problems[0])
         self.assertEqual(self.railway.mutations(), ["deploy", "cancel"])
 
+    def test_unreadable_status_cancels_and_keeps_the_deployment_id(self) -> None:
+        """A status read that fails after the deploy started cancels the kit's deployment and keeps its id."""
+        with mock.patch.object(rwy, "wait_for_deployment", side_effect=rr.RecordError("Railway HTTP 502")):
+            started, problems = rl.railway_deploy(API, self.apis["prod"], "prod", COMMIT)
+        self.assertEqual(started["id"], "new1")
+        self.assertIn("status unreadable", problems[0])
+        self.assertIn("cancelled", problems[0])
+        self.assertEqual(self.railway.mutations(), ["deploy", "cancel"])
+
+    def test_rollback_with_unreadable_status_cancels_and_fails(self) -> None:
+        """The rollback's redeploy is cancelled too when its status cannot be read; the rollback fails."""
+        self.railway.deployments["d_new"] = deployment("d_new", PROD_ENV, COMMIT)
+        self.railway.active[PROD_ENV] = "d_new"
+        with mock.patch.object(rwy, "wait_for_deployment", side_effect=rr.RecordError("Railway HTTP 502")):
+            failures = rl.railway_rollback(API, self.apis["prod"], "d_old", OLD_COMMIT)
+        self.assertIn("status unreadable", failures[0])
+        self.assertEqual(self.railway.mutations()[-1], "cancel")
+
+    def test_unknown_changed_pages_leave_the_checkpoint_incomplete(self) -> None:
+        """Unknown changed pages: their titles and links went unchecked, so the checkpoint is not complete."""
+        unknown = rst.Changes(known=False, count_known=True, note="300 or more changed files")
+        result = rst.check_pages(DOCS.site, COMMIT, unknown, None, strict_content=True, get=FakeSite())
+        self.assertFalse(result.complete)
+        self.assertTrue(any("changed pages are unknown" in item for item in result.warnings))
+
     def test_rollback_waits_for_a_deployment_in_flight(self) -> None:
         """A production deployment that still builds blocks the rollback plan."""
         self.railway.deployments["d_new"] = deployment("d_new", PROD_ENV, COMMIT)

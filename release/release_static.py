@@ -427,7 +427,10 @@ def check_pages(
     if broken:
         result.failures.append(f"{len(broken)} internal links on changed pages fail: " + "; ".join(broken[:8]))
     if not changes.known:
+        # The changed pages' titles and links went unchecked (a new page may not be in the sitemap yet):
+        # the checkpoint is not complete, so the final verdict stays inconclusive and a later release judges it.
         result.warnings.append(f"the changed pages are unknown ({changes.note}); only the sitemap pages were checked")
+        result.complete = False
     return result
 
 

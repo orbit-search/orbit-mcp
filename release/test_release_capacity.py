@@ -904,6 +904,18 @@ class ReleaseCaseTest(unittest.TestCase):
         self.assertEqual((result["result"], result["cause"]), ("inconclusive", "capacity"))
         self.assertEqual(result["capacity"]["environmental_checks"], ["deploy"])
 
+    def test_an_unnamed_failure_of_a_step_naming_build_is_never_capacity(self) -> None:
+        """A build that names its failed steps (finish --failed-step-file) and still wrote deploy_failed without
+        one failed outside a rollout wait (an apply, a script): capacity elsewhere never excuses it."""
+        cluster = orbit_api_incident()
+        finish_on_second_wait(cluster)
+        record = record_for(ORBIT_API, status="deploy_failed", deploy_steps_named=True)
+        result = deploy_check(ORBIT_API, cluster, record)
+        self.assertEqual(result["result"], "failed")
+        self.assertEqual(result["capacity"]["verdict"], "not_capacity")
+        self.assertIn("outside a rollout wait", result["capacity"]["summary"])
+        self.assertEqual(cluster.sleeps, [])
+
     def test_deep_search_incident_one_finding_and_no_rollback(self) -> None:
         cluster = deep_search_incident()
         cluster.rollout_results = [{ENTITY: False}]
