@@ -383,6 +383,154 @@ class RailwayApiTest(RailwayCase):
             flaky.token_scope()
         self.assertIn("boom", str(raised.exception))
 
+    def test_deploy_answer_lost_is_reconciled_not_sent_again(self) -> None:
+        """A 502 after Railway started the deploy: the kit adopts that deployment and sends the mutation once."""
+        lost = {"done": False}
+
+        def http(request):
+            status, raw = self.railway(request)
+            if b"serviceInstanceDeployV2" in request.data and not lost["done"]:
+                lost["done"] = True
+                return 502, b""
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        self.assertEqual(api.deploy("svc", PROD_ENV, COMMIT), "new1")
+        self.assertEqual(self.railway.mutations(), ["deploy"])
+
+    def test_deploy_without_an_answer_and_no_new_deployment_raises(self) -> None:
+        """A timeout before Railway ran it: no new deployment is listed, the kit raises and never sends it again."""
+
+        def http(request):
+            if b"serviceInstanceDeployV2" in request.data:
+                self.railway.calls.append(("deploy", {}, PROD_TOKEN))
+                raise TimeoutError("timed out")
+            return self.railway(request)
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        with self.assertRaisesRegex(rwy.RailwayError, "nothing was sent again"):
+            api.deploy("svc", PROD_ENV, COMMIT)
+        self.assertEqual(self.railway.mutations(), ["deploy"])
+
+    def test_redeploy_answer_lost_is_reconciled(self) -> None:
+        """A rollback redeploy whose answer is lost returns the new deployment of the old commit, sent once."""
+        lost = {"done": False}
+
+        def http(request):
+            status, raw = self.railway(request)
+            if b"deploymentRedeploy" in request.data and not lost["done"]:
+                lost["done"] = True
+                return 503, b""
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        found = api.redeploy("d_old", "svc", PROD_ENV)
+        self.assertEqual(rwy.commit_of(found), OLD_COMMIT)
+        self.assertNotEqual(found["id"], "d_old")
+        self.assertEqual(self.railway.mutations(), ["redeploy"])
+
+    def test_deploy_reply_cut_off_is_reconciled(self) -> None:
+        """A reply cut off mid-body (IncompleteRead) after Railway started the deploy is adopted, sent once."""
+        import http.client
+
+        def http_cut(request):
+            status, raw = self.railway(request)
+            if b"serviceInstanceDeployV2" in request.data:
+                raise http.client.IncompleteRead(raw[:5])
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http_cut, sleep=lambda _: None)
+        self.assertEqual(api.deploy("svc", PROD_ENV, COMMIT), "new1")
+        self.assertEqual(self.railway.mutations(), ["deploy"])
+
+    def test_recovered_redeploy_keeps_its_id_when_the_last_read_fails(self) -> None:
+        """After a lost redeploy answer, the recovered id is returned even when reading it fails."""
+        state = {"lost": False}
+
+        def http(request):
+            if state["lost"] and b"query deployment(" in request.data:
+                return 500, b""
+            status, raw = self.railway(request)
+            if b"deploymentRedeploy" in request.data:
+                state["lost"] = True
+                return 503, b""
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None, attempts=1)
+        found = api.redeploy("d_old", "svc", PROD_ENV)
+        self.assertTrue(found["id"].startswith("re"))
+        self.assertEqual(self.railway.mutations(), ["redeploy"])
+
+    def test_reconcile_survives_a_failed_read(self) -> None:
+        """A list read that fails after a lost deploy answer uses one attempt; the next read adopts the deployment."""
+        state = {"lost": False, "failed_reads": 0}
+
+        def http(request):
+            if state["lost"] and b"query deployments(" in request.data and state["failed_reads"] < 1:
+                state["failed_reads"] += 1
+                return 500, b""
+            status, raw = self.railway(request)
+            if b"serviceInstanceDeployV2" in request.data:
+                state["lost"] = True
+                return 502, b""
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None, attempts=1)
+        self.assertEqual(api.deploy("svc", PROD_ENV, COMMIT), "new1")
+        self.assertEqual((state["failed_reads"], self.railway.mutations()), (1, ["deploy"]))
+
+    def test_redeploy_recovery_ignores_a_rebuild_of_the_same_commit(self) -> None:
+        """After a lost redeploy answer, a new deployment of the old commit with another image is not adopted."""
+
+        def http(request):
+            if b"deploymentRedeploy" in request.data:
+                self.railway.calls.append(("redeploy", {}, PROD_TOKEN))
+                rebuild = deployment("rebuild", PROD_ENV, OLD_COMMIT, image="sha256:other")
+                self.railway.deployments["rebuild"] = rebuild
+                return 504, b""
+            return self.railway(request)
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        with self.assertRaisesRegex(rwy.RailwayError, "lists no new deployment"):
+            api.redeploy("d_old", "svc", PROD_ENV)
+        self.assertEqual(self.railway.mutations(), ["redeploy"])
+
+    def test_redeploy_of_a_target_without_an_image_is_not_reconciled(self) -> None:
+        """A target whose image is unknown: a lost answer stops; no new deployment is adopted."""
+        self.railway.deployments["d_old"]["meta"]["imageDigest"] = ""
+
+        def http(request):
+            status, raw = self.railway(request)
+            if b"deploymentRedeploy" in request.data:
+                return 502, b""
+            return status, raw
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        with self.assertRaisesRegex(rwy.RailwayError, "nothing was sent again"):
+            api.redeploy("d_old", "svc", PROD_ENV)
+        self.assertEqual(self.railway.mutations(), ["redeploy"])
+
+    def test_cancel_is_sent_again_after_a_lost_answer(self) -> None:
+        """A cancel is safe to repeat: a 502 is tried again, so the deployment does not stay running."""
+        self.railway.deployments["new9"] = deployment("new9", PROD_ENV, COMMIT, "BUILDING")
+        answers = {"n": 0}
+
+        def http(request):
+            if b"deploymentCancel" in request.data and answers["n"] == 0:
+                answers["n"] += 1
+                return 502, b""
+            return self.railway(request)
+
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=http, sleep=lambda _: None)
+        api.cancel("new9")
+        self.assertEqual(self.railway.deployments["new9"]["status"], "REMOVED")
+
+    def test_reads_are_still_tried_again(self) -> None:
+        """A 502 on a read is tried again (only mutations are sent once)."""
+        answers = iter([(502, b""), (200, b'{"data": {"projectToken": {"projectId": "p", "environmentId": "e"}}}')])
+        api = rwy.RailwayApi(lambda: PROD_TOKEN, http=lambda _: next(answers), sleep=lambda _: None)
+        self.assertEqual(api.token_scope()["environmentId"], "e")
+
     def test_token_scope_guard(self) -> None:
         """A dev token in the prod slot is refused before any deploy."""
         wrong = rwy.RailwayApi(lambda: DEV_TOKEN, http=self.railway, sleep=lambda _: None)
@@ -503,12 +651,20 @@ class RailwayFlowTest(RailwayCase):
         self.assertNotIn(DEV_TOKEN, json.dumps(rr.read_record(self.dev, release_id)))
 
     def test_dev_verify_fails_on_auto_deploy_errors_or_wrong_version(self) -> None:
-        """Railway auto deploy on, an error log line, or a version that is not the commit fail dev verify."""
+        """Railway auto deploy on or unreadable, an error log line, or a version that is not the commit fail dev verify."""
         release_id = self._dev_record()
         self.railway.auto[DEV_ENV] = True
         self.assertEqual(self._verify(release_id), rv.EXIT_FAILED)
         self.assertIn("auto deploy is ON", " ".join(rr.read_record(self.dev, release_id)["verdict"]["reasons"]))
         self.railway.auto[DEV_ENV] = False
+        real_auto = rwy.RailwayApi.auto_deploy
+        with mock.patch.object(rwy.RailwayApi, "auto_deploy", side_effect=rwy.RailwayError("Not Authorized")):
+            self.assertEqual(self._verify(release_id), rv.EXIT_FAILED)
+        self.assertIn("may be on", " ".join(rr.read_record(self.dev, release_id)["verdict"]["reasons"]))
+        self.assertIs(rwy.RailwayApi.auto_deploy, real_auto)
+        with mock.patch.object(rwy.RailwayApi, "auto_deploy", return_value={}):
+            self.assertEqual(self._verify(release_id), rv.EXIT_FAILED)
+        self.assertIn("it answered None", " ".join(rr.read_record(self.dev, release_id)["verdict"]["reasons"]))
         self.assertEqual(self._verify(release_id, b'{"version": "bbbbbbb"}'), rv.EXIT_FAILED)
         recent = datetime.now(rr.UTC) - timedelta(seconds=5)
         self.railway.logs["new1"] = [{"timestamp": iso(recent), "severity": "error", "message": "db.connect.failed"}]

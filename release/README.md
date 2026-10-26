@@ -359,6 +359,16 @@ chat, read +15/+60 results and retain ownership through recovery or escalation.
 The existing watch build performs server-side checks even while that agent is
 asleep. No generic automatic cross-provider chat delivery is claimed.
 
+A release that no agent claimed (a person merged it) is owned by its PR author:
+the watch records `followup.owner` `{"state": "author", "login", "pr"}` and posts
+nothing about it. The checks and the automatic rollback run as usual, and the
+watch ends green on a pass. Only an alert that already goes out for a failed or
+inconclusive +15/+60 check (or a check that could not run) mentions the author,
+resolved through the people map (`release_people.json`, or `RELEASE_PEOPLE_JSON`
+in public repositories); an author missing from the map gets the map's
+`fallback` people. A capacity verdict mentions nobody. A later agent claim
+replaces the author.
+
 A manual `check --phase window` before a checkpoint is due (an early check, or
 `--checkpoint-minutes` ahead of its due time) completes no checkpoint. Its result
 goes to `followup.early_checks` and the watch still runs every scheduled
@@ -598,6 +608,13 @@ Tier `check_rollback` names only `environments.prod` and `triggers.prod`.
 `railway` also takes `deploy_wait_minutes` (20) and `log_settle_seconds` (30).
 Every smoke URL must be under the prod URL (dev verify calls the same path on
 the dev URL).
+
+A deploy or redeploy is sent once. When its answer is lost (a timeout or a 5xx),
+the kit looks for the new deployment Railway lists and adopts it, or stops;
+it never sends the mutation again. A rollback adopts only a deployment of the
+target's image (a rebuild of the same commit is not the rollback); a cancel is
+sent again after a lost answer. Dev verify fails when Railway's auto deploy
+setting cannot be read.
 
 Credentials: one Railway project token per environment (scoped to that one
 environment) in Secret Manager, read into `RAILWAY_TOKEN_DEV` and

@@ -721,6 +721,39 @@ class SmokeTest(unittest.TestCase):
         bad = rr.snapshot_workloads(rr.Clients(env=PROD, runner=FakeCluster(waiting="CrashLoopBackOff")))
         self.assertIn("CrashLoopBackOff", " ".join(rv.check_images(_record(), bad).details))
 
+    def test_contains_text_deep_in_a_large_page(self) -> None:
+        """A title at byte 254,765 of an 840 KB page (developer.orbitsearch.com, 10-26) is found; past the read cap
+        the failure says how much of the body it read."""
+        page = b"<html><head><style>" + b"x" * 254_700 + b"</style><title>Orbit for Developers</title>" + b"y" * 585_000
+
+        class Response:
+            """A urlopen response that honors read(n)."""
+
+            status = 200
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def read(self, size: int = -1) -> bytes:
+                return self.body if size < 0 else self.body[:size]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> None:
+                return None
+
+        with mock.patch.object(urllib.request, "urlopen", return_value=Response(page)):
+            status, body = rv.http_get(urllib.request.Request("https://developer.example.com/"))
+        self.assertEqual(len(body), len(page))
+        self.assertTrue(rv._expect_ok(status, body, {"contains": "Orbit for Developers"})[0])
+        huge = b"z" * (rv.HTTP_READ_BYTES + 10) + b"Orbit for Developers"
+        with mock.patch.object(urllib.request, "urlopen", return_value=Response(huge)):
+            status, body = rv.http_get(urllib.request.Request("https://developer.example.com/"))
+        ok, line = rv._expect_ok(status, body, {"contains": "Orbit for Developers"})
+        self.assertFalse(ok)
+        self.assertIn(f"in its first {rv.HTTP_READ_BYTES} bytes", line)
+
     def test_service_smoke(self) -> None:
         """Service smoke."""
         clients = rr.Clients(env=PROD, runner=FakeCluster())
@@ -892,17 +925,17 @@ class VerdictTest(unittest.TestCase):
             outcome = rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock())
             return outcome, evaluate.call_count
 
-    def test_missing_owner_runs_health_but_final_followup_is_red(self):
+    def test_unclaimed_release_runs_both_checkpoints_and_the_author_owns_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(followup={})
             _save(store, record)
             outcome, count = self._run_owned_watch(store, record)
             self.assertEqual(count, 2)
-            self.assertEqual(outcome, rv.EXIT_FAILED)
+            self.assertEqual(outcome, rv.EXIT_OK)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["verdict"]["status"], "passed")
-            self.assertEqual(saved["followup"]["state"], "owner_missing")
+            self.assertEqual(saved["followup"]["state"], "author_owned")
 
     def test_resumed_watch_preserves_completed_15m_and_only_checks_60m(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -951,7 +984,7 @@ class VerdictTest(unittest.TestCase):
             self.assertEqual(outcome, rv.EXIT_FAILED)
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "pending")
 
-    def test_failed_deploy_rolls_back_even_without_an_owner_but_returns_red(self):
+    def test_failed_deploy_of_an_unclaimed_release_rolls_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(verdict={"status": "failed"}, followup={})
@@ -959,10 +992,10 @@ class VerdictTest(unittest.TestCase):
             with mock.patch.object(rv, "on_failure") as rollback:
                 outcome, count = self._run_owned_watch(store, record)
                 rollback.assert_called_once()
-            self.assertEqual((outcome, count), (rv.EXIT_FAILED, 0))
-            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["state"], "owner_missing")
+            self.assertEqual((outcome, count), (rv.EXIT_OK, 0))
+            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["state"], "author_owned")
 
-    def test_manual_final_health_pass_without_owner_is_red(self):
+    def test_manual_final_health_pass_of_an_unclaimed_release_is_green(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(followup={})
@@ -985,17 +1018,21 @@ class VerdictTest(unittest.TestCase):
                 mock.patch.object(rv, "print_result"),
                 mock.patch.object(rr, "post_slack", return_value=True),
             ):
-                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_FAILED)
+                self.assertEqual(rv.cmd_check(args, SERVICE, SERVICE.prod, store, mock.Mock()), rv.EXIT_OK)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["verdict"]["status"], "passed")
-            self.assertEqual(saved["followup"]["state"], "owner_missing")
+            self.assertEqual(saved["followup"]["state"], "author_owned")
 
-    def test_missing_owner_receipt_outage_cannot_grant_ownership(self):
+    def test_owner_receipt_outage_posts_nothing(self):
+        """The author owns an unclaimed release even when the record write fails; the alerts still mention them."""
         with (
             mock.patch.object(rr, "update_record", side_effect=rr.RecordError("GCS down")),
-            mock.patch.object(rr, "post_slack", return_value=True),
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            mock.patch.object(rv, "load_people", return_value=PEOPLE),
         ):
-            self.assertFalse(rv.require_owner(mock.Mock(), _record(followup={})))
+            self.assertTrue(rv.require_owner(mock.Mock(), _record(followup={})))
+            self.assertEqual(rv.owner_mentions(_record(followup={})), ["<@UJONNY>"])
+        slack.assert_not_called()
 
     def test_reverse_resume_cannot_erase_a_completed_60m_verdict(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2460,7 +2497,8 @@ class LightTest(unittest.TestCase):
                     mock.patch.object(rr, "post_slack", return_value=True),
                 ):
                     outcome = rl.cmd_watch(args, service, store, mock.Mock())
-                self.assertEqual(outcome, rv.EXIT_OK if owned else rv.EXIT_FAILED)
+                # An unclaimed release is owned by its PR author: green, like a claimed one.
+                self.assertEqual(outcome, rv.EXIT_OK)
                 self.assertEqual(evaluate.call_count, 1)
                 saved = rr.read_record(store, record["release_id"])
                 self.assertEqual(saved["followup"]["checkpoints"]["window_15m"]["completed_at"], "original")
@@ -5354,6 +5392,173 @@ class LateFailedReceiptAndRecoveryTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--failed-step") + 1], "")
         plain = rr.finish_recovery("gke", "demo", "prod", "r1", "deployed")
         self.assertNotIn("--failed-step", plain[0])
+
+
+PEOPLE = {"slack_ids": {"jonnybcw": "UJONNY"}, "fallback": ["UFALLBACK"]}
+
+
+class UnclaimedReleaseOwnerTest(unittest.TestCase):
+    """A release that no agent claimed (a person merged it): its PR author owns it, quietly.
+
+    _record()'s release commit is PR #12 by jonnybcw. Each test fails on the kit before the change."""
+
+    def _watch(self, store, record, *, people=PEOPLE, result=None, error=None):
+        """Run the GKE watch over +15 and +60; return (exit code, every Slack text)."""
+        args = argparse.Namespace(
+            release_id=record["release_id"],
+            checkpoints="15,60",
+            extend_minutes=15,
+            max_window_minutes=180,
+            retry_completed=False,
+        )
+        result = result or VerdictTest._result(self)
+        with (
+            mock.patch.object(rv, "load_people", return_value=people),
+            mock.patch.object(rv, "_datadog", return_value=(None, None)),
+            mock.patch.object(rv, "_token", return_value=None),
+            mock.patch.object(rv.rs, "CloudLogging"),
+            mock.patch.object(rv, "GoogleApi"),
+            mock.patch.object(rv, "wait_until_settled", return_value=None),
+            mock.patch.object(rv, "prod_state", return_value=(None, None)),
+            mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+            mock.patch.object(rv, "evaluate", side_effect=error, return_value=result),
+            mock.patch.object(rv, "print_result"),
+            mock.patch.object(rv, "on_failure"),
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+        ):
+            outcome = rv.cmd_watch(args, SERVICE, SERVICE.prod, store, mock.Mock())
+        return outcome, [" ".join(str(part) for part in call.args) for call in slack.call_args_list]
+
+    def test_unclaimed_release_that_passes_posts_nothing_and_the_author_owns_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, posts = self._watch(store, record)
+            self.assertEqual(outcome, rv.EXIT_OK)
+            self.assertFalse([text for text in posts if "owner" in text], posts)
+            self.assertFalse([text for text in posts if "<@" in text], posts)
+            owner = rr.read_record(store, record["release_id"])["followup"]["owner"]
+            self.assertEqual((owner["state"], owner["login"]), ("author", "jonnybcw"))
+            self.assertEqual(owner["pr"], 12)
+
+    def test_unclaimed_release_that_fails_mentions_the_author_in_the_failure_alert(self) -> None:
+        failed = VerdictTest._result(
+            self, result="failed", regressions=[{"kind": "metric", "text": "error rate regressed"}]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._watch(store, record, result=failed)
+            alerts = [text for text in posts if "FAILED" in text]
+            self.assertTrue(alerts, posts)
+            self.assertIn("<@UJONNY>", alerts[0])
+        # Inconclusive: the last checkpoint could not run.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._watch(store, record, error=rr.RecordError("cluster unavailable"))
+            alerts = [text for text in posts if "could not run" in text]
+            self.assertTrue(alerts, posts)
+            self.assertIn("<@UJONNY>", alerts[-1])
+
+    def test_an_agent_claim_is_unchanged(self) -> None:
+        failed = VerdictTest._result(
+            self, result="failed", regressions=[{"kind": "metric", "text": "error rate regressed"}]
+        )
+        for result in (None, failed):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                record = _record()
+                claimed = dict(record["followup"]["owner"])
+                _save(store, record)
+                outcome, posts = self._watch(store, record, result=result)
+                self.assertEqual(outcome, rv.EXIT_OK)
+                self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["owner"], claimed)
+                self.assertFalse([text for text in posts if "<@UJONNY>" in text or "owner" in text], posts)
+
+    def test_an_author_missing_from_the_map_falls_back_and_stays_quiet_on_success(self) -> None:
+        people = {"slack_ids": {"someone-else": "UELSE"}, "fallback": ["UFALLBACK"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, posts = self._watch(store, record, people=people)
+            self.assertEqual(outcome, rv.EXIT_OK)
+            self.assertFalse([text for text in posts if "owner" in text or "<@" in text], posts)
+            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["owner"]["login"], "jonnybcw")
+        failed = VerdictTest._result(
+            self, result="failed", regressions=[{"kind": "metric", "text": "error rate regressed"}]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._watch(store, record, people=people, result=failed)
+            self.assertIn("<@UFALLBACK>", [text for text in posts if "FAILED" in text][0])
+
+    def test_the_author_is_the_newest_pr_not_a_later_direct_commit(self) -> None:
+        """A direct or automated commit after the PR never takes ownership from the PR's author."""
+        record = _record(commit="d" * 40)
+        record["commits"] = [
+            {"sha": "c" * 40, "title": "Fix the parser (#12)", "pr": 12, "author": "jonnybcw"},
+            {"sha": "d" * 40, "title": "chore: bump", "pr": None, "author": "renovate-bot"},
+        ]
+        self.assertEqual(rv.ro.release_author(record), ("jonnybcw", 12))
+        record["commits"] = [{"sha": "d" * 40, "title": "hotfix", "pr": None, "author": "someone"}]
+        self.assertEqual(rv.ro.release_author(record), ("someone", None))
+
+    def test_an_alert_rereads_the_owner_after_a_late_agent_claim(self) -> None:
+        """An agent claims the release while the watch sleeps: the alert mentions nobody."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            stale = _record(followup={})
+            _save(store, stale)
+            rr.update_record(
+                store,
+                stale["release_id"],
+                lambda current: rv.ro.claim_owner(current, "codex://threads/late", "https://github.com/o/r/pull/12"),
+                "claimed",
+            )
+            with mock.patch.object(rv, "load_people", return_value=PEOPLE):
+                self.assertEqual(rv.owner_suffix(stale), " <@UJONNY>")
+                self.assertEqual(rv.owner_suffix(stale, store), "")
+
+    def _light_watch(self, store, record, *, error=None):
+        """Run the Cloud Run watch over +60; return (exit code, every Slack text)."""
+        service = rl.parse_light(light_data("cloud_run"))
+        args = argparse.Namespace(release_id=record["release_id"], checkpoints="60", retry_completed=False)
+        clean = {"problems": [], "parts": {"logs": {"status": "checked"}}, "scope": {}}
+        with (
+            mock.patch.object(rv, "load_people", return_value=PEOPLE),
+            mock.patch.object(rv, "builds_since_rollback", return_value=[]),
+            mock.patch.object(rl, "wait_for_deploys", return_value=None),
+            mock.patch.object(rl, "replaced_by", return_value=None),
+            mock.patch.object(rl, "evaluate_window", side_effect=error, return_value=clean),
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+        ):
+            outcome = rl.cmd_watch(args, service, store, mock.Mock())
+        return outcome, [" ".join(str(part) for part in call.args) for call in slack.call_args_list]
+
+    def test_light_unclaimed_release_passes_quietly_and_mentions_the_author_when_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, posts = self._light_watch(store, record)
+            self.assertEqual(outcome, rv.EXIT_OK)
+            self.assertFalse([text for text in posts if "owner" in text or "<@" in text], posts)
+            self.assertEqual(rr.read_record(store, record["release_id"])["followup"]["owner"]["state"], "author")
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._light_watch(store, record, error=rr.RecordError("logging unavailable"))
+            alerts = [text for text in posts if "inconclusive" in text]
+            self.assertTrue(alerts, posts)
+            self.assertIn("<@UJONNY>", alerts[-1])
 
 
 if __name__ == "__main__":
