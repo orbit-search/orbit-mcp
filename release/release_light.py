@@ -1785,22 +1785,26 @@ def railway_dev_checks(
         problems.append(f"{label} serves {(live or {}).get('id') or 'nothing'}, not {deployment_id} (a newer deploy?)")
     checks = [rv.Check("deployment", "failed" if problems else "passed", [rwy.describe(deployment), *problems])]
     try:
-        auto = api.auto_deploy(service.railway_project_id, service.railway_service_id, env_id)
-        on = bool(auto.get("enabled"))
+        enabled = api.auto_deploy(service.railway_project_id, service.railway_service_id, env_id).get("enabled")
+        if enabled is True:
+            line = (
+                f"Railway auto deploy is ON in {label}: Railway deploys {service.release_branch} by itself, around "
+                "the release kit. Turn it off (Service > Settings > Source)."
+            )
+        elif enabled is False:
+            line = f"Railway auto deploy is off in {label}"
+        else:
+            line = f"cannot read Railway's auto deploy setting in {label} (it answered {enabled!r}), so it may be on"
+        checks.append(rv.Check("auto_deploy", "passed" if enabled is False else "failed", [line]))
+    except (rr.RecordError, GuardError) as error:
+        # Unread is not off: the commit stays unverified until Railway confirms that it cannot deploy by itself.
         checks.append(
             rv.Check(
                 "auto_deploy",
-                "failed" if on else "passed",
-                [
-                    f"Railway auto deploy is ON in {label}: Railway deploys {service.release_branch} by itself, around "
-                    "the release kit. Turn it off (Service > Settings > Source)."
-                    if on
-                    else f"Railway auto deploy is off in {label}"
-                ],
+                "failed",
+                [f"cannot read Railway's auto deploy setting in {label}, so it may be on: {str(error)[:200]}"],
             )
         )
-    except (rr.RecordError, GuardError) as error:
-        checks.append(rv.Check("auto_deploy", "skipped", [f"cannot read: {str(error)[:200]}"]))
     started = datetime.now(rr.UTC)
     checks += [rv.check_http_public(check, get or rv.http_get) for check in dev_smoke(service)]
     version = check_railway_version(service, "dev", record["commit"], get, sleep or time.sleep)
@@ -2140,7 +2144,7 @@ def railway_rollback(service: LightService, api: rwy.RailwayApi, target: str, ta
     rwy.check_token_scope(api, service.railway_project_id, env_id, "prod")
     old = api.deployment(target)
     if old.get("canRedeploy"):
-        new_id = str(api.redeploy(target).get("id") or "")
+        new_id = str(api.redeploy(target, service.railway_service_id, env_id).get("id") or "")
     else:
         commit = rwy.commit_of(old) or str(target_commit or "")
         print(f"{target} can no longer be redeployed; rebuilding its commit {commit[:9]}", flush=True)
@@ -3080,7 +3084,7 @@ def finish_inconclusive(service: LightService, store: rr.Store, record: dict, ke
     rr.post_slack(
         f":grey_question: {service.title} release-verify {record['commit'][:9]} inconclusive: the last checkpoint "
         f"could not run ({why[:200]}). Check the release by hand. "
-        f"Record {store.location(rr.record_name(record['release_id']))}"
+        f"Record {store.location(rr.record_name(record['release_id']))}{rv.owner_suffix(record, store)}"
     )
 
 
@@ -3154,7 +3158,9 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 if history:
                     reason = f"another build changed prod during this observation: {history[0]}"
                     rv._record_checkpoint_error(store, record, minutes, reason, final=True)
-                    rr.post_slack(f":warning: {service.title} release-verify unchecked: {reason}")
+                    rr.post_slack(
+                        f":warning: {service.title} release-verify unchecked: {reason}{rv.owner_suffix(record, store)}"
+                    )
                     return rv.EXIT_FAILED
                 break
             if new_errors is None:
@@ -3164,6 +3170,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             rv._record_checkpoint_error(store, record, minutes, str(error), final=last)
             rr.post_slack(
                 f":warning: {service.title} +{minutes} min checkpoint inconclusive: could not run: {str(error)[:200]}"
+                f"{rv.owner_suffix(record, store)}"
             )
             if last:
                 return rv.EXIT_FAILED
@@ -3248,6 +3255,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
             rr.post_slack(
                 f"{icon} {service.title} release-verify {record['commit'][:9]} {status}. "
                 f"Record {store.location(rr.record_name(record['release_id']))}"
+                f"{'' if checked else rv.owner_suffix(final, store)}"
             )
     current = rr.read_record(store, record["release_id"])
     return (

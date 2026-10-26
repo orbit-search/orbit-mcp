@@ -155,6 +155,31 @@ def owned(record: dict) -> bool:
     return bool(str(owner.get("thread_url") or "").strip() and str(owner.get("pr_url") or "").strip())
 
 
+def author_owned(record: dict) -> bool:
+    """No agent claimed the release, and its PR author was recorded as the owner (release_verify.require_owner)."""
+    return ((record.get("followup") or {}).get("owner") or {}).get("state") == "author"
+
+
+def release_author(record: dict) -> tuple[str | None, int | None]:
+    """The GitHub login and PR number of the change the release deploys: its commit's PR, else the newest PR.
+
+    A commit without a PR (a direct or automated push) never wins over a PR; its author is used only when the
+    release holds no PR at all."""
+    commits = [item for item in record.get("commits") or [] if isinstance(item, dict) and item.get("author")]
+    with_pr = [item for item in commits if item.get("pr")]
+    head = [item for item in with_pr if item.get("sha") == record.get("commit")]
+    newest = list(reversed(with_pr))
+    direct = [item for item in commits if item.get("sha") == record.get("commit")] + list(reversed(commits))
+    chosen = (head or newest or direct or [{}])[0]
+    return chosen.get("author"), chosen.get("pr")
+
+
+def author_owner(record: dict) -> dict:
+    """The owner of a release that no agent claimed: the author of its PR."""
+    login, pr = release_author(record)
+    return {"state": "author", "login": login, "pr": pr, "assigned_at": utc_now()}
+
+
 def scheduled_minute(record: dict, elapsed: float, requested: int | None = None) -> int | None:
     """The scheduled checkpoint a manual check completes: the latest one that is due, else None.
 

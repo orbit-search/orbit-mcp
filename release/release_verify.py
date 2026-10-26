@@ -941,8 +941,10 @@ def check_images(
 HttpGet = Callable[[urllib.request.Request], tuple[int, bytes]]
 
 
-# A page's <title> can sit past the first 4 KiB of a server-rendered page (orbitsearch.com/search: byte 4,461).
-HTTP_READ_BYTES = 65536
+# A smoke check's `contains` text is searched in the first HTTP_READ_BYTES of the body. A page's <title> can sit far
+# into a server-rendered page: orbitsearch.com/search at byte 4,461; developer.orbitsearch.com (Next.js with large
+# inline styles in <head>) at byte 254,765 of 840 KB on 10-26, which failed api-landing's first dev verify at 64 KiB.
+HTTP_READ_BYTES = 4 * 1024 * 1024
 
 
 def http_get(request: urllib.request.Request, context: ssl.SSLContext | None = None) -> tuple[int, bytes]:
@@ -998,7 +1000,8 @@ def _expect_ok(status: int, body: bytes, check: dict) -> tuple[bool, str]:
         return False, f"HTTP {status} (expected {', '.join(str(code) for code in expected)}): {text[:120]!r}"
     if contains := check.get("contains"):
         if contains not in text:
-            return False, f"HTTP {status}, the body has no {contains!r}: {text[:120]!r}"
+            where = f" in its first {len(body)} bytes" if len(body) >= HTTP_READ_BYTES else ""
+            return False, f"HTTP {status}, the body has no {contains!r}{where}: {text[:120]!r}"
     if expect_json := check.get("expect_json"):
         try:
             payload = json.loads(text)
@@ -1951,6 +1954,7 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
         return (
             f":rotating_light: {title} release-verify {short} FAILED ({result['phase']}): {first[:300]} "
             f"Rollback target {(target or 'unknown')[:9]}; {follow}.{inconclusive_parts(result)} Record {where}"
+            f"{owner_suffix(record, store)}"
         )
     if status == "passed":
         judged = f" ({result['judged']:,.0f} samples judged)" if result.get("judged") else ""
@@ -1964,7 +1968,7 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
             )
         return (
             f":grey_question: {title} release-verify {short} inconclusive: {str(verdict.get('reason'))[:160]}."
-            f"{inconclusive_parts(result)} Record {where}"
+            f"{inconclusive_parts(result)} Record {where}{owner_suffix(record, store)}"
         )
     if result["phase"] == "deploy":
         minutes = " and ".join(f"+{value}" for value in service.checkpoints)
@@ -2052,23 +2056,50 @@ def _pod_get(clients: rr.Clients, env: rc.Environment) -> PodGet | None:
 
 
 def require_owner(store: rr.Store, record: dict) -> bool:
-    """Missing ownership stays red even when the bookkeeping write is unavailable."""
-    if ro.owned(record):
-        return True
-    claimed = [False]
+    """Every prod release has an owner for +15/+60 recovery: the agent that claimed it, else its PR author.
 
-    def missing(current):
-        claimed[0] = ro.owned(current)
-        if not claimed[0]:
-            current.setdefault("followup", {}).update(state="owner_missing")
+    A release that no agent claimed (a person merged it) gets its PR author as the owner, quietly: the checks
+    and the automatic rollback run as usual, and only a failed or inconclusive check's alert mentions the
+    author (owner_mentions). An agent claim is unchanged; a later claim replaces the author."""
+    if ro.owned(record) or ro.author_owned(record):
+        return True
+
+    def assign(current: dict) -> None:
+        """Record the PR author as the owner, unless an agent claimed the release meanwhile."""
+        if not (ro.owned(current) or ro.author_owned(current)):
+            followup = current.setdefault("followup", {})
+            followup["owner"] = ro.author_owner(current)
+            followup["state"] = "author_owned"
 
     try:
-        rr.update_record(store, record["release_id"], missing, "followup_owner_missing")
-    except (rr.RecordError, GuardError, OSError):
-        pass
-    if not claimed[0]:
-        rr.post_slack(f":warning: release {record['release_id']} has no deploying-agent owner for +15/+60 recovery")
-    return claimed[0]
+        rr.update_record(store, record["release_id"], assign, "followup_owner_author")
+    except (rr.RecordError, GuardError, OSError) as error:
+        print(f"WARNING: could not record the PR author as the owner: {error}", file=sys.stderr, flush=True)
+    return True
+
+
+def owner_mentions(record: dict, people: dict | None = None) -> list[str]:
+    """Slack mentions of the owner of a release that no agent claimed: its PR author, else the fallback people.
+
+    An agent-claimed release mentions nobody here (its agent follows the checks itself)."""
+    if ro.owned(record):
+        return []
+    owner = (record.get("followup") or {}).get("owner") or {}
+    login = owner.get("login") if ro.author_owned(record) else ro.release_author(record)[0]
+    return _mentions(people or load_people(), [{"author": login}])
+
+
+def owner_suffix(record: dict, store: rr.Store | None = None) -> str:
+    """The mention suffix (" <@author>") for a failed or inconclusive alert of a release no agent claimed, else "".
+
+    With a store, the record is read again first: an agent may have claimed the release while the watch slept."""
+    if store is not None:
+        try:
+            record = rr.read_record(store, record["release_id"])
+        except (rr.RecordError, GuardError, OSError, KeyError) as error:
+            print(f"WARNING: could not read the owner again: {error}", file=sys.stderr, flush=True)
+    mentions = owner_mentions(record)
+    return f" {' '.join(mentions)}" if mentions else ""
 
 
 def cmd_check(
@@ -2643,7 +2674,10 @@ def rollback_alert(
     """
     people = load_people()
     suspects = likely_prs(record)
-    who = " ".join(_mentions(people, suspects)) or "Someone"
+    mentions = _mentions(people, suspects)
+    # A release that no agent claimed: its PR author owns it, so the alert mentions the author too.
+    mentions += [mention for mention in owner_mentions(record, people) if mention not in mentions]
+    who = " ".join(mentions) or "Someone"
     verdict = record.get("verdict") or {}
     short = record["commit"][:9]
     target = ((record.get("rollback_suggestion") or {}).get("target") or {}).get("commit") or "unknown"
@@ -2887,7 +2921,9 @@ def cmd_watch(
             if history:
                 reason = f"another build changed prod during this release's observation: {history[0]}"
                 _record_checkpoint_error(store, record, minutes, reason, final=True)
-                rr.post_slack(f":warning: release-verify {record['release_id']} unchecked: {reason}")
+                rr.post_slack(
+                    f":warning: release-verify {record['release_id']} unchecked: {reason}{owner_suffix(record, store)}"
+                )
                 return EXIT_FAILED
             extend = (
                 dd is not None
@@ -2930,7 +2966,7 @@ def cmd_watch(
             _record_checkpoint_error(store, record, minutes, str(error), final=last)
             rr.post_slack(
                 f":warning: {service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
-                f"{str(error)[:200]}"
+                f"{str(error)[:200]}{owner_suffix(record, store)}"
             )
             if last:
                 return EXIT_FAILED  # a failed receipt write cannot make a failed checker green
@@ -2942,14 +2978,14 @@ def cmd_watch(
             return (
                 EXIT_FAILED
                 if saved["verdict"]["status"] == "inconclusive"
-                or not ro.owned(rr.read_record(store, record["release_id"]))
+                or not require_owner(store, rr.read_record(store, record["release_id"]))
                 else EXIT_OK
             )
     final_record = rr.read_record(store, record["release_id"])
     return (
         EXIT_FAILED
         if (final_record.get("verdict") or {}).get("status") not in ("passed", "warning", "failed")
-        or not ro.owned(final_record)
+        or not require_owner(store, final_record)
         else EXIT_OK
     )
 

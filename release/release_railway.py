@@ -35,6 +35,7 @@ Part of the release kit (orbit-infrastructure/release-kit). Stdlib only (Python 
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -73,6 +74,16 @@ DEPLOYMENT_PAGES = 10
 
 class RailwayError(rr.RecordError):
     """A Railway call failed, or a deployment is not what the release needs."""
+
+
+class RailwayUncertain(RailwayError):
+    """A mutation got no answer (a timeout, a dropped connection, a 5xx): Railway may have run it."""
+
+
+# After a deploy or redeploy whose outcome is unknown, the kit looks this many times (RECONCILE_SECONDS apart) for
+# the deployment it may have started, instead of sending the mutation again.
+RECONCILE_TRIES = 4
+RECONCILE_SECONDS = 10
 
 
 Http = Callable[[urllib.request.Request], tuple[int, bytes]]
@@ -134,10 +145,14 @@ class RailwayApi:
         self.sleep = sleep
         self.attempts = attempts
 
-    def call(self, query: str, variables: dict | None = None) -> dict:
+    def call(self, query: str, variables: dict | None = None, *, resend: bool = False) -> dict:
         """Run one query or mutation and return its data; raise RailwayError on an HTTP or GraphQL error."""
         body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
         name = query.split("(", 1)[0].split("{", 1)[0].strip() or "query"
+        # A mutation is sent once: after a timeout or a 5xx Railway may have run it, and a second send can start a
+        # second deployment. Only a 429 (refused before it ran) is sent again. Reads are tried again on all three.
+        # resend: a mutation that is safe to send twice (a cancel) keeps the read retries.
+        mutation = query.lstrip().startswith("mutation") and not resend
         for attempt in range(1, self.attempts + 1):
             request = urllib.request.Request(
                 API,
@@ -147,11 +162,16 @@ class RailwayApi:
             )
             try:
                 status, raw = self.http(request)
-            except (urllib.error.URLError, TimeoutError, OSError) as error:
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+                # HTTPException: a reply cut off mid-body (IncompleteRead) after Railway may have run it.
+                if mutation:
+                    raise RailwayUncertain(f"Railway {name} got no answer ({error}); it may have run") from None
                 if attempt == self.attempts:
                     raise RailwayError(f"Railway {name} failed: {error}") from None
                 self.sleep(2**attempt)
                 continue
+            if mutation and status >= 500:
+                raise RailwayUncertain(f"Railway {name} returned HTTP {status}; it may have run")
             if (status == 429 or status >= 500) and attempt < self.attempts:
                 self.sleep(2**attempt)
                 continue
@@ -173,13 +193,59 @@ class RailwayApi:
             self.call("query projectToken { projectToken { projectId environmentId } }").get("projectToken") or {}
         )
 
+    def known_ids(self, service_id: str, environment_id: str) -> set[str]:
+        """The ids of the service's deployments Railway lists in the environment now (newest page)."""
+        listed, _ = self.deployments(service_id, environment_id)
+        return {str(item.get("id")) for item in listed}
+
+    def reconcile(
+        self,
+        service_id: str,
+        environment_id: str,
+        before: set[str],
+        match: Callable[[dict], bool],
+        what: str,
+        error: RailwayError,
+    ) -> str:
+        """After a mutation with an unknown outcome: the id of the one new deployment that matches, else raise."""
+        unread = ""
+        for attempt in range(RECONCILE_TRIES):
+            try:
+                listed, _ = self.deployments(service_id, environment_id)
+            except RailwayError as read_error:
+                # A failed read uses up one attempt, not the reconcile: the next read may answer.
+                unread = f"; the last read failed: {str(read_error)[:160]}"
+                if attempt < RECONCILE_TRIES - 1:
+                    self.sleep(RECONCILE_SECONDS)
+                continue
+            unread = ""
+            new = [d for d in listed if str(d.get("id")) not in before and match(d)]
+            if len(new) == 1:
+                print(f"Railway {what}: {error}; it did start deployment {new[0].get('id')}", flush=True)
+                return str(new[0].get("id"))
+            if len(new) > 1:
+                ids = ", ".join(str(d.get("id")) for d in new)
+                raise RailwayError(f"Railway {what}: {error}; several new deployments ({ids}); a human decides")
+            if attempt < RECONCILE_TRIES - 1:
+                self.sleep(RECONCILE_SECONDS)
+        raise RailwayError(f"Railway {what}: {error}; Railway lists no new deployment{unread}; nothing was sent again")
+
     def deploy(self, service_id: str, environment_id: str, commit: str) -> str:
-        """Build and deploy one commit of the service's GitHub repository to an environment; the deployment id."""
-        data = self.call(
-            "mutation deploy($s: String!, $e: String!, $c: String!) "
-            "{ serviceInstanceDeployV2(serviceId: $s, environmentId: $e, commitSha: $c) }",
-            {"s": service_id, "e": environment_id, "c": commit},
-        )
+        """Build and deploy one commit of the service's GitHub repository to an environment; the deployment id.
+
+        Sent once. When the answer is lost, the new deployment of the commit that Railway lists is the result.
+        """
+        before = self.known_ids(service_id, environment_id)
+        try:
+            data = self.call(
+                "mutation deploy($s: String!, $e: String!, $c: String!) "
+                "{ serviceInstanceDeployV2(serviceId: $s, environmentId: $e, commitSha: $c) }",
+                {"s": service_id, "e": environment_id, "c": commit},
+            )
+        except RailwayUncertain as error:
+            return self.reconcile(
+                service_id, environment_id, before, lambda d: commit_of(d) == commit, f"deploy of {commit[:9]}", error
+            )
         found = str(data.get("serviceInstanceDeployV2") or "")
         if not found:
             raise RailwayError(f"Railway started no deployment of {commit[:9]}")
@@ -234,7 +300,8 @@ class RailwayApi:
 
     def cancel(self, deployment_id: str) -> None:
         """Cancel a deployment that still builds or deploys (the kit's own, after its wait ran out)."""
-        self.call("mutation cancel($id: String!) { deploymentCancel(id: $id) }", {"id": deployment_id})
+        # Sent again after a lost answer: cancelling twice is harmless, and a lost cancel must not leave it running.
+        self.call("mutation cancel($id: String!) { deploymentCancel(id: $id) }", {"id": deployment_id}, resend=True)
 
     def active(self, service_id: str, environment_id: str) -> list[dict]:
         """The deployments that serve the environment now (Railway's activeDeployments)."""
@@ -254,13 +321,38 @@ class RailwayApi:
         )
         return dict(data.get("serviceInstanceAutoDeployStatus") or {})
 
-    def redeploy(self, deployment_id: str) -> dict:
-        """A new deployment from an earlier one with its image (no rebuild) and the current variables."""
-        data = self.call(
-            "mutation redeploy($id: String!) { deploymentRedeploy(id: $id, usePreviousImageTag: true) "
-            f"{{ {DEPLOYMENT_FIELDS} }} }}",
-            {"id": deployment_id},
-        )
+    def redeploy(self, deployment_id: str, service_id: str = "", environment_id: str = "") -> dict:
+        """A new deployment from an earlier one with its image (no rebuild) and the current variables.
+
+        Sent once. With the service and environment, a lost answer is reconciled: the one new deployment that runs
+        the earlier one's image is the result (a rebuild of the same commit has another image and is not adopted).
+        A target without a known image is never reconciled: nothing else proves which deployment is the rollback.
+        """
+        before = self.known_ids(service_id, environment_id) if service_id and environment_id else None
+        # Read before the mutation: after a lost answer the reconcile must not depend on another read of it.
+        image = image_of(self.deployment(deployment_id)) if before is not None else ""
+        try:
+            data = self.call(
+                "mutation redeploy($id: String!) { deploymentRedeploy(id: $id, usePreviousImageTag: true) "
+                f"{{ {DEPLOYMENT_FIELDS} }} }}",
+                {"id": deployment_id},
+            )
+        except RailwayUncertain as error:
+            if before is None or not image:
+                raise RailwayError(f"Railway redeploy of {deployment_id}: {error}; nothing was sent again") from None
+            found = self.reconcile(
+                service_id,
+                environment_id,
+                before,
+                lambda d: image_of(d) == image,
+                f"redeploy of {deployment_id}",
+                error,
+            )
+            try:
+                return self.deployment(found)
+            except RailwayError:
+                # The id is enough: the caller waits for it, or cancels it.
+                return {"id": found}
         found = data.get("deploymentRedeploy")
         if not found:
             raise RailwayError(f"Railway did not redeploy {deployment_id}")
