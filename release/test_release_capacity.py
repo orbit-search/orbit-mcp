@@ -871,9 +871,13 @@ class ReleaseCaseTest(unittest.TestCase):
         self.assertEqual((saved["verdict"]["status"], saved["verdict"]["cause"]), ("inconclusive", "capacity"))
         self.assertIsNone(saved["rollback_suggestion"])
         with tempfile.TemporaryDirectory() as tmp:
-            line = rv.slack_line(ORBIT_API, saved, result, rr.LocalStore(Path(tmp)))
+            store = rr.LocalStore(Path(tmp))
+            line = rv.result_detail(ORBIT_API, saved, result, store)
+            with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+                rv.post_result(ORBIT_API, store, saved, result)
         self.assertIn("no rollback", line)
-        self.assertNotIn("<@", line)
+        # Capacity is environmental: a warning line that mentions nobody.
+        self.assertEqual(slack.call_args[0][0], rr.status_line("warning", ORBIT_API.name))
 
     def test_the_capacity_wait_counts_the_first_wait(self) -> None:
         """Greptile #499: the first wait took 10 min, so the capacity wait gets what is left of 2 x 1,020 s."""

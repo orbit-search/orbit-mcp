@@ -777,8 +777,8 @@ steps:
                 TEXT=":x: {title} dev release record failed for $SHORT_SHA; verification and promotion stopped"
               fi
               if [ -n "$${{TEXT}}" ]; then
-                PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({{"text": sys.argv[1]}}))' "$${{TEXT}}")"
-                curl -s -X POST -H 'Content-type: application/json' --data "$${{PAYLOAD}}" "$$WEBHOOK_ORBIT" || true
+                # Slack gets the status line; the reason stays in this build log.
+                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT" || true
                 echo "$${{TEXT}}" >&2
                 exit 1
               fi
@@ -900,8 +900,12 @@ PROD_DEPLOY_STEPS = """\
               else
                 TEXT=":white_check_mark: {title} prod deploy completed for commit \\`$SHORT_SHA\\`"
               fi
-              PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({{"text": sys.argv[1]}}))' "$${{TEXT}}")"
-              curl -s -X POST -H 'Content-type: application/json' --data "$${{PAYLOAD}}" "$$WEBHOOK_ORBIT"
+              echo "$${{TEXT}}"
+              # Slack gets a status line only when no other step posts this moment: a failed deploy or an
+              # unchecked prod. A failed check posted its down line; the promote said deploying; the watch says up.
+              if [ -f /workspace/deploy_failed ] || [ -f /workspace/release_verify_unchecked ]; then
+                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_warning}"}}' "$$WEBHOOK_ORBIT"
+              fi
               if [ -f /workspace/deploy_failed ]; then exit 1; fi
 
     - name: "gcr.io/cloud-builders/gcloud"
@@ -988,9 +992,8 @@ steps:
               if [ -n "$${{BUILDER_OUTPUT:-}}" ]; then
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
-              curl -s -X POST -H 'Content-type: application/json' \\
-                --data '{{"text":":x: {title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, or dev verify not passed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>"}}' \\
-                "$$WEBHOOK_ORBIT"
+              echo '{title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, or dev verify not passed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>'
+              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
     # Still current: right before the deploy, no newer prod build exists and no older build or rollback started.
@@ -1077,9 +1080,8 @@ steps:
               if [ -n "$${{BUILDER_OUTPUT:-}}" ]; then
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
-              curl -s -X POST -H 'Content-type: application/json' \\
-                --data '{{"text":":x: {title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, or the single-flight or gate step failed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the deploy build>"}}' \\
-                "$$WEBHOOK_ORBIT"
+              echo '{title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, or the single-flight or gate step failed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the deploy build>'
+              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
 """
@@ -1227,6 +1229,9 @@ def rendered(service: object) -> dict[str, str]:
         "wait_minutes": wait,
         "wait_seconds": (wait + 5) * 60,
         "build_seconds": (wait + 70) * 60,
+        # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
+        "line_on_hold": rr.status_line("on hold", service.name),  # type: ignore[attr-defined]
+        "line_warning": rr.status_line("warning", service.name),  # type: ignore[attr-defined]
     }
     prod = secrets(service, ["prod"])
     files = {

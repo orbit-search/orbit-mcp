@@ -514,10 +514,13 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
         if not decision.go:
             _note_promote(stores, args.commit, {"status": decision.status, "reason": decision.reason})
             if decision.status in ("frozen", "held"):
-                icon = ":no_entry_sign:" if decision.status == "frozen" else ":pause_button:"
-                rr.post_slack(
-                    f"{icon} {title} dev verify passed for {short}; prod promote {decision.status}: "
-                    f"{decision.reason}. To resume: {decision.resume_hint}."
+                rr.post_status(
+                    "on hold",
+                    service.name,
+                    detail=(
+                        f"{title} dev verify passed for {short}; prod promote {decision.status}: "
+                        f"{decision.reason}. To resume: {decision.resume_hint}."
+                    ),
                 )
             return EXIT_GO
         if decision.fix_seen and not args.dry_run:
@@ -525,21 +528,33 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
         build_id = start_prod_build(service, args.commit, args.build_id, dry_run=args.dry_run)
         if args.dry_run:
             # A test run of the dev build: say what would happen, record nothing.
-            rr.post_slack(
-                f":test_tube: TEST RUN, nothing is wrong. {title} dev verify passed for {short}; the gate says go "
-                f"({decision.reason}), and a real merge would start the prod promote now. Nothing was promoted."
+            rr.post_status(
+                "up",
+                service.name,
+                detail=(
+                    f"TEST RUN, nothing is wrong. {title} dev verify passed for {short}; the gate says go "
+                    f"({decision.reason}), and a real merge would start the prod promote now. Nothing was promoted."
+                ),
             )
             return EXIT_GO
         _note_promote(stores, args.commit, {"status": "started", "build_id": build_id, "at": rr.utc_now()})
-        rr.post_slack(
-            f":arrow_double_up: {title} dev verify passed for {short}; prod promote started "
-            f"(<{_build_url(service, build_id)}|prod build>). {decision.reason}."
+        rr.post_status(
+            "deploying",
+            service.name,
+            detail=(
+                f"{title} dev verify passed for {short}; prod promote started "
+                f"({_build_url(service, build_id)}). {decision.reason}."
+            ),
         )
     except Exception as error:  # noqa: BLE001 - a failure here must reach a human, not end the dev build red
         print(f"WARNING: the prod promote did not start: {error}", file=sys.stderr, flush=True)
-        rr.post_slack(
-            f":x: {title} dev verify passed for {short}, but the prod promote did not start: {str(error)[:200]}. "
-            f"Start it by hand: {service.kit_command('release_gate.py', 'promote')} --commit {args.commit}"
+        rr.post_status(
+            "warning",
+            service.name,
+            detail=(
+                f"{title} dev verify passed for {short}, but the prod promote did not start: {str(error)[:200]}. "
+                f"Start it by hand: {service.kit_command('release_gate.py', 'promote')} --commit {args.commit}"
+            ),
         )
     return EXIT_GO
 
@@ -722,8 +737,10 @@ def cmd_freeze(args: argparse.Namespace, stores: Stores, frozen: bool) -> int:
     state = {"frozen": frozen, "by": _who(args), "reason": args.reason, "at": rr.utc_now()}
     rr.update_object(stores.prod, FREEZE_OBJECT, lambda _: state)
     word = "frozen" if frozen else "unfrozen"
-    rr.post_slack(
-        f":ice_cube: {stores.service.title} automatic prod deploys {word} by {state['by']}: {args.reason[:200]}"
+    rr.post_status(
+        "on hold" if frozen else "up",
+        stores.service.name,
+        detail=f"{stores.service.title} automatic prod deploys {word} by {state['by']}: {args.reason[:200]}",
     )
     print(f"Automatic prod deploys {word}: {stores.prod.location(FREEZE_OBJECT)}")
     return EXIT_GO
@@ -745,9 +762,13 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
         else "the next merge deploys."
     )
     what = "rollback" if pointer.get("kind") == "rollback" else "forward-only release"
-    rr.post_slack(
-        f":arrow_forward: {service.title} automatic prod deploys resumed by {_who(args)} after {what} "
-        f"{pointer['release_id']}: {args.reason[:200]}. The next merge deploys; {after}"
+    rr.post_status(
+        "up",
+        service.name,
+        detail=(
+            f"{service.title} automatic prod deploys resumed by {_who(args)} after {what} "
+            f"{pointer['release_id']}: {args.reason[:200]}. The next merge deploys; {after}"
+        ),
     )
     print(f"Hold after {pointer['release_id']} released.")
     return EXIT_GO

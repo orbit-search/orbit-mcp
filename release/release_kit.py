@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release_config as rc  # noqa: E402
+import release_record as rr  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent
 MANIFEST = KIT_DIR / "KIT.json"
@@ -509,8 +510,8 @@ steps:
                 TEXT=":x: {title} could not set the commit status {context} on $SHORT_SHA; see the status-gate step"
               fi
               if [ -n "$${{TEXT}}" ]; then
-                PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({{"text": sys.argv[1]}}))' "$${{TEXT}}")"
-                curl -s -X POST -H 'Content-type: application/json' --data "$${{PAYLOAD}}" "$$WEBHOOK_ORBIT" || true
+                # Slack gets the status line; the reason stays in this build log.
+                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT" || true
                 echo "$${{TEXT}}" >&2
                 exit 1
               fi
@@ -605,9 +606,8 @@ steps:
               if [ -n "$${{BUILDER_OUTPUT:-}}" ]; then
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
-              curl -s -X POST -H 'Content-type: application/json' \\
-                --data '{{"text":":x: {title} prod promote blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, dev verify not passed, the deployment changed, or Vercel holds the project after an unrecorded rollback); the deployment stays staged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>"}}' \\
-                "$$WEBHOOK_ORBIT"
+              echo '{title} prod promote blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, dev verify not passed, the deployment changed, or Vercel holds the project after an unrecorded rollback); the deployment stays staged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>'
+              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
     # Still current: right before the status, no newer prod build or deployment exists, no older
@@ -743,8 +743,12 @@ steps:
               else
                 TEXT=":white_check_mark: {title} prod promote completed for commit \\`$SHORT_SHA\\`"
               fi
-              PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({{"text": sys.argv[1]}}))' "$${{TEXT}}")"
-              curl -s -X POST -H 'Content-type: application/json' --data "$${{PAYLOAD}}" "$$WEBHOOK_ORBIT"
+              echo "$${{TEXT}}"
+              # Slack gets a status line only when no other step posts this moment: a failed deploy or an
+              # unchecked prod. A failed check posted its down line; the promote said deploying; the watch says up.
+              if [ -f /workspace/deploy_failed ] || [ -f /workspace/release_verify_unchecked ]; then
+                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_warning}"}}' "$$WEBHOOK_ORBIT"
+              fi
               if [ -f /workspace/deploy_failed ]; then exit 1; fi
 
     - name: "gcr.io/cloud-builders/gcloud"
@@ -898,6 +902,9 @@ def rendered_vercel(service: object) -> dict[str, str]:
         "wait_minutes": service.deployment_wait_minutes,  # type: ignore[attr-defined]
         "wait_seconds": (service.deployment_wait_minutes + 5) * 60,  # type: ignore[attr-defined]
         "build_seconds": (service.deployment_wait_minutes + 60) * 60,  # type: ignore[attr-defined]
+        # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
+        "line_on_hold": rr.status_line("on hold", service.name),  # type: ignore[attr-defined]
+        "line_warning": rr.status_line("warning", service.name),  # type: ignore[attr-defined]
     }
     files = {
         service.release_build_config: VERCEL_RELEASE_TEMPLATE.format(**values),  # type: ignore[attr-defined]

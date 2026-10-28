@@ -436,6 +436,22 @@ class VercelConfigTest(unittest.TestCase):
             '"RELEASE_AUTO_ROLLBACK=${_AUTO_ROLLBACK}"', files["release/services/demo-web.release-verify.yaml"]
         )
 
+    def test_rendered_builds_post_only_status_lines(self) -> None:
+        """Every Slack post of a rendered build is a status line with the ops board link; reasons stay in the log."""
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+            files = kit.rendered(WEB)
+        posts = [
+            line.split("--data ", 1)[1]
+            for text in files.values()
+            for line in text.splitlines()
+            if "curl" in line and "WEBHOOK_ORBIT" in line
+        ]
+        self.assertEqual(len(posts), 3, posts)
+        lines = {rr.status_line(state, WEB.name) for state in ("on hold", "warning")}
+        for post in posts:
+            self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
+        self.assertNotIn("PAYLOAD", "".join(files.values()))
+
     def test_rendered_promote_keeps_the_prod_build_contract(self) -> None:
         """Every stop before the promote leaves the no-change receipt, and the finish retries."""
         import test_release_kit as tk

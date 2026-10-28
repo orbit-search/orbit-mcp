@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -329,6 +331,23 @@ class RailwayConfigTest(unittest.TestCase):
         for data in bad:
             with self.assertRaises(rc.ConfigError, msg=json.dumps(data)[:200]):
                 rl.parse_light(data)
+
+    def test_rendered_builds_post_only_status_lines(self) -> None:
+        """Every Slack post of a rendered Railway build is a status line; the reasons stay in the build log."""
+        for service in (API, DIRECT):
+            with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+                files = kit.rendered(service)
+            posts = [
+                line
+                for text in files.values()
+                for line in text.splitlines()
+                if "curl" in line and "WEBHOOK_ORBIT" in line
+            ]
+            self.assertTrue(posts, service.name)
+            lines = [rr.status_line(state, service.name) for state in ("on hold", "warning")]
+            for post in posts:
+                self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
+            self.assertNotIn("PAYLOAD", "".join(files.values()))
 
     def test_render(self) -> None:
         """Tier full renders the merge (dev), promote, window and rollback builds; check_rollback has no promote."""
@@ -842,6 +861,7 @@ class RailwayWindowTest(RailwayCase):
         with (
             mock.patch.dict(os.environ, {"RELEASE_AUTO_ROLLBACK": "1"}),
             mock.patch.object(rv, "start_rollback") as start,
+            contextlib.redirect_stdout(io.StringIO()) as log,
         ):
             rl.on_failed(API, self.prod, record)
             rl.on_failed(API, self.prod, rr.read_record(self.prod, record["release_id"]))
@@ -850,7 +870,8 @@ class RailwayWindowTest(RailwayCase):
         self.assertTrue(saved["promote_hold"]["forward_only"])
         self.assertEqual(saved["auto_rollback"]["status"], "skipped")
         self.assertEqual(len(self.slack), 1)
-        self.assertIn("Fixes-release: " + record["release_id"], self.slack[0])
+        self.assertTrue(self.slack[0].startswith(rr.status_line("on hold", API.name)), self.slack[0])
+        self.assertIn("Fixes-release: " + record["release_id"], log.getvalue())
         self.assertEqual(self.railway.mutations(), [])
 
     def test_release_without_migration_rolls_back(self) -> None:
@@ -1154,10 +1175,44 @@ class StaticSiteTest(unittest.TestCase):
         self.assertIn("gh pr create --repo orbit-search/docs --base main", command)
         self.assertIn(f"git revert --no-edit {COMMIT} ", rl.rollback_command(DOCS, {"commit": COMMIT, "previous": {}}))
         record = {"release_id": "r1", "commit": COMMIT, "status": "deployed", "verdict": {"reasons": ["/x: HTTP 404"]}}
-        text, blocks = rl.static_alert(DOCS, record, "gs://x/r1.json", command)
-        self.assertIn("fix or revert", text)
-        self.assertIn(OLD_COMMIT, json.dumps(blocks))
-        self.assertIn("nothing reverts by itself", json.dumps(blocks))
+        state, _, detail = rl.static_alert(DOCS, record, "gs://x/r1.json", command)
+        self.assertEqual(state, "down")
+        self.assertIn(OLD_COMMIT, detail)
+        self.assertIn("nothing reverts by itself", detail)
+        # Nothing went live: the old site still serves, so the line is a warning.
+        self.assertEqual(rl.static_alert(DOCS, {**record, "status": "deploy_failed"}, "gs://x", command)[0], "warning")
+
+
+class OwnerMentionTest(unittest.TestCase):
+    def test_static_alert_mentions_the_owner_of_an_unclaimed_release(self) -> None:
+        """Docs failures use static_alert: it mentions the PR author of a release no agent claimed, even when
+        an earlier PR ranks first, and the fallback people only when nobody is in the map."""
+        commits = [
+            {"sha": OLD_COMMIT, "title": "Old page (#11)", "pr": 11, "author": "mapped-other"},
+            {"sha": COMMIT, "title": "New page (#12)", "pr": 12, "author": "jonnybcw"},
+        ]
+        record = {
+            "release_id": "r1",
+            "commit": COMMIT,
+            "status": "deployed",
+            "commits": commits,
+            "followup": {},
+            "verdict": {"reasons": ["/x: HTTP 404"]},
+        }
+        people = {"slack_ids": {"jonnybcw": "UJONNY", "mapped-other": "UOTHER"}, "fallback": ["UFALLBACK"]}
+        with (
+            mock.patch.object(rl.rv, "load_people", return_value=people),
+            mock.patch.object(rl.rv, "likely_prs", return_value=commits[:1]),
+        ):
+            _, mentions, _ = rl.static_alert(DOCS, record, "gs://x/r1.json", "git revert")
+            self.assertEqual(mentions, ["<@UOTHER>", "<@UJONNY>"])
+            claimed = {**record, "followup": {"owner": {"thread_url": "codex://t", "pr_url": "https://x/pull/12"}}}
+            self.assertNotIn("<@UJONNY>", rl.static_alert(DOCS, claimed, "gs://x", "git revert")[1])
+        with (
+            mock.patch.object(rl.rv, "load_people", return_value={"slack_ids": {}, "fallback": ["UFALLBACK"]}),
+            mock.patch.object(rl.rv, "likely_prs", return_value=commits[:1]),
+        ):
+            self.assertIn("<@UFALLBACK>", rl.static_alert(DOCS, record, "gs://x", "git revert")[1])
 
 
 class ReviewFixesTest(RailwayCase):

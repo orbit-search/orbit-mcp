@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,6 +81,11 @@ class Environment:
     release_branch: str
     # The builds that deploy this environment: the trigger first, then retired names whose builds still count.
     deploy_triggers: tuple[str, ...]
+    # Where this environment runs and the host names it serves, for the release record (Orbit Ops finds
+    # services by them): (key, value) pairs of the record's deploy_target (deploy_target()), a tuple value
+    # is a list. Empty when unknown.
+    deploy_target: tuple[tuple[str, str | tuple[str, ...]], ...] = ()
+    domains: tuple[str, ...] = ()
 
     @property
     def image_repository(self) -> str:
@@ -281,6 +288,56 @@ def _names(value: object, where: str) -> tuple[str, ...]:
 
 
 SMOKE_TYPES = ("http_pod", "http_public", "pods_ready")
+# The release record's deploy_target.platform of each service kind (Orbit Ops groups services by it).
+PLATFORMS = {
+    "gke": "gke",
+    "cloud_run": "cloud-run",
+    "composer": "composer",
+    "vercel": "vercel",
+    "railway": "railway",
+    "static_site": "mintlify",
+}
+HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+
+def url_hosts(urls: Iterable[object]) -> tuple[str, ...]:
+    """The host names of https URLs, in first-seen order, each once."""
+    hosts = (urllib.parse.urlsplit(str(url)).hostname or "" for url in urls if str(url).startswith("https://"))
+    return tuple(dict.fromkeys(host for host in hosts if host))
+
+
+def public_hosts(smoke: Iterable[dict]) -> tuple[str, ...]:
+    """The host names that the http_public smoke checks call."""
+    return url_hosts(check.get("url") for check in smoke if check.get("type") == "http_public")
+
+
+def deploy_target(platform: str, **values: str | tuple[str, ...]) -> tuple[tuple[str, str | tuple[str, ...]], ...]:
+    """An Environment.deploy_target: the platform first, then each known value (empty ones are left out).
+
+    A tuple of one workload is the record's "workload"; of more, "workload" (the first) and "workloads" (all).
+    """
+    pairs: list[tuple[str, str | tuple[str, ...]]] = [("platform", platform)]
+    for key, value in values.items():
+        if isinstance(value, tuple):
+            names = tuple(name for name in value if name)
+            if names:
+                pairs.append((key, names[0]))
+            if len(names) > 1:
+                pairs.append((f"{key}s", names))
+        elif value:
+            pairs.append((key, value))
+    return tuple(pairs)
+
+
+def _domains(value: object, where: str) -> tuple[str, ...]:
+    """An optional list of host names (a config's domains); raise ConfigError on anything else."""
+    if value in (None, []):
+        return ()
+    names = _names(value, where)
+    for name in names:
+        if not HOST_RE.fullmatch(name):
+            raise ConfigError(f"{where}: {name!r} is not a lower-case host name")
+    return names
 
 
 def validate_smoke(check: object, deployments: set[str], where: str) -> None:
@@ -360,13 +417,27 @@ def parse_service(data: dict, path: Path | None = None) -> Service:
         names = {item.name for item in deployments}
         for check in smoke:
             validate_smoke(check, names, f"{env_where} smoke")
+        cluster = str(env_data.get("cluster") or env_name)
+        namespace = str(_require(env_data, "namespace", env_where))
         environments[env_name] = Environment(
             name=env_name,
-            cluster=str(env_data.get("cluster") or env_name),
-            namespace=str(_require(env_data, "namespace", env_where)),
+            cluster=cluster,
+            namespace=namespace,
             deployments=deployments,
             smoke=smoke,
             deploy_triggers=_names(triggers.get(env_name), f"{where} triggers.{env_name}"),
+            deploy_target=deploy_target(
+                PLATFORMS["gke"],
+                project=str(common["project"]),
+                region=str(common["region"]),
+                cluster=cluster,
+                namespace=namespace,
+                workload=tuple(item.name for item in deployments),
+            ),
+            # The hosts the config names (environments.<env>.domains), then the ones its public smoke checks call.
+            domains=tuple(
+                dict.fromkeys((*_domains(env_data.get("domains"), f"{env_where} domains"), *public_hosts(smoke)))
+            ),
             **common,  # type: ignore[arg-type]
         )
     if "prod" not in environments:

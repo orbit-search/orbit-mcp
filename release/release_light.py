@@ -296,7 +296,37 @@ class LightService:
             connected_repository=self.connected_repository,
             release_branch=self.release_branch,
             deploy_triggers=self.deploy_triggers if name == "prod" else self.dev_triggers,
+            deploy_target=self.deploy_target(name),
+            domains=self.domains(name),
         )
+
+    def deploy_target(self, name: str) -> tuple[tuple[str, str | tuple[str, ...]], ...]:
+        """Where an environment runs (the release record's deploy_target). The dev stage of cloud_run and
+        composer lives in prod's own resources, so both environments name the same workload."""
+        platform = rc.PLATFORMS[self.kind]
+        if self.kind == "vercel":
+            return rc.deploy_target(platform, vercel_project=self.vercel_project)
+        if self.kind == "railway":
+            return rc.deploy_target(
+                platform, railway_project=self.railway_project_id, railway_service=self.railway_service_id
+            )
+        if self.kind == "static_site":
+            return rc.deploy_target(platform)
+        workload = self.services if self.kind == "cloud_run" else (self.environment,)
+        return rc.deploy_target(platform, project=self.project, region=self.region, workload=workload)
+
+    def domains(self, name: str) -> tuple[str, ...]:
+        """The host names an environment serves (the release record's domains). The dev stage of vercel,
+        cloud_run and composer has none of its own: it is a deployment or revision without a domain."""
+        if self.kind == "railway":
+            return rc.url_hosts([dict(self.railway_urls).get(name) or ""])
+        if name != "prod":
+            return ()
+        if self.kind == "vercel":
+            return self.vercel_domains
+        if self.kind == "static_site" and self.site:
+            return rc.url_hosts([self.site.url])
+        return rc.public_hosts(self.smoke)
 
     @property
     def prod(self) -> rc.Environment:
@@ -2014,34 +2044,22 @@ def forward_hold(service: LightService, store: rr.Store, record: dict, *, force:
         current["auto_rollback"] = {"status": "skipped", "reason": f"forward-only: {why[:300]}", "at": rr.utc_now()}
 
     saved = rr.update_record(store, release_id, change, "forward_hold", {"why": why[:200]})
-    if (saved.get("alert") or {}).get("posted"):
-        return
     location = store.location(rr.record_name(release_id))
-    text, blocks = forward_alert(service, saved, location, why)
-    if rr.post_slack(text, blocks):
-        rr.update_record(
-            store,
-            release_id,
-            lambda current: current.__setitem__("alert", {"posted": True, "at": rr.utc_now()}),
-            "alert_posted",
-        )
+    mentions, detail = forward_alert(service, saved, location, why)
+    rv.alert_once(service, store, saved, "on hold", mentions, detail)
 
 
-def forward_alert(service: LightService, record: dict, location: str, why: str) -> tuple[str, list[dict]]:
-    """The Slack message of a failed forward-only release: hold, who should fix it, a prompt to paste."""
-    people = rv.load_people()
-    suspects = rv.likely_prs(record)
-    who = " ".join(rv._mentions(people, suspects)) or "Someone"
+def forward_alert(service: LightService, record: dict, location: str, why: str) -> tuple[list[str], str]:
+    """A failed forward-only release: (mentions, detail). The "on hold" line carries the mentions; the detail
+    (what regressed, the hold, a fix-forward prompt) is for the build log."""
+    mentions = rv.failure_mentions(record, rv.load_people(), rv.likely_prs(record))
     short = record["commit"][:9]
-    reasons = "\n".join(
-        f"• {rv._slack_escape(rv._clip(reason, 300))}"
-        for reason in ((record.get("verdict") or {}).get("reasons") or [])[:5]
-    )
-    prompt = "\n".join(
+    detail = "\n".join(
         [
             f"{service.title} prod release {record['release_id']} (commit {short}) failed release-verify. It changes "
             f"the database schema ({why[:200]}), so it did not roll back: an older build does not start against the "
-            "newer schema. Production still runs it, and automatic prod deploys hold.",
+            "newer schema. Production still runs it, and automatic prod deploys hold until a commit with "
+            f"`Fixes-release: {record['release_id']}` merges.",
             "",
             "What regressed:",
             *[
@@ -2058,35 +2076,7 @@ def forward_alert(service: LightService, record: dict, location: str, why: str) 
             "4. Open the PR as me and follow the PR review loop in AGENTS.md. After it merges it deploys by itself.",
         ]
     )
-    header = f":octagonal_sign: {service.title} prod release failed; forward-only, no rollback"
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"Release `{record['release_id']}` (`{short}`) failed release-verify. It changes the database "
-                    f"schema ({rv._slack_escape(why[:200])}), so the kit did not roll it back. Prod deploys hold "
-                    f"until a commit with `Fixes-release: {record['release_id']}` merges."
-                ),
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*What regressed*\n{reasons or '• see the record'}"}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{who}: please fix it forward. Paste this prompt into Claude Code or Codex:",
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{rv._slack_escape(prompt)[:2900]}```"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Record `{location}`"}]},
-    ]
-    return (
-        f":octagonal_sign: {service.title} release {short} failed (forward-only, no rollback). {who}: please fix it forward.",
-        blocks,
-    )
+    return mentions, detail
 
 
 def railway_rollback_steps(
@@ -2290,11 +2280,12 @@ def evaluate_static_window(service: LightService, store: rr.Store, record: dict,
     }
 
 
-def static_alert(service: LightService, record: dict, location: str, command: str) -> tuple[str, list[dict]]:
-    """The Slack message of a failed static-site release: the author ping, the revert command and a fix prompt."""
-    people = rv.load_people()
+def static_alert(service: LightService, record: dict, location: str, command: str) -> tuple[str, list[str], str]:
+    """A failed static-site release: (state, mentions, detail). "down" when it went live (nothing reverts by
+    itself), else "warning" (the old site still serves). The detail (what failed, the revert command, a fix
+    prompt) is for the build log."""
     suspects = rv.likely_prs(record) or [item for item in record.get("commits") or [] if item.get("sha")][-3:]
-    who = " ".join(rv._mentions(people, suspects)) or "Someone"
+    mentions = rv.failure_mentions(record, rv.load_people(), suspects)
     short = record["commit"][:9]
     reasons = [
         rv._clip(reason, 300) for reason in ((record.get("verdict") or {}).get("reasons") or ["see the record"])[:5]
@@ -2305,7 +2296,7 @@ def static_alert(service: LightService, record: dict, location: str, command: st
         if published
         else "Nothing went live: the publisher's check run did not succeed."
     )
-    prompt = "\n".join(
+    detail = "\n".join(
         [
             f"{service.title} release {record['release_id']} (commit {short}) failed its release check. {state}",
             "",
@@ -2320,29 +2311,7 @@ def static_alert(service: LightService, record: dict, location: str, command: st
             "4. Open the PR as me and follow the PR review loop in AGENTS.md. It publishes when it merges.",
         ]
     )
-    header = f":rotating_light: {service.title} release check failed"
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"Release `{record['release_id']}` (`{short}`): {rv._slack_escape(state)}\n"
-                + "\n".join(f"• {rv._slack_escape(reason)}" for reason in reasons),
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{who}: please fix or revert it. Revert:\n```{rv._slack_escape(command)}```",
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": "Or paste this prompt into Claude Code or Codex:"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{rv._slack_escape(prompt)[:2900]}```"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Record `{location}`"}]},
-    ]
-    return f"{header}: release {short}. {who}: please fix or revert it.", blocks
+    return ("down" if published else "warning"), mentions, detail
 
 
 def cmd_static_wait(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2771,33 +2740,21 @@ def suggested(service: LightService, record: dict) -> str:
 
 
 def alert(service: LightService, store: rr.Store, record: dict) -> None:
-    """The failed-release Slack alert with the author ping, a fix prompt and the rollback command.
+    """The failed-release status line with the author ping; the fix prompt and the rollback command go to the log.
 
-    Sent once per release: the deploy check and the watch both reach a failed verdict,
+    Sent once per release (rv.alert_once): the deploy check and the watch both reach a failed verdict,
     and only a post that Slack did not take is sent again.
     """
     if os.environ.get("RELEASE_SLACK_DISABLED", "").strip() == "1":
         print("Test run: no alert", flush=True)
         return
-    if (record.get("alert") or {}).get("posted"):
-        print("The failed-release alert was sent already", flush=True)
-        return
     location = store.location(rr.record_name(record["release_id"]))
     if service.kind == "static_site":
-        text, blocks = static_alert(service, record, location, suggested(service, record))
+        state, mentions, detail = static_alert(service, record, location, suggested(service, record))
     else:
-        text, blocks = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
-    if not rr.post_slack(text, blocks):
-        return
-    try:
-        rr.update_record(
-            store,
-            record["release_id"],
-            lambda current: current.__setitem__("alert", {"posted": True, "at": rr.utc_now()}),
-            "alert_posted",
-        )
-    except (rr.RecordError, GuardError, OSError) as error:
-        print(f"WARNING: could not mark the alert sent: {error}", file=sys.stderr, flush=True)
+        state = "down"
+        mentions, detail = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
+    rv.alert_once(service, store, record, state, mentions, detail)
 
 
 def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2842,8 +2799,10 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         ]
         saved = _fail(service, store, saved, "deploy", regressions)
         if args.force_fail:
-            rr.post_slack(
-                f"{rv.TEST_RUN_LINE}. A test of {service.title} release-verify failed on purpose; no action needed."
+            rr.post_status(
+                "up",
+                service.name,
+                detail=f"{rv.TEST_RUN_LINE}. A test of {service.title} release-verify failed on purpose; no action needed.",
             )
         elif service.auto_rollback:
             # The watch-window build sees the failed verdict at once and starts the rollback trigger. A
@@ -2851,23 +2810,29 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
             state = forward_state(service, saved) if service.kind == "railway" else None
             if state is not None:
                 forward_hold(service, store, {**saved, "migrations": state}, force=True)
-            follows = (
-                "It changes the database schema (forward-only): no rollback; prod deploys hold."
-                if state is not None
-                else "An automatic rollback follows."
-            )
-            rr.post_slack(
-                f":rotating_light: {service.title} release-verify {record['commit'][:9]} FAILED (deploy): "
-                f"{saved['rollback_suggestion']['summary'][:300]} {follows} Record {where}"
-            )
+            if state is None:
+                # A forward-only release posted its "on hold" line in forward_hold: one line for this moment.
+                rv.alert_once(
+                    service,
+                    store,
+                    saved,
+                    "down",
+                    rv.failure_mentions(saved, rv.load_people(), rv.likely_prs(saved)),
+                    f"{service.title} release-verify {record['commit'][:9]} FAILED (deploy): "
+                    f"{saved['rollback_suggestion']['summary'][:300]} An automatic rollback follows. Record {where}",
+                )
         else:
             alert(service, store, saved)
         return rv.EXIT_FAILED
     minutes = " and ".join(f"+{value}" for value in service.checkpoints)
-    rr.post_slack(
-        f":mag: {service.title} release-verify {record['commit'][:9]} deploy checks passed; window checks follow "
+    detail = (
+        f"{service.title} release-verify {record['commit'][:9]} deploy checks passed; window checks follow "
         f"at {minutes} min. Record {where}"
     )
+    if service.has_dev:
+        print(detail, flush=True)  # the promote line said "deploying" already
+    else:
+        rr.post_status("deploying", service.name, detail=detail)
     return rv.EXIT_OK
 
 
@@ -3081,10 +3046,13 @@ def finish_inconclusive(service: LightService, store: rr.Store, record: dict, ke
         rr.update_record(store, record["release_id"], done, "verify_final", {"status": "inconclusive"})
     except (rr.RecordError, GuardError, OSError) as error:
         print(f"WARNING: could not save the inconclusive verdict: {error}", file=sys.stderr, flush=True)
-    rr.post_slack(
-        f":grey_question: {service.title} release-verify {record['commit'][:9]} inconclusive: the last checkpoint "
+    rr.post_status(
+        "warning",
+        service.name,
+        rv.owner_now(record, store),
+        f"{service.title} release-verify {record['commit'][:9]} inconclusive: the last checkpoint "
         f"could not run ({why[:200]}). Check the release by hand. "
-        f"Record {store.location(rr.record_name(record['release_id']))}{rv.owner_suffix(record, store)}"
+        f"Record {store.location(rr.record_name(record['release_id']))}",
     )
 
 
@@ -3158,8 +3126,11 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 if history:
                     reason = f"another build changed prod during this observation: {history[0]}"
                     rv._record_checkpoint_error(store, record, minutes, reason, final=True)
-                    rr.post_slack(
-                        f":warning: {service.title} release-verify unchecked: {reason}{rv.owner_suffix(record, store)}"
+                    rr.post_status(
+                        "warning",
+                        service.name,
+                        rv.owner_now(record, store),
+                        f"{service.title} release-verify unchecked: {reason}",
                     )
                     return rv.EXIT_FAILED
                 break
@@ -3168,9 +3139,11 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
         except (rr.RecordError, GuardError, subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
             print(f"Checkpoint +{minutes} min could not run: {error}", file=sys.stderr, flush=True)
             rv._record_checkpoint_error(store, record, minutes, str(error), final=last)
-            rr.post_slack(
-                f":warning: {service.title} +{minutes} min checkpoint inconclusive: could not run: {str(error)[:200]}"
-                f"{rv.owner_suffix(record, store)}"
+            rr.post_status(
+                "warning",
+                service.name,
+                rv.owner_now(record, store),
+                f"{service.title} +{minutes} min checkpoint inconclusive: could not run: {str(error)[:200]}",
             )
             if last:
                 return rv.EXIT_FAILED
@@ -3251,11 +3224,12 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 # A manual check failed the release after this checkpoint's save; the final write kept it.
                 on_failed(service, store, final)
                 return rv.EXIT_OK if rv.require_owner(store, final) else rv.EXIT_FAILED
-            icon = ":white_check_mark:" if checked else ":grey_question:"
-            rr.post_slack(
-                f"{icon} {service.title} release-verify {record['commit'][:9]} {status}. "
-                f"Record {store.location(rr.record_name(record['release_id']))}"
-                f"{'' if checked else rv.owner_suffix(final, store)}"
+            rr.post_status(
+                "up" if checked else "warning",
+                service.name,
+                [] if checked else rv.owner_now(final, store),
+                f"{service.title} release-verify {record['commit'][:9]} {status}. "
+                f"Record {store.location(rr.record_name(record['release_id']))}",
             )
     current = rr.read_record(store, record["release_id"])
     return (
@@ -4188,7 +4162,7 @@ def main(argv: list[str] | None = None) -> int:
             return rr.finish_with_retries(
                 lambda: cmd_finish(args, service, store, runner),
                 attempts=args.attempts,
-                title=service.title,
+                service=service.name,
                 env=args.env,
                 release_id=args.release_id,
                 recovery=rr.finish_recovery("light", service.name, args.env, args.release_id, args.status),

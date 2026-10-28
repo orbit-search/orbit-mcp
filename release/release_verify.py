@@ -554,9 +554,13 @@ def note_recovered(service: rc.Service, store: rr.Store, record: dict, keys: lis
         print(f"WARNING: could not end the environmental marks: {error}", file=sys.stderr, flush=True)
         return
     if ended:
-        rr.post_slack(
-            f":white_check_mark: {service.title} {record['environment']}: {', '.join(ended)} recovered (release "
-            f"{record['commit'][:9]}); automatic rollbacks on it are on again."
+        rr.post_status(
+            "up",
+            service.name,
+            detail=(
+                f"{service.title} {record['environment']}: {', '.join(ended)} recovered (release "
+                f"{record['commit'][:9]}); automatic rollbacks on it are on again."
+            ),
         )
 
 
@@ -706,11 +710,14 @@ def _watch_rollback(
             f"These signals did not come from release {record['commit'][:9]}; its other regressions keep "
             f"the promote hold of {by}"
         )
-    alert = (
-        f":warning: {service.title} {record['environment']}: rollback {by} did not help. {window}: "
+    print(
+        f"{service.title} {record['environment']}: rollback {by} did not help. {window}: "
         f"{'; '.join(f.line() for f in still)[:600]}. {why}. Automatic rollbacks on {', '.join(keys)} stop "
-        f"until it recovers. Please look. Marks: {store.location(ENVIRONMENTAL_OBJECT)}"
+        f"until it recovers. Please look. Marks: {store.location(ENVIRONMENTAL_OBJECT)}",
+        flush=True,
     )
+    # The signals still fail on the rollback target: the service is down for an environmental cause.
+    alert = rr.status_line("down", service.name)
 
     def mark(current: dict | None) -> dict:
         """Mark each signal that still fails (a mark that is active stays as it is)."""
@@ -1902,7 +1909,9 @@ def post_warnings(
 
     command: how a human rolls back (default: release_rollback.py run; light services pass their own).
     """
-    if not warnings or not rr.post_slack(warning_line(service, record, warnings, store, command)):
+    if not warnings or not rr.post_status(
+        "warning", service.name, detail=warning_line(service, record, warnings, store, command)
+    ):
         return
     names = {warning["name"] for warning in warnings}
 
@@ -1921,12 +1930,12 @@ def post_warnings(
 def warning_line(
     service: rc.Service, record: dict, warnings: list[dict], store: rr.Store, command: str | None = None
 ) -> str:
-    """Slack: findings that do not roll back (no clear suspect, no runtime code). A human decides."""
+    """The log detail of findings that do not roll back (no clear suspect, no runtime code). A human decides."""
     where = store.location(rr.record_name(record["release_id"]))
     items = " | ".join(_clip(item["text"], 300) for item in warnings[:3])
     how = command or f"{rollback_cli(service, 'run')} --reason '<why>'"
     return (
-        f":warning: {service.title} release-verify {record['commit'][:9]}: {len(warnings)} finding(s) that do not "
+        f"{service.title} release-verify {record['commit'][:9]}: {len(warnings)} finding(s) that do not "
         f"roll back on their own: {items}. Please look; roll back with "
         f"{how} if the release caused it. Record {where}"
     )
@@ -1939,8 +1948,32 @@ def inconclusive_parts(result: dict) -> str:
     return f" New-error checks not run: {', '.join(names)}." if names else ""
 
 
-def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store) -> str:
-    """The Slack line for a check result: failed, passed, inconclusive, or the checks passed so far."""
+def post_result(service: rc.Service, store: rr.Store, record: dict, result: dict) -> None:
+    """Post the status line of a check result; the detail (result_detail) goes to the build log.
+
+    failed: "down" once per release with the failure mentions; passed: "up"; inconclusive: "warning" (with the
+    owner unless capacity caused it); the deploy checks passed: "deploying" for a service without a dev stage
+    (with one, the promote line said so); a window checkpoint that passed: the log only (the final line follows).
+    """
+    detail = result_detail(service, record, result, store)
+    verdict = record.get("verdict") or {}
+    status = verdict.get("status")
+    if status == "failed":
+        mentions = failure_mentions(record, load_people(), likely_prs(record))
+        alert_once(service, store, record, "down", mentions, detail)
+    elif status == "passed":
+        rr.post_status("up", service.name, detail=detail)
+    elif status == "inconclusive":
+        mentions = [] if verdict.get("cause") == "capacity" else owner_now(record, store)
+        rr.post_status("warning", service.name, mentions, detail)
+    elif result["phase"] == "deploy" and not service.has_dev:
+        rr.post_status("deploying", service.name, detail=detail)
+    else:
+        print(detail, flush=True)
+
+
+def result_detail(service: rc.Service, record: dict, result: dict, store: rr.Store) -> str:
+    """The log detail of a check result: failed, passed, inconclusive, or the checks passed so far."""
     title = service.title
     where = store.location(rr.record_name(record["release_id"]))
     short = record["commit"][:9]
@@ -1952,23 +1985,22 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
         target = (suggestion.get("target") or {}).get("commit") or (record.get("previous") or {}).get("commit")
         follow = "an automatic rollback follows" if service.auto_rollback else "roll back by hand (tier check_only)"
         return (
-            f":rotating_light: {title} release-verify {short} FAILED ({result['phase']}): {first[:300]} "
+            f"{title} release-verify {short} FAILED ({result['phase']}): {first[:300]} "
             f"Rollback target {(target or 'unknown')[:9]}; {follow}.{inconclusive_parts(result)} Record {where}"
-            f"{owner_suffix(record, store)}"
         )
     if status == "passed":
         judged = f" ({result['judged']:,.0f} samples judged)" if result.get("judged") else ""
-        return f":white_check_mark: {title} release-verify {short} passed{judged}.{inconclusive_parts(result)} Record {where}"
+        return f"{title} release-verify {short} passed{judged}.{inconclusive_parts(result)} Record {where}"
     if status == "inconclusive":
         if verdict.get("cause") == "capacity":
             return (
-                f":grey_question: {title} release-verify {short} deploy incomplete for capacity (environmental: no "
+                f"{title} release-verify {short} deploy incomplete for capacity (environmental: no "
                 f"rollback, no hold): {str((result.get('capacity') or {}).get('summary'))[:300]}. The +15/+60 checks "
                 f"judge the running release. Record {where}"
             )
         return (
-            f":grey_question: {title} release-verify {short} inconclusive: {str(verdict.get('reason'))[:160]}."
-            f"{inconclusive_parts(result)} Record {where}{owner_suffix(record, store)}"
+            f"{title} release-verify {short} inconclusive: {str(verdict.get('reason'))[:160]}."
+            f"{inconclusive_parts(result)} Record {where}"
         )
     if result["phase"] == "deploy":
         minutes = " and ".join(f"+{value}" for value in service.checkpoints)
@@ -1980,10 +2012,12 @@ def slack_line(service: rc.Service, record: dict, result: dict, store: rr.Store)
             else ""
         )
         return (
-            f":mag: {title} release-verify {short} deploy checks passed;{note} window checks follow at {minutes} min. "
+            f"{title} release-verify {short} deploy checks passed;{note} window checks follow at {minutes} min. "
             f"Record {where}"
         )
-    return f":mag: {title} release-verify {short} window checks at +{result['candidate_minutes']:.0f} min passed. Record {where}"
+    return (
+        f"{title} release-verify {short} window checks at +{result['candidate_minutes']:.0f} min passed. Record {where}"
+    )
 
 
 def print_result(result: dict) -> None:
@@ -2078,19 +2112,34 @@ def require_owner(store: rr.Store, record: dict) -> bool:
     return True
 
 
+def owner_items(record: dict) -> list[dict]:
+    """The owner of a release that no agent claimed, as a mention item ({"author": login}); [] when an agent did."""
+    if ro.owned(record):
+        return []
+    owner = (record.get("followup") or {}).get("owner") or {}
+    return [{"author": owner.get("login") if ro.author_owned(record) else ro.release_author(record)[0]}]
+
+
 def owner_mentions(record: dict, people: dict | None = None) -> list[str]:
     """Slack mentions of the owner of a release that no agent claimed: its PR author, else the fallback people.
 
     An agent-claimed release mentions nobody here (its agent follows the checks itself)."""
-    if ro.owned(record):
-        return []
-    owner = (record.get("followup") or {}).get("owner") or {}
-    login = owner.get("login") if ro.author_owned(record) else ro.release_author(record)[0]
-    return _mentions(people or load_people(), [{"author": login}])
+    items = owner_items(record)
+    return _mentions(people or load_people(), items) if items else []
 
 
-def owner_suffix(record: dict, store: rr.Store | None = None) -> str:
-    """The mention suffix (" <@author>") for a failed or inconclusive alert of a release no agent claimed, else "".
+def failure_mentions(record: dict, people: dict, suspects: list[dict]) -> list[str]:
+    """The mentions of a failed-release alert: the mapped suspects' authors, then the owner of an unclaimed release.
+
+    The owner is its PR author, else the fallback people (owner_mentions), whatever the suspects are. Without an
+    owner mention (an agent claimed the release), the fallback people when no suspect is in the map."""
+    mapped = _mentions({**people, "fallback": []}, suspects)
+    combined = list(dict.fromkeys(mapped + owner_mentions(record, people)))
+    return combined or _mentions(people, suspects)
+
+
+def owner_now(record: dict, store: rr.Store | None = None) -> list[str]:
+    """The owner mentions of a warning about a release no agent claimed, else [].
 
     With a store, the record is read again first: an agent may have claimed the release while the watch slept."""
     if store is not None:
@@ -2098,8 +2147,64 @@ def owner_suffix(record: dict, store: rr.Store | None = None) -> str:
             record = rr.read_record(store, record["release_id"])
         except (rr.RecordError, GuardError, OSError, KeyError) as error:
             print(f"WARNING: could not read the owner again: {error}", file=sys.stderr, flush=True)
-    mentions = owner_mentions(record)
-    return f" {' '.join(mentions)}" if mentions else ""
+    return owner_mentions(record)
+
+
+ALERT_CLAIM_SECONDS = 300
+
+
+class AlertTaken(Exception):
+    """Another caller posted, or is posting, the alert line of this release."""
+
+
+def alert_once(
+    service: rc.Service, store: rr.Store, record: dict, state: str, mentions: list[str], detail: str
+) -> bool:
+    """Post the one alert line of a failed release ("down", or "on hold" for a forward-only one), once.
+
+    The check build, the watch and the rollback all reach the same failed release. A caller first claims the
+    alert in the record (a conditional write, so of two callers only one wins), then posts, then notes
+    "alert": posted. A post that Slack did not take frees the claim for the next caller; a claim older than
+    ALERT_CLAIM_SECONDS (its caller died) is taken over. Whether the line is in Slack, or another caller has it.
+    """
+    release_id = record["release_id"]
+    claim_id = uuid.uuid4().hex
+
+    def claim(current: dict) -> None:
+        """Claim the alert; raise AlertTaken when it was posted or another live caller holds it."""
+        alert = current.get("alert") or {}
+        if alert.get("posted"):
+            raise AlertTaken(release_id)
+        if alert.get("claim") and alert.get("claim") != claim_id:
+            age = (datetime.now(rr.UTC) - rr.parse_utc(alert.get("at") or rr.utc_now())).total_seconds()
+            if age < ALERT_CLAIM_SECONDS:
+                raise AlertTaken(release_id)
+        current["alert"] = {"claim": claim_id, "at": rr.utc_now()}
+
+    def settle(posted: bool) -> Callable[[dict], None]:
+        """Note the post (posted) or free our claim (not posted), unless another caller holds it now."""
+
+        def change(current: dict) -> None:
+            if (current.get("alert") or {}).get("claim") == claim_id:
+                current["alert"] = {"posted": True, "at": rr.utc_now()} if posted else {}
+
+        return change
+
+    try:
+        rr.update_record(store, release_id, claim, "alert_claimed", {"claim": claim_id})
+    except AlertTaken:
+        print(f"The alert of {release_id} is sent already: {rr.redact_slack_ids(detail)}", flush=True)
+        return True
+    except (rr.RecordError, GuardError, OSError) as error:
+        # The record cannot be written: post anyway, a duplicate line beats a lost alert.
+        print(f"WARNING: could not claim the alert: {error}", file=sys.stderr, flush=True)
+        return rr.post_status(state, service.name, mentions, detail)
+    posted = rr.post_status(state, service.name, mentions, detail)
+    try:
+        rr.update_record(store, release_id, settle(posted), "alert_posted" if posted else "alert_not_posted")
+    except (rr.RecordError, GuardError, OSError) as error:
+        print(f"WARNING: could not note the alert: {error}", file=sys.stderr, flush=True)
+    return posted
 
 
 def cmd_check(
@@ -2225,12 +2330,16 @@ def cmd_check(
                 else EXIT_OK
             )
         if args.force_fail and saved["verdict"]["status"] == "failed":
-            rr.post_slack(
-                f"{TEST_RUN_LINE}. A test of {service.title} release-verify forced a failure for {record['commit'][:9]}; "
-                "the window build of a test run never rolls back. No action needed."
+            rr.post_status(
+                "up",
+                service.name,
+                detail=(
+                    f"{TEST_RUN_LINE}. A test of {service.title} release-verify forced a failure for "
+                    f"{record['commit'][:9]}; the window build of a test run never rolls back. No action needed."
+                ),
             )
         else:
-            rr.post_slack(slack_line(service, saved, result, store))
+            post_result(service, store, saved, result)
         if args.failed_marker and saved["verdict"]["status"] == "failed":
             Path(args.failed_marker).write_text("true\n", encoding="utf-8")
         if args.final and not owner_ok:
@@ -2257,8 +2366,7 @@ def cmd_check(
 
 # --------------------------------------------------------------------------- dev verify
 
-SLACK_SECTION_LIMIT = 3000
-TEST_RUN_LINE = ":test_tube: TEST RUN, nothing is wrong"
+TEST_RUN_LINE = "TEST RUN, nothing is wrong"
 
 
 def _point_verified(store: rr.Store, env: rc.Environment, record: dict, token: str | None) -> None:
@@ -2393,16 +2501,19 @@ def finish_dev_verify(
     elif status == "superseded":
         print(f"Dev verify superseded, nothing to promote: {superseded_by}", flush=True)
     elif status == "inconclusive":
-        link = f" <{build_url}|the dev build>" if build_url else ""
-        line = (
-            f":grey_question: {service.title} dev verify inconclusive for `{saved['commit'][:9]}`: "
-            f"{verdict['reason']}. Not verified, so prod does not promote it; a later dev build that passes does.{link}"
+        link = f" ({build_url})" if build_url else ""
+        rr.post_status(
+            "warning",
+            service.name,
+            detail=(
+                f"{service.title} dev verify inconclusive for {saved['commit'][:9]}: {verdict['reason']}. Not "
+                f"verified, so prod does not promote it; a later dev build that passes does.{link}"
+            ),
         )
-        print(line, flush=True)
-        rr.post_slack(line)
     else:
         location = store.location(rr.record_name(saved["release_id"]))
-        rr.post_slack(*dev_verify_alert(service, saved, build_url, location, test_run))
+        state, mentions, detail = dev_verify_alert(service, saved, build_url, location, test_run)
+        rr.post_status(state, service.name, mentions, detail)
     return saved
 
 
@@ -2456,11 +2567,6 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _slack_escape(text: str) -> str:
-    """Escape &, < and > for a Slack message."""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def _pr_title(item: dict) -> str:
     """The PR title without the (#123) PR number."""
     return rr.PR_IN_TITLE_RE.sub("", str(item.get("title", ""))).strip()
@@ -2500,7 +2606,7 @@ def dev_fix_prompt(service: rc.Service, record: dict, location: str) -> tuple[st
     steps = [
         f"In {service.github_repo}:",
         f"1. Read {service.docs} and the dev release record: gcloud storage cat {location}",
-        "2. Read the dev build log (link in Slack) and the dev pods' logs; find which change breaks dev.",
+        "2. Read the dev build log and the dev pods' logs; find which change breaks dev.",
         f"3. Fix it on {branch} with a test, or revert the PR when a fix is not quick. Open the PR as me and "
         "follow the PR review loop in AGENTS.md.",
         "4. After it merges it deploys by itself: dev, dev verify, then prod. Watch Slack #deployments.",
@@ -2508,87 +2614,43 @@ def dev_fix_prompt(service: rc.Service, record: dict, location: str) -> tuple[st
     return "\n".join(facts), "\n".join(steps)
 
 
-def _fit(facts: str, steps: str) -> str:
-    """The code block of a prompt in one Slack section: shorten the facts, never the steps."""
-    room = SLACK_SECTION_LIMIT - len("``````") - len("\n\n") - len(steps)
-    if len(facts) > room:
-        facts = facts[: max(room - 1, 0)] + "…"
-    return f"{facts}\n\n{steps}"
-
-
 def dev_verify_alert(
     service: rc.Service, record: dict, build_url: str, location: str, test_run: bool = False
-) -> tuple[str, list[dict]]:
-    """The Slack message for a failed dev verify: who should fix it, and a prompt to copy.
+) -> tuple[str, list[str], str]:
+    """A failed dev verify: (state, mentions, detail). The status line carries the state and the mentions of the
+    authors of the changes it first tested; the detail (what failed, the changes, a fix prompt) is for the build log.
 
-    A test run (forced failure) says so first and mentions nobody.
+    A test run (forced failure) is "up" (prod runs the last verified release) and mentions nobody.
     """
-    people = load_people()
-    suspects = dev_suspects(record)
-    who = "(test run: no mentions)" if test_run else " ".join(_mentions(people, suspects))
-    verdict = record.get("verdict") or {}
     short = record["commit"][:9]
-    repo_url = f"https://github.com/{service.github_repo}"
-    reasons = "\n".join(f"• {_slack_escape(_clip(reason, 300))}" for reason in (verdict.get("reasons") or [])[:5])
-
-    def change_line(item: dict) -> str:
-        """One Slack line for a change: the PR or commit link, the title and the author."""
-        number = item.get("pr")
-        link = f"<{repo_url}/pull/{number}|#{number}>" if number else f"`{str(item.get('sha', ''))[:9]}`"
-        return f"• {link} {_slack_escape(_clip(_pr_title(item), 150))} ({item.get('author') or 'unknown'})"
-
-    facts, steps = (_slack_escape(part) for part in dev_fix_prompt(service, record, location))
-    header = (
-        f"{TEST_RUN_LINE}: forced dev verify failure" if test_run else f":no_entry: {service.title} dev verify failed"
-    )
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"Commit <{repo_url}/commit/{record['commit']}|{short}> failed dev verify "
-                    f"(<{build_url}|dev build>). The prod promote did not start."
-                ),
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*What failed*\n{reasons or '• see the record'}"}},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "*Changes first tested*\n" + "\n".join(map(change_line, suspects))},
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{who}: please fix or revert this. Paste this prompt into Claude Code or Codex:",
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{_fit(facts, steps)}```"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"Record `{location}`"}]},
-    ]
-    first = suspects[0].get("pr") if suspects else None
+    reasons = [_clip(reason, 300) for reason in ((record.get("verdict") or {}).get("reasons") or [])[:5]]
     if test_run:
-        # Only what happened: no "please fix", no fix prompt, so nobody acts on a forced failure.
-        text = (
+        detail = (
             f"{TEST_RUN_LINE}. A test of {service.title} dev verify forced a failure for {short} to prove that a "
-            "failure stops the prod promote. No rollback, no action needed."
+            "failure stops the prod promote. No rollback, no action needed. What the test checked: "
+            + ("; ".join(reasons) or "see the record")
+            + f". Record {location}"
         )
-        return text, [
-            blocks[0],
-            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{text}*"}},
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*What the test checked*\n{reasons or '• see the record'}"},
-            },
-            blocks[-1],
+        return "up", [], detail
+    suspects = dev_suspects(record)
+    facts, steps = dev_fix_prompt(service, record, location)
+    detail = "\n".join(
+        [
+            f"{service.title} dev verify failed for {short} ({build_url}); the prod promote did not start.",
+            "Changes first tested:",
+            *[
+                f"- #{item.get('pr') or str(item.get('sha', ''))[:9]} {_clip(_pr_title(item), 150)} "
+                f"({item.get('author') or 'unknown'})"
+                for item in suspects
+            ],
+            "Fix prompt:",
+            facts,
+            "",
+            steps,
+            f"Record {location}",
         ]
-    text = (
-        f":no_entry: {service.title} dev verify failed for {short}; the prod promote did not start. {who}: please fix "
-        "or revert" + (f" #{first}" if first else "") + "."
     )
-    return text, blocks
+    return "on hold", _mentions(load_people(), suspects), detail
 
 
 # --------------------------------------------------------------------------- rollback alert
@@ -2667,93 +2729,52 @@ def suggested_command(service: rc.Service, record: dict, sub: str = "run") -> st
 
 def rollback_alert(
     service: rc.Service, record: dict, build_url: str | None, location: str, command: str | None = None
-) -> tuple[str, list[dict]]:
-    """The Slack message for a failed release: who should fix it, and a prompt to copy.
+) -> tuple[list[str], str]:
+    """A failed release: (mentions, detail). The "down" status line carries the mentions (the suspects' and the
+    owner's authors); the detail (what regressed, the suspects, the rollback, a fix prompt) is for the build log.
 
     build_url: the automatic rollback build; None when no rollback started (tier check_only).
     """
-    people = load_people()
     suspects = likely_prs(record)
-    mentions = _mentions(people, suspects)
     # A release that no agent claimed: its PR author owns it, so the alert mentions the author too.
-    mentions += [mention for mention in owner_mentions(record, people) if mention not in mentions]
-    who = " ".join(mentions) or "Someone"
+    mentions = failure_mentions(record, load_people(), suspects)
     verdict = record.get("verdict") or {}
-    short = record["commit"][:9]
     target = ((record.get("rollback_suggestion") or {}).get("target") or {}).get("commit") or "unknown"
-    repo_url = f"https://github.com/{service.github_repo}"
-    automatic = build_url is not None
-
-    def pr_line(item: dict) -> str:
-        """One Slack line for a PR: the link, the title and the author (a mention when known)."""
-        number = item.get("pr")
-        link = f"<{repo_url}/pull/{number}|#{number}>" if number else f"`{str(item.get('sha', ''))[:9]}`"
-        author = item.get("author") or "unknown"
-        slack_id = people["slack_ids"].get(author)
-        return (
-            f"• {link} {_slack_escape(_clip(_pr_title(item), 150))} ({'<@' + slack_id + '>' if slack_id else author})"
-        )
-
-    reasons = "\n".join(f"• {_slack_escape(_clip(reason, 300))}" for reason in (verdict.get("reasons") or [])[:5])
-    facts, steps = (_slack_escape(part) for part in fix_prompt(service, record, location, automatic=automatic))
-    if automatic:
-        header = f":rewind: {service.title} prod rollback started"
-        what = (
-            f"A rollback to `{target[:9]}` started (<{build_url}|rollback build>); its result follows in this channel."
-        )
+    facts, steps = fix_prompt(service, record, location, automatic=build_url is not None)
+    if build_url is not None:
+        what = f"An automatic rollback to {target[:9]} started ({build_url})."
     else:
         manual = command or f"{suggested_command(service, record)} --reason '<why>'"
-        header = f":rotating_light: {service.title} prod release failed release-verify"
-        what = f"Tier check_only: no automatic rollback. Roll back by hand to `{target[:9]}`: `{manual}`."
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header[:150]}},
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"Release `{record['release_id']}` (<{repo_url}/commit/{record['commit']}|{short}>) failed "
-                    f"release-verify at *{_slack_escape(verdict.get('phase', '?'))}*. {what}"
-                ),
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*What regressed*\n{reasons or '• see the record'}"}},
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "*Suspected PRs*\n" + ("\n".join(map(pr_line, suspects)) or "• none")},
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"{who}: please fix or revert this before the next prod release. Paste this prompt into Claude Code or Codex:",
-            },
-        },
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"```{_fit(facts, steps)}```"}},
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"Record `{location}` • {service.release_branch} still has the change; automatic prod deploys "
-                        f"hold after a rollback until a revert or a commit with `Fixes-release: {record['release_id']}` merges."
-                        if getattr(service, "has_gate", True)
-                        else f"Record `{location}` • {service.release_branch} still has the change; the next merge "
-                        "deploys as usual (no hold for this service)."
-                    ),
-                }
-            ],
-        },
-    ]
-    first = suspects[0].get("pr") if suspects else None
-    lead = "prod rollback started" if automatic else "prod release failed release-verify"
-    text = (
-        f"{header.split(' ', 1)[0]} {service.title} {lead}: release {short}. {who}: please fix or revert"
-        + (f" #{first}" if first else "")
-        + " before the next release."
+        what = f"Tier check_only: no automatic rollback. Roll back by hand to {target[:9]}: {manual}"
+    hold = (
+        f"automatic prod deploys hold after a rollback until a revert or a commit with "
+        f"`Fixes-release: {record['release_id']}` merges."
+        if getattr(service, "has_gate", True)
+        else "the next merge deploys as usual (no hold for this service)."
     )
-    return text, blocks
+    detail = "\n".join(
+        [
+            f"{service.title} release {record['release_id']} ({record['commit'][:9]}) failed release-verify at "
+            f"{verdict.get('phase', '?')}. {what}",
+            "What regressed:",
+            *[f"- {_clip(reason, 300)}" for reason in (verdict.get("reasons") or ["see the record"])[:5]],
+            "Suspected PRs:",
+            *(
+                [
+                    f"- #{item.get('pr') or '?'} {_clip(_pr_title(item), 150)} ({item.get('author') or 'unknown'})"
+                    for item in suspects
+                ]
+                or ["- none"]
+            ),
+            f"{service.release_branch} still has the change; {hold}",
+            "Fix prompt:",
+            facts,
+            "",
+            steps,
+            f"Record {location}",
+        ]
+    )
+    return mentions, detail
 
 
 # --------------------------------------------------------------------------- watch window
@@ -2921,8 +2942,11 @@ def cmd_watch(
             if history:
                 reason = f"another build changed prod during this release's observation: {history[0]}"
                 _record_checkpoint_error(store, record, minutes, reason, final=True)
-                rr.post_slack(
-                    f":warning: release-verify {record['release_id']} unchecked: {reason}{owner_suffix(record, store)}"
+                rr.post_status(
+                    "warning",
+                    service.name,
+                    owner_now(record, store),
+                    f"release-verify {record['release_id']} unchecked: {reason}",
                 )
                 return EXIT_FAILED
             extend = (
@@ -2948,7 +2972,7 @@ def cmd_watch(
             note_recovered(service, store, saved, result.get("recovered_signals") or [])
             alert_marks(store)
             if saved["verdict"]["status"] == "inconclusive" and not last:
-                rr.post_slack(slack_line(service, saved, result, store))
+                post_result(service, store, saved, result)
         except (
             rr.RecordError,
             GuardError,
@@ -2964,15 +2988,18 @@ def cmd_watch(
                 flush=True,
             )
             _record_checkpoint_error(store, record, minutes, str(error), final=last)
-            rr.post_slack(
-                f":warning: {service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
-                f"{str(error)[:200]}{owner_suffix(record, store)}"
+            rr.post_status(
+                "warning",
+                service.name,
+                owner_now(record, store),
+                f"{service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
+                f"{str(error)[:200]}",
             )
             if last:
                 return EXIT_FAILED  # a failed receipt write cannot make a failed checker green
             continue
         if saved["verdict"]["status"] == "failed" or (last and not extend):
-            rr.post_slack(slack_line(service, saved, result, store))
+            post_result(service, store, saved, result)
             if saved["verdict"]["status"] == "failed":
                 on_failure(service, store, saved, dd)
             return (
@@ -3027,7 +3054,8 @@ def on_failure(service: rc.Service, store: rr.Store, record: dict, dd: DatadogCl
         print("Test run: no alert for the failed release (RELEASE_AUTO_ROLLBACK is not 1)", flush=True)
         return
     current = rr.read_record(store, record["release_id"])
-    rr.post_slack(*rollback_alert(service, current, None, store.location(rr.record_name(record["release_id"]))))
+    mentions, detail = rollback_alert(service, current, None, store.location(rr.record_name(record["release_id"])))
+    alert_once(service, store, current, "down", mentions, detail)
 
 
 # --------------------------------------------------------------------------- automatic rollback
@@ -3159,9 +3187,13 @@ def follow_rollback(
         return status
     if status not in TERMINAL_STATUSES:
         # Still running, or unreadable: the claim stays, a human looks.
-        rr.post_slack(
-            f":warning: {service.title} automatic rollback build {build_id} has no result after "
-            f"{ROLLBACK_WAIT_SECONDS // 60} min ({status}); check it: {rr.build_url(service.prod, build_id)}"
+        rr.post_status(
+            "down",
+            service.name,
+            detail=(
+                f"{service.title} automatic rollback build {build_id} has no result after "
+                f"{ROLLBACK_WAIT_SECONDS // 60} min ({status}); check it: {rr.build_url(service.prod, build_id)}"
+            ),
         )
         return status
 
@@ -3177,10 +3209,12 @@ def follow_rollback(
             and (rollback.get("promote_hold") or {}).get("status") == "held"
             and cleanup
         ):
-            rr.post_slack(
-                f":x: {service.title} rollback build {build_id} restored prod and holds promotes, "
-                f"but candidate cleanup is incomplete: {cleanup[0][:300]}. Repair candidate tags; "
-                f"do not roll back again ({rr.build_url(service.prod, build_id)})"
+            # The rollback build posted the "on hold" line of this moment; the cleanup failure is in its record.
+            print(
+                f"Rollback build {build_id} restored prod and holds promotes, but candidate cleanup is incomplete: "
+                f"{cleanup[0][:300]}. Repair candidate tags; do not roll back again "
+                f"({rr.build_url(service.prod, build_id)})",
+                flush=True,
             )
             return status
     except (rr.RecordError, GuardError, OSError, KeyError, ValueError) as error:
@@ -3195,10 +3229,14 @@ def follow_rollback(
         rr.update_record(store, release_id, failed, "auto_rollback_failed", {"build_id": build_id, "status": status})
     except (rr.RecordError, GuardError, OSError) as error:
         print(f"WARNING: could not mark the rollback failed: {error}", file=sys.stderr, flush=True)
-    rr.post_slack(
-        f":x: {service.title} automatic rollback build {build_id} ended {status}; prod may still run the failed "
-        f"release {release_id}. Roll back by hand: {rollback_cli(service, 'run', target)} --reason '<why>' "
-        f"({rr.build_url(service.prod, build_id)})"
+    rr.post_status(
+        "down",
+        service.name,
+        detail=(
+            f"{service.title} automatic rollback build {build_id} ended {status}; prod may still run the failed "
+            f"release {release_id}. Roll back by hand: {rollback_cli(service, 'run', target)} --reason '<why>' "
+            f"({rr.build_url(service.prod, build_id)})"
+        ),
     )
     return status
 
@@ -3258,10 +3296,14 @@ def start_rollback(
                     sleep(30)
                     continue
             if others:
-                rr.post_slack(
-                    f":warning: {title} release-verify {short} failed, but {others[0]} changes prod now, so no "
-                    f"automatic rollback started. Check prod; roll back by hand with "
-                    f"{suggested_command(service, current)} --reason '<why>' if needed."
+                rr.post_status(
+                    "down",
+                    service.name,
+                    detail=(
+                        f"{title} release-verify {short} failed, but {others[0]} changes prod now, so no "
+                        f"automatic rollback started. Check prod; roll back by hand with "
+                        f"{suggested_command(service, current)} --reason '<why>' if needed."
+                    ),
                 )
                 return None
             if not own_running:
@@ -3329,14 +3371,19 @@ def start_rollback(
         rr.update_record(store, release_id, started, "auto_rollback_started", {"build_id": build_id})
     except Exception as error:  # noqa: BLE001 - a failure here must reach a human, not end the watch with a trace
         print(f"WARNING: the automatic rollback did not start: {error}", file=sys.stderr, flush=True)
-        rr.post_slack(
-            f":x: {title} release-verify {short} failed and the automatic rollback did not start: {str(error)[:200]}. "
-            f"Roll back by hand: {suggested_command(service, record)} --reason '<why>'"
+        rr.post_status(
+            "down",
+            service.name,
+            detail=(
+                f"{title} release-verify {short} failed and the automatic rollback did not start: "
+                f"{str(error)[:200]}. Roll back by hand: {suggested_command(service, record)} --reason '<why>'"
+            ),
         )
         return None
     url = rr.build_url(service.prod, build_id)
     print(f"Automatic rollback build {build_id} started: {url}", flush=True)
-    rr.post_slack(*rollback_alert(service, current, url, store.location(rr.record_name(release_id))))
+    mentions, detail = rollback_alert(service, current, url, store.location(rr.record_name(release_id)))
+    alert_once(service, store, current, "down", mentions, detail)
     if follow:
         status = follow_rollback(service, store, release_id, build_id, claim_id, target=target)
         if followed is not None and not followed(status):
