@@ -473,9 +473,13 @@ def finish_rollback(
     if failures:
         # latest.json stays on the release that was rolled back, so a retry with
         # the default target "previous" aims at the same good release again.
-        rr.post_slack(
-            f":x: {title} prod rollback incomplete ({summary}). {failures[0][:300]}. "
-            f"Retry with the same target. Record {where}"
+        rr.post_status(
+            "down",
+            service.name,
+            detail=(
+                f"{title} prod rollback incomplete ({summary}). {failures[0][:300]}. "
+                f"Retry with the same target. Record {where}"
+            ),
         )
         for failure in failures:
             print(f"FAILED: {failure}", file=sys.stderr)
@@ -490,17 +494,22 @@ def finish_rollback(
     rr.update_record(
         store, latest["release_id"], mark_rolled_back, "rolled_back", {"by": saved["release_id"], "reason": args.reason}
     )
-    rr.post_slack(f":rewind: {title} prod rolled back ({summary}). Record {where}")
     hold = saved.get("promote_hold") or {}
-    rr.post_slack(
-        f":pause_button: {title} automatic prod deploys are on hold after rollback {saved['release_id']} "
-        f"of {latest['release_id']}. To resume: {hold.get('resume')}."
+    # One line for the rolled-back, held state; a failed candidate cleanup is in the record and the log.
+    cleanup = (
+        f" Candidate cleanup failed: {cleanup_failures[0][:300]}. Repair the candidate tags; do not roll back again."
+        if cleanup_failures
+        else ""
+    )
+    rr.post_status(
+        "on hold",
+        service.name,
+        detail=(
+            f"{title} prod rolled back ({summary}); automatic prod deploys are on hold after rollback "
+            f"{saved['release_id']} of {latest['release_id']}. To resume: {hold.get('resume')}.{cleanup} Record {where}"
+        ),
     )
     if cleanup_failures:
-        rr.post_slack(
-            f":x: {title} prod traffic restored and promotes held, but candidate cleanup failed: "
-            f"{cleanup_failures[0][:300]}. Repair the candidate tags; do not roll back again. Record {where}"
-        )
         return 1
     print(f"Rollback complete: {where}")
     return 0

@@ -743,12 +743,65 @@ def commits_between(repo: str, base: str | None, head: str, token: str) -> tuple
     return commits, note
 
 
+def head_pr(repo: str, commit: str, token: str) -> dict | None:
+    """The merged PR of the release commit and its author, from GitHub's commit-to-PR index; None when unknown.
+
+    The PR's own author (a commit's author can be someone else), and found also when the release's commit list
+    was truncated. Release ownership (release_observation.release_author) reads it."""
+    try:
+        pulls = github_json(f"repos/{repo}/commits/{commit}/pulls?per_page=10", token)
+    except (GuardError, OSError, ValueError) as error:
+        print(f"WARNING: could not read the PR of {commit[:9]}: {error}", file=sys.stderr, flush=True)
+        return None
+    for pull in pulls if isinstance(pulls, list) else []:
+        login = (pull.get("user") or {}).get("login") if isinstance(pull, dict) else None
+        if login and pull.get("merged_at") and pull.get("number"):
+            return {"pr": int(pull["number"]), "author": login}
+    return None
+
+
 # --------------------------------------------------------------------------- Slack
 
 
 def redact_slack_ids(text: str) -> str:
     """The text for a log: Slack member mentions become <@...>, so ids never reach build or CI logs."""
     return re.sub(r"<@[A-Z0-9]+>", "<@...>", text)
+
+
+# Every #deployments post is one status line. The reasons (checks, error rates, holds, rollback targets,
+# commits) are on the ops board, one page per service at <RELEASE_OPS_URL>/<service>, where <service> is
+# the folder of the service's release records (gs://orbit-search-release-records/<service>/).
+OPS_URL = "https://ops.orbitsearch.com"
+STATUS_DOTS = {
+    "deploying": ":large_green_circle:",
+    "up": ":large_green_circle:",
+    "warning": ":large_yellow_circle:",
+    "on hold": ":large_yellow_circle:",
+    "down": ":red_circle:",
+}
+
+
+def ops_url(service: str) -> str:
+    """The ops board page of a service: RELEASE_OPS_URL (default OPS_URL) + /<service>."""
+    base = os.environ.get("RELEASE_OPS_URL", "").strip().rstrip("/") or OPS_URL
+    return f"{base}/{service}"
+
+
+def status_line(state: str, service: str, mentions: list[str] | tuple[str, ...] = ()) -> str:
+    """The one Slack line of a release moment: dot, service, state and the ops board link.
+
+    state: deploying, up, warning, on hold or down. mentions: the owner Slack mentions of an alert,
+    at the end of the line. Raise KeyError on an unknown state."""
+    url = ops_url(service)
+    line = f"{STATUS_DOTS[state]} *{service}* {state} · <{url}|{url.split('://', 1)[-1]}>"
+    return " ".join([line, *mentions])
+
+
+def post_status(state: str, service: str, mentions: list[str] | tuple[str, ...] = (), detail: str = "") -> bool:
+    """Print the detail for the build log (Slack ids redacted) and post the status line; whether Slack took it."""
+    if detail:
+        print(f"{state}: {redact_slack_ids(detail)}", flush=True)
+    return post_slack(status_line(state, service, mentions))
 
 
 def post_slack(text: str, blocks: list[dict] | None = None) -> bool:
@@ -804,6 +857,20 @@ def previous_release(store: Store, env: Environment, before: dict[str, dict]) ->
     return previous
 
 
+def describe(env: Environment) -> dict:
+    """Where the release runs: the GitHub repository, the deploy target and the domains of the environment.
+
+    Orbit Ops (SMP /ops) finds services by these fields. A value the kit does not know is left out, never null.
+    """
+    out: dict = {"repo": env.github_repo} if env.github_repo else {}
+    target = {key: list(value) if isinstance(value, tuple) else value for key, value in env.deploy_target}
+    if target:
+        out["deploy_target"] = target
+    if env.domains:
+        out["domains"] = list(env.domains)
+    return out
+
+
 def new_record(
     env: Environment,
     *,
@@ -817,12 +884,17 @@ def new_record(
 ) -> dict:
     """A new deploying release record, with the commits since the previous release when a token is given."""
     commits, note = ([], "no GitHub token")
+    pull = None
     if token:
         try:
             commits, note = commits_between(env.github_repo, previous.get("commit"), commit, token)
         except GuardError as error:
             note = f"GitHub compare failed: {error}"
+        pull = head_pr(env.github_repo, commit, token)
+    extra = {"head_pr": pull} if pull else {}
     return {
+        **extra,
+        **describe(env),
         "schema_version": SCHEMA_VERSION,
         "service": env.service,
         "environment": env.name,
@@ -1013,7 +1085,7 @@ def finish_with_retries(
     finish: Callable[[], int],
     *,
     attempts: int,
-    title: str,
+    service: str,
     env: str,
     release_id: str,
     recovery: list[str],
@@ -1036,7 +1108,7 @@ def finish_with_retries(
                 (sleep or time.sleep)(FINISH_RETRY_SECONDS * attempt)
     steps = " ".join(f"{index}) `{command}`" for index, command in enumerate(recovery, 1))
     text = (
-        f":rotating_light: {title} {env} release {release_id or '(unknown id)'}: the deploy changed {env}, but "
+        f"{service} {env} release {release_id or '(unknown id)'}: the deploy changed {env}, but "
         f"the release record was not finished after {attempts} attempt(s): {str(error)[:300]}. The new image "
         "runs UNCHECKED (no smoke checks, no +15/+60 watch window, no automatic rollback) and this build ends "
         f"red. From a checkout of this commit with {env} access, run in order: {steps}. The finish refuses "
@@ -1044,7 +1116,7 @@ def finish_with_retries(
     )
     print(text, file=sys.stderr, flush=True)
     if env == "prod":
-        post_slack(text)
+        post_slack(status_line("down", service))
     return 1
 
 
@@ -1250,7 +1322,7 @@ def main(argv: list[str] | None = None) -> int:
             return finish_with_retries(
                 lambda: cmd_finish(args, env, store, clients),
                 attempts=args.attempts,
-                title=service.title,
+                service=service.name,
                 env=args.env,
                 release_id=release_id,
                 recovery=finish_recovery(

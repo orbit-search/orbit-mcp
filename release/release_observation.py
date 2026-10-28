@@ -164,7 +164,11 @@ def release_author(record: dict) -> tuple[str | None, int | None]:
     """The GitHub login and PR number of the change the release deploys: its commit's PR, else the newest PR.
 
     A commit without a PR (a direct or automated push) never wins over a PR; its author is used only when the
-    release holds no PR at all."""
+    release holds no PR at all. The release commit's PR as GitHub reports it (`head_pr`, from release_record.head_pr:
+    the PR's own author, also when the commit list was truncated) comes first."""
+    head_pr = record.get("head_pr") or {}
+    if head_pr.get("author"):
+        return head_pr["author"], head_pr.get("pr")
     commits = [item for item in record.get("commits") or [] if isinstance(item, dict) and item.get("author")]
     with_pr = [item for item in commits if item.get("pr")]
     head = [item for item in with_pr if item.get("sha") == record.get("commit")]

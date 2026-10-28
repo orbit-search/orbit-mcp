@@ -17,7 +17,31 @@ The repo owns only `release/services/<service>.json` and the build files that
 |---|---|---|---|
 | `full` | A merge deploys dev; dev verify gates; the dev build starts the prod build, which promotes the dev digest (Cloud Run: the dev revisions; Composer: the dev candidate folder). | Smoke checks after the deploy, watch window at +15 and +60 min. | Rolls back on its own; promotes hold. |
 | `check_rollback` | The prod build of a merge deploys (no dev stage), after single flight and the freeze and hold gate. | Same. | Rolls back on its own; deploys hold. |
-| `check_only` | Same as `check_rollback`. | Same. | Slack alert with the author ping and a fix prompt; a human rolls back. |
+| `check_only` | Same as `check_rollback`. | Same. | A `down` line in Slack with the author ping (the fix prompt is in the build log); a human rolls back. |
+
+## Slack
+
+Every post to #deployments is one line: a status dot, the service, its state and a link to the
+service's page on the ops board, `<RELEASE_OPS_URL>/<service>` (default `https://ops.orbitsearch.com`;
+`<service>` is the folder of the service's records in `gs://orbit-search-release-records/`).
+The reasons (failed checks, error rates, suspects, rollback targets, holds, commits) are on the
+ops board and in the build log, never in the post.
+
+```text
+:large_green_circle: *orbit-api* up · <https://ops.orbitsearch.com/orbit-api|ops.orbitsearch.com/orbit-api>
+```
+
+| State | Dot | When |
+|---|---|---|
+| `deploying` | green | The prod promote started; for a service without a dev stage, the deploy checks passed. |
+| `up` | green | The release passed; a hold or freeze ended; a recovered signal; a test run. |
+| `warning` | yellow | Not verified: an inconclusive check, a checkpoint that could not run, warnings that do not roll back, a promote that did not start. |
+| `on hold` | yellow | Prod promotes hold: after a rollback, a forward-only release, a freeze, a failed dev verify. |
+| `down` | red | A release failed (once per release, also when its rollback starts), a rollback failed or could not start, a signal still fails after a rollback. |
+
+An alert about a release no agent claimed ends with the mentions of its owner (and of the suspects'
+authors for a failed release). `release_record.status_line` builds the line; `post_status` prints the
+detail to the build log (Slack ids redacted) and posts the line.
 
 ## Files
 
@@ -91,6 +115,38 @@ The repo owns only `release/services/<service>.json` and the build files that
 - `code`: which paths are runtime source (`source_prefixes`, `extensions`), tests,
   non-runtime and deploy files. A release that changes no runtime code never rolls
   back on a metric; suspects rank by the source they change.
+- `environments.<env>.domains` (GKE, optional): the host names the environment
+  serves, for the release record. The kit adds the hosts of the `http_public` smoke
+  checks itself; name a host here only when no public smoke check calls it.
+
+## Orbit Ops
+
+Every release record names where the release runs, so Orbit Ops (SMP `/ops`) finds
+the service without a hand-written list. The kit takes each value from what the run
+already knows: the build's GitHub repository, the platform and target of the deploy
+step, and the hosts the service config names. A value the kit does not know is left
+out, never `null`. Records written before kit 2026-10-28 have none of the three.
+
+```json
+"repo": "orbit-search/orbit-search-web",
+"deploy_target": {"platform": "gke", "project": "orbit-search", "region": "us-central1", "cluster": "prod",
+                  "namespace": "orbit-search-web", "workload": "prod-orbit-search-web-deployment"},
+"domains": ["orbitsearch.com"]
+```
+
+| Kind | `deploy_target` | `domains` |
+|---|---|---|
+| `gke` | `project`, `region`, `cluster`, `namespace`, `workload` (the first Deployment; `workloads` when there are more) | `environments.<env>.domains`, then the `http_public` smoke hosts |
+| `cloud_run` | `project`, `region`, `workload` (the first service; `workloads` when there are more). The dev stage names the same services. | prod: the `http_public` smoke hosts; dev: none |
+| `composer` | `project`, `region`, `workload` (the environment) | none |
+| `vercel` | `vercel_project` | prod: `vercel.domains`; dev: none |
+| `railway` | `railway_project`, `railway_service` | the environment's `url` host |
+| `static_site` | platform `mintlify` only | the `static_site.url` host |
+
+**The rule for agents.** A service that ships with the kit appears on Orbit Ops
+after its first release. Add something by hand only for call lines, a display label,
+or a platform that discovery does not cover yet. Put it in SMP's
+`lib/ops-overrides.ts`, and check it on `/ops`.
 
 ## Release cases
 
@@ -361,12 +417,17 @@ asleep. No generic automatic cross-provider chat delivery is claimed.
 
 A release that no agent claimed (a person merged it) is owned by its PR author:
 the watch records `followup.owner` `{"state": "author", "login", "pr"}` and posts
-nothing about it. The checks and the automatic rollback run as usual, and the
+nothing about it. The author is the author of the PR that GitHub links to the
+release commit (`head_pr`, read when the record is written), else the newest PR in
+the release's commits. The checks and the automatic rollback run as usual, and the
 watch ends green on a pass. Only an alert that already goes out for a failed or
-inconclusive +15/+60 check (or a check that could not run) mentions the author,
+inconclusive +15/+60 check (or a check that could not run), and the failed-release
+alerts (rollback, Docs, Railway forward hold), mention the author,
 resolved through the people map (`release_people.json`, or `RELEASE_PEOPLE_JSON`
 in public repositories); an author missing from the map gets the map's
-`fallback` people. A capacity verdict mentions nobody. A later agent claim
+`fallback` people, also when a suspected PR's author is in the map (the
+failed-release alerts mention the mapped suspects and the owner). A capacity
+verdict mentions nobody. A later agent claim
 replaces the author.
 
 A manual `check --phase window` before a checkpoint is due (an early check, or
@@ -577,7 +638,7 @@ commits since the last release add or change such a file (an unknown range
 counts as one). Such a release never rolls back by itself: an older build does not
 start against a newer schema. It holds instead: its own record gets
 `promote_hold` with `forward_only`, `release_gate.py` holds every later deploy,
-and the author gets a Slack ping with a prompt. Only a commit with the trailer
+and the author gets an `on hold` line with a ping (the prompt is in the build log). Only a commit with the trailer
 `Fixes-release: <release id>` or `release_gate.py resume` ends that hold; a
 revert does not (the database keeps the migration). A manual rollback across
 such a range is blocked too.
@@ -650,8 +711,8 @@ staged build and no rollback API, so the kit watches and pings:
    `required_paths` entry answers 200; each page the release changed answers
    and carries its frontmatter title (a warning at +0, a failure later); the
    internal links on the changed pages resolve. External links are not checked.
-4. A failed check pings the PR author in Slack with the exact revert command
-   (`git revert` of the release's commits into a PR) and a fix prompt.
+4. A failed check pings the PR author in Slack (a `down` line); the build log has the exact revert
+   command (`git revert` of the release's commits into a PR) and a fix prompt.
    Nothing reverts by itself: a bot must not author commits.
 
 ```json

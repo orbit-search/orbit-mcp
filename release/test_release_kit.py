@@ -8,6 +8,8 @@ every repository that vendors the kit.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -495,9 +497,15 @@ class GateTest(unittest.TestCase):
         """Request promote dry run."""
         _verified(self.stores)
         args = mock.Mock(commit=COMMIT, build_id="b1", trigger_name="demo-dev", auto_promote="true", dry_run=True)
-        with mock.patch.object(rr, "github_token", return_value="t"), mock.patch.object(rr, "post_slack") as slack:
+        with (
+            mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rr, "post_slack") as slack,
+            contextlib.redirect_stdout(io.StringIO()) as log,
+        ):
             self.assertEqual(rg.cmd_request_promote(args, self.stores), rg.EXIT_GO)
-        self.assertTrue(slack.call_args[0][0].startswith(":test_tube: TEST RUN, nothing is wrong"))
+        # A test run changes nothing: prod is up; the log says it was a test.
+        self.assertEqual(slack.call_args[0][0], rr.status_line("up", self.stores.service.name))
+        self.assertIn("up: TEST RUN, nothing is wrong", log.getvalue())
         index, _ = self.stores.dev.read(rg.dev_commit_index(COMMIT))
         self.assertNotIn("promote", index)
 
@@ -1180,6 +1188,131 @@ class VerdictTest(unittest.TestCase):
             self.assertEqual(target["commit"], "e" * 40)
 
 
+class StatusLineTest(unittest.TestCase):
+    """Every #deployments post is one line: dot, service, state, the ops board link, then any mentions."""
+
+    def test_each_state_is_one_exact_line(self) -> None:
+        """The exact line of each state, with the default ops board link."""
+        link = "<https://ops.orbitsearch.com/orbit-api|ops.orbitsearch.com/orbit-api>"
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+            lines = {state: rr.status_line(state, "orbit-api") for state in rr.STATUS_DOTS}
+        self.assertEqual(
+            lines,
+            {
+                "deploying": f":large_green_circle: *orbit-api* deploying · {link}",
+                "up": f":large_green_circle: *orbit-api* up · {link}",
+                "warning": f":large_yellow_circle: *orbit-api* warning · {link}",
+                "on hold": f":large_yellow_circle: *orbit-api* on hold · {link}",
+                "down": f":red_circle: *orbit-api* down · {link}",
+            },
+        )
+        with self.assertRaises(KeyError):
+            rr.status_line("passed", "orbit-api")
+
+    def test_mentions_end_the_line(self) -> None:
+        """The owner mentions of an alert come last, on the same line."""
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+            line = rr.status_line("down", "smp", ["<@UJONNY>", "<@UNICK>"])
+        self.assertEqual(
+            line,
+            ":red_circle: *smp* down · <https://ops.orbitsearch.com/smp|ops.orbitsearch.com/smp> <@UJONNY> <@UNICK>",
+        )
+        self.assertNotIn("\n", line)
+
+    def test_the_link_base_comes_from_release_ops_url(self) -> None:
+        """RELEASE_OPS_URL sets the link base; a trailing slash is dropped."""
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": "https://ops.example.com/"}):
+            self.assertEqual(rr.ops_url("demo"), "https://ops.example.com/demo")
+            self.assertEqual(
+                rr.status_line("on hold", "demo"),
+                ":large_yellow_circle: *demo* on hold · <https://ops.example.com/demo|ops.example.com/demo>",
+            )
+
+    def test_post_status_logs_the_detail_and_posts_only_the_line(self) -> None:
+        """The detail goes to the build log with Slack ids redacted; Slack gets the line alone."""
+        out = io.StringIO()
+        with (
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertTrue(rr.post_status("down", "demo", ["<@UJONNY>"], "check images failed; <@UJONNY> owns it"))
+        slack.assert_called_once_with(rr.status_line("down", "demo", ["<@UJONNY>"]))
+        self.assertIn("check images failed; <@...> owns it", out.getvalue())
+        self.assertNotIn("UJONNY", out.getvalue())
+
+    def test_overlapping_alerts_post_one_line(self) -> None:
+        """Two callers reach the same failed release at once: the claim lets only one post. A post that Slack did
+        not take frees the claim for the next caller; a claim whose caller died is taken over."""
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"})
+            _save(store, record)
+            inner: list[bool] = []
+
+            def slack(text: str, blocks: object = None) -> bool:
+                """While the first caller posts, a second caller (the watch) reaches the same release."""
+                if not inner:
+                    inner.append(rv.alert_once(SERVICE, store, record, "down", [], "second"))
+                return True
+
+            with mock.patch.object(rr, "post_slack", side_effect=slack) as posted:
+                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", ["<@UJONNY>"], "first"))
+            self.assertEqual(posted.call_count, 1)
+            self.assertEqual(inner, [True])
+            self.assertTrue(rr.read_record(store, record["release_id"])["alert"]["posted"])
+
+            other = _record(release_id="20261021T120000Z-ccccccccc", verdict={"status": "failed"})
+            _save(store, other, latest=False)
+            with mock.patch.object(rr, "post_slack", return_value=False):
+                self.assertFalse(rv.alert_once(SERVICE, store, other, "down", [], "lost"))
+            self.assertEqual(rr.read_record(store, other["release_id"])["alert"], {})
+            stale = {"claim": "dead", "at": "2026-10-21T10:00:00Z"}
+            rr.update_record(store, other["release_id"], lambda current: current.update(alert=stale), "test")
+            with mock.patch.object(rr, "post_slack", return_value=True) as posted:
+                self.assertTrue(rv.alert_once(SERVICE, store, other, "down", [], "retry"))
+                self.assertTrue(rv.alert_once(SERVICE, store, other, "down", [], "again"))
+            self.assertEqual(posted.call_count, 1)
+
+    def test_check_results_map_to_states(self) -> None:
+        """A check result posts its state: failed down once (with the owner), passed up, inconclusive warning,
+        the deploy checks passed deploying only without a dev stage, a passed window checkpoint nothing."""
+        data = service_data(tier="check_rollback")
+        del data["environments"]["dev"]
+        data["triggers"] = {"prod": ["demo-prod"], "rollback": "demo-rollback"}
+        no_dev = rc.parse_service(data)
+        window = VerdictTest._result(self)
+        deploy = VerdictTest._result(self, phase="deploy")
+        cases = [
+            (SERVICE, {"status": "failed", "phase": "window_15m"}, window, ["down", "<@UJONNY>"]),
+            (SERVICE, {"status": "passed"}, window, ["up"]),
+            (SERVICE, {"status": "inconclusive", "reason": "x"}, window, ["warning", "<@UJONNY>"]),
+            (SERVICE, {"status": "inconclusive", "cause": "capacity"}, window, ["warning"]),
+            (no_dev, {"status": "pending"}, deploy, ["deploying"]),
+            (SERVICE, {"status": "pending"}, deploy, []),
+            (no_dev, {"status": "pending"}, window, []),
+        ]
+        for service, verdict, result, expected in cases:
+            with (
+                self.subTest(verdict=verdict, phase=result["phase"], dev=service.has_dev),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                mock.patch.object(rv, "load_people", return_value=PEOPLE),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                store = _store(tmp)
+                record = _record(followup={}, verdict=verdict)
+                _save(store, record)
+                rv.post_result(service, store, record, result)
+                rv.post_result(service, store, rr.read_record(store, record["release_id"]), result)
+                lines = [call.args[0] for call in slack.call_args_list]
+                if not expected:
+                    self.assertEqual(lines, [])
+                    continue
+                line = rr.status_line(expected[0], service.name, expected[1:])
+                # A failed release posts its down line once; the other states post each time.
+                self.assertEqual(lines, [line] if expected[0] == "down" else [line, line])
+
+
 class AlertTest(unittest.TestCase):
     def test_rollback_alert_pings_author(self) -> None:
         """Rollback alert pings author."""
@@ -1198,18 +1331,18 @@ class AlertTest(unittest.TestCase):
             mock.patch.object(rv, "PEOPLE_FILE", Path(tempfile.gettempdir()) / "no-release-people.json"),
             mock.patch.dict(os.environ, {"RELEASE_PEOPLE_JSON": json.dumps(people)}),
         ):
-            text, blocks = rv.rollback_alert(SERVICE, record, "https://build", "gs://x")
-        self.assertIn("<@U095N7BBQKD>", text)
-        self.assertIn("Fixes-release: 20261021T100000Z-aaaaaaaaa", json.dumps(blocks))
-        text, _ = rv.rollback_alert(SERVICE, record, None, "gs://x")
-        self.assertIn("failed release-verify", text)
+            mentions, detail = rv.rollback_alert(SERVICE, record, "https://build", "gs://x")
+        self.assertEqual(mentions, ["<@U095N7BBQKD>"])
+        self.assertIn("Fixes-release: 20261021T100000Z-aaaaaaaaa", detail)
+        _, detail = rv.rollback_alert(SERVICE, record, None, "gs://x")
+        self.assertIn("failed release-verify", detail)
 
     def test_dev_alert_test_run(self) -> None:
         """Dev alert test run."""
         record = _record(verdict={"status": "failed", "reasons": ["forced"]})
-        text, blocks = rv.dev_verify_alert(SERVICE, record, "https://build", "gs://x", test_run=True)
-        self.assertTrue(text.startswith(rv.TEST_RUN_LINE))
-        self.assertNotIn("<@", json.dumps(blocks))
+        state, mentions, detail = rv.dev_verify_alert(SERVICE, record, "https://build", "gs://x", test_run=True)
+        self.assertEqual((state, mentions), ("up", []))
+        self.assertTrue(detail.startswith(rv.TEST_RUN_LINE))
 
 
 class AutoRollbackTest(unittest.TestCase):
@@ -1758,7 +1891,10 @@ class ReviewFixTest(unittest.TestCase):
                 auto_rollback={"status": "started", "claim": "c1", "build_id": "rb1", "at": "2026-10-21T10:00:00Z"}
             )
             _save(store, record)
-            with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                contextlib.redirect_stdout(io.StringIO()) as log,
+            ):
                 status = rv.follow_rollback(
                     SERVICE,
                     store,
@@ -1770,17 +1906,19 @@ class ReviewFixTest(unittest.TestCase):
                     get_build=lambda _: mock.Mock(status="FAILURE"),
                 )
             self.assertEqual(status, "FAILURE")
-            self.assertIn("--to previous-of:r1", slack.call_args[0][0])
+            self.assertEqual(slack.call_args[0][0], rr.status_line("down", SERVICE.name))
+            self.assertIn("--to previous-of:r1", log.getvalue())
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["auto_rollback"]["status"], "failed")
             self.assertFalse(rv.claim_blocks(saved, "other", datetime(2026, 10, 21, 11, tzinfo=rr.UTC)))
-            self.assertIn("Roll back by hand", slack.call_args[0][0])
+            self.assertIn("Roll back by hand", log.getvalue())
 
     def test_red_cleanup_build_does_not_recommend_a_second_rollback(self) -> None:
         """A restored, held rollback can end red for cleanup without reversing to the failed release."""
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()) as log,
         ):
             store = _store(tmp)
             record = _record(auto_rollback={"status": "started", "claim": "c1", "build_id": "rb1"})
@@ -1824,8 +1962,10 @@ class ReviewFixTest(unittest.TestCase):
             )
             self.assertEqual(status, "FAILURE")
             self.assertEqual(rr.read_record(store, record["release_id"])["auto_rollback"]["status"], "started")
-            self.assertIn("do not roll back again", slack.call_args.args[0])
-            self.assertNotIn("Roll back by hand", slack.call_args.args[0])
+            # One line for the restored, held moment (from the rollback build); the watch adds none.
+            self.assertEqual(slack.call_args_list, [mock.call(rr.status_line("on hold", SERVICE.name))])
+            self.assertIn("do not roll back again", log.getvalue())
+            self.assertNotIn("Roll back by hand", log.getvalue())
 
     def test_single_pod_spread(self) -> None:
         """Single pod spread."""
@@ -2672,11 +2812,13 @@ class LightTest(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, {"RELEASE_SLACK_DISABLED": "0"}),
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                contextlib.redirect_stdout(io.StringIO()) as log,
             ):
                 rl.alert(service, store, saved)
                 rl.alert(service, store, rr.read_record(store, newer["release_id"]))
             self.assertEqual(slack.call_count, 1)
-            self.assertIn(f"--sha={'e' * 40}", json.dumps(slack.call_args[0][1]))
+            self.assertTrue(slack.call_args[0][0].startswith(rr.status_line("down", service.name)))
+            self.assertIn(f"--sha={'e' * 40}", log.getvalue())
 
     def test_watch_waits_for_a_running_sync(self) -> None:
         """Watch waits for a running sync."""
@@ -2777,11 +2919,13 @@ class LightTest(unittest.TestCase):
                 mock.patch.object(rl, "wait_for_deploys", return_value=None),
                 mock.patch.object(rl, "evaluate_window", side_effect=rr.RecordError("logs down")),
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                contextlib.redirect_stdout(io.StringIO()) as log,
             ):
                 self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("inconclusive", True))
-            self.assertIn("inconclusive", slack.call_args[0][0])
+            self.assertTrue(slack.call_args[0][0].startswith(rr.status_line("warning", service.name)))
+            self.assertIn("inconclusive", log.getvalue())
             # The next release's watch judges the unchecked release with it.
             newer = _record(
                 release_id="20261021T120000Z-ccccccccc",
@@ -3365,6 +3509,7 @@ class LightFullProdTest(unittest.TestCase):
         self.patches = [
             mock.patch.object(rl, "GoogleApi"),
             mock.patch.object(rr, "github_token", return_value="t"),
+            mock.patch.object(rr, "head_pr", return_value=None),
             mock.patch.object(rr, "build_info", return_value={"id": "b1"}),
             mock.patch.object(rr, "post_slack", return_value=True),
         ]
@@ -3539,12 +3684,16 @@ class LightFullProdTest(unittest.TestCase):
             mock.patch.object(rv, "suspected_prs", return_value=[]),
             mock.patch.object(rl, "alert") as alert,
             mock.patch.object(rv, "start_rollback") as start,
+            contextlib.redirect_stdout(io.StringIO()) as log,
         ):
             self.assertEqual(
                 rl.cmd_check(_args(release_id=record["release_id"]), RUN, self.prod, self.gcloud), rv.EXIT_FAILED
             )
             alert.assert_not_called()
-            self.assertIn("An automatic rollback follows", rr.post_slack.call_args[0][0])
+            self.assertTrue(rr.post_slack.call_args[0][0].startswith(rr.status_line("down", RUN.name)))
+            self.assertIn("An automatic rollback follows", log.getvalue())
+            # The down line is sent once per release: the check build noted it in the record.
+            self.assertTrue(rr.read_record(self.prod, record["release_id"])["alert"]["posted"])
             saved = rr.read_record(self.prod, record["release_id"])
             self.assertIn("release_rollback.py run", saved["rollback_suggestion"]["how"][0])
             self.assertEqual(saved["rollback_suggestion"]["target"]["release_id"], record["previous"]["release_id"])
@@ -4125,7 +4274,11 @@ class VersionTest(unittest.TestCase):
 
     def test_rollback_that_does_not_help(self) -> None:
         """After the rollback the target fails the same limit: the signal is marked and the hold ends."""
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()) as log,
+        ):
             store = _store(tmp)
             record = self._rolled_back(store)
             dd = FakeDatadog({}, {ERRORS: {"GET /b": 300}, HITS: {"GET /b": 1000}})
@@ -4144,7 +4297,8 @@ class VersionTest(unittest.TestCase):
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["cause"], "environmental")
             hold = rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]
             self.assertEqual(hold["status"], "released")
-            self.assertIn("did not help", slack.call_args_list[-1].args[0])
+            self.assertEqual(slack.call_args_list[-1].args[0], rr.status_line("down", SERVICE.name))
+            self.assertIn("did not help", log.getvalue())
             self.assertTrue(
                 json.loads((Path(tmp) / rv.ENVIRONMENTAL_OBJECT).read_text())["signals"]["http_error_rate demo GET /b"][
                     "alerted"
@@ -4170,7 +4324,11 @@ class VersionTest(unittest.TestCase):
 
     def test_mixed_failure_keeps_the_cause(self) -> None:
         """One signal still fails, another regression recovered: marks, but no release-wide cause, hold stays."""
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rr, "post_slack", return_value=True) as slack:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()) as log,
+        ):
             store = _store(tmp)
             record = self._rolled_back(store)
 
@@ -4193,7 +4351,8 @@ class VersionTest(unittest.TestCase):
             self.assertNotIn("cause", verdict)
             self.assertEqual(verdict["environmental_signals"], ["http_error_rate demo GET /b"])
             self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
-            self.assertIn("keep the promote hold", slack.call_args_list[-1].args[0])
+            self.assertEqual(slack.call_args_list[-1].args[0], rr.status_line("down", SERVICE.name))
+            self.assertIn("keep the promote hold", log.getvalue())
 
     def test_rollback_check_skips_spread_and_busy_prod(self) -> None:
         """A spread metric is not judged again, and nothing is judged while a build changes prod."""
@@ -4460,7 +4619,7 @@ class VersionTest(unittest.TestCase):
                 mock.patch.object(rv, "evaluate", return_value=result),
                 mock.patch.object(rv, "apply_result", return_value=saved),
                 mock.patch.object(rv, "print_result"),
-                mock.patch.object(rv, "slack_line", return_value="ok"),
+                mock.patch.object(rv, "result_detail", return_value="ok"),
                 mock.patch.object(rv, "prod_state", return_value=(None, None)),
                 mock.patch.object(rv, "builds_since_rollback", return_value=[]),
             ):
@@ -4731,9 +4890,12 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             return 0
 
         sleeps: list[float] = []
-        with mock.patch.object(rr, "post_slack", return_value=True) as slack:
+        with (
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stderr(io.StringIO()) as log,
+        ):
             code = rr.finish_with_retries(
-                flaky, attempts=3, title="demo", env="prod", release_id="r1", recovery=["a"], sleep=sleeps.append
+                flaky, attempts=3, service="demo", env="prod", release_id="r1", recovery=["a"], sleep=sleeps.append
             )
             self.assertEqual((code, len(calls), len(sleeps)), (0, 3, 2))
             slack.assert_not_called()
@@ -4741,14 +4903,16 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             code = rr.finish_with_retries(
                 mock.Mock(side_effect=OSError("disk")),
                 attempts=3,
-                title="demo",
+                service="demo",
                 env="prod",
                 release_id="r1",
                 recovery=recovery,
                 sleep=lambda _: None,
             )
         self.assertEqual(code, 1)
-        text = slack.call_args[0][0]
+        # Slack gets the down line; the recovery commands are in the build log.
+        self.assertEqual(slack.call_args[0][0], rr.status_line("down", "demo"))
+        text = log.getvalue()
         for command in recovery:
             self.assertIn(command, text)
         self.assertIn("release_record.py finish --service demo --env prod --release-id r1 --status deployed", text)
@@ -4776,13 +4940,15 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
                 mock.patch.object(rr, "cmd_finish", side_effect=rr.RecordError("GCS 503")) as finish,
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
                 mock.patch.object(rr.time, "sleep"),
+                contextlib.redirect_stderr(io.StringIO()) as log,
             ):
                 code = rr.main(
                     ["finish", "--env", "prod", "--attempts", "3", "--release-id-file", f"{tmp}/release_id"]
                     + ["--status", "deployed"]
                 )
             self.assertEqual((code, finish.call_count), (1, 3))
-            self.assertIn("--release-id r1", slack.call_args[0][0])
+            self.assertEqual(slack.call_args[0][0], rr.status_line("down", SERVICE.name))
+            self.assertIn("--release-id r1", log.getvalue())
 
     def test_prod_build_contract(self) -> None:
         """Prod build contract."""
@@ -4924,6 +5090,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             with (
                 mock.patch.object(rr, "post_slack", return_value=True) as slack,
                 mock.patch.object(rv, "_point_verified") as pointed,
+                contextlib.redirect_stdout(io.StringIO()) as log,
             ):
                 saved = rv.finish_dev_verify(SERVICE, store, record, result, build_url="https://b")
             self.assertEqual(saved["verdict"]["status"], "inconclusive")
@@ -4931,7 +5098,8 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             index, _ = store.read(rg.dev_commit_index(record["commit"]))
             self.assertEqual(index["verdict"]["status"], "inconclusive")
             pointed.assert_not_called()
-            self.assertIn("dev verify inconclusive", slack.call_args[0][0])
+            self.assertEqual(slack.call_args[0][0], rr.status_line("warning", SERVICE.name))
+            self.assertIn("dev verify inconclusive", log.getvalue())
 
     def test_rollback_watch_reads_a_failed_early_check(self) -> None:
         """A failed early check is the verdict's phase: its regressions stay readable after the rollback."""
@@ -5073,9 +5241,9 @@ class PeopleMapTest(unittest.TestCase):
             mock.patch.dict(os.environ, {"RELEASE_PEOPLE_JSON": '{"slack_ids": null, "fallback": 3}'}),
             mock.patch("sys.stderr"),
         ):
-            text, _ = rv.rollback_alert(SERVICE, record, None, "gs://x")
-        self.assertTrue(text)
-        self.assertNotIn("<@", text)
+            mentions, detail = rv.rollback_alert(SERVICE, record, None, "gs://x")
+        self.assertTrue(detail)
+        self.assertEqual(mentions, [])
 
     def test_logs_never_show_slack_ids(self) -> None:
         self.assertEqual(rr.redact_slack_ids("<@U095N7BBQKD> and <@UFALL> failed"), "<@...> and <@...> failed")
@@ -5364,16 +5532,17 @@ class LateFailedReceiptAndRecoveryTest(unittest.TestCase):
             with (
                 mock.patch.object(rr, "open_from_args", return_value=(SERVICE, PROD, store, clients)),
                 mock.patch.object(rr, "snapshot_workloads", side_effect=rr.RecordError("kubectl timed out")),
-                mock.patch.object(rr, "post_slack", return_value=True) as slack,
+                mock.patch.object(rr, "post_slack", return_value=True),
                 mock.patch.object(rr.time, "sleep"),
+                contextlib.redirect_stderr(io.StringIO()) as log,
             ):
                 code = rr.main(
                     ["finish", "--env", "prod", "--attempts", "3", "--release-id-file", f"{tmp}/release_id"]
                     + ["--status", "deploy_failed", "--failed-step-file", str(step_file)]
                 )
             self.assertEqual(code, 1)
-            finish = re.search(r"1\) `([^`]+)`", slack.call_args[0][0]).group(1)
-            # The build is over: its /workspace is gone. A human runs the command from the alert.
+            finish = re.search(r"1\) `([^`]+)`", log.getvalue()).group(1)
+            # The build is over: its /workspace is gone. A human runs the command from the build log.
             step_file.unlink()
             argv = shlex.split(finish)
             self.assertEqual(argv[:3], ["python3", "release/release_record.py", "finish"])
@@ -5451,16 +5620,18 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, result=failed)
-            alerts = [text for text in posts if "FAILED" in text]
+            alerts = [text for text in posts if " down · " in text]
             self.assertTrue(alerts, posts)
             self.assertIn("<@UJONNY>", alerts[0])
+            # One down line per failed release: the rollback that follows adds none.
+            self.assertEqual(len(alerts), 1, posts)
         # Inconclusive: the last checkpoint could not run.
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, error=rr.RecordError("cluster unavailable"))
-            alerts = [text for text in posts if "could not run" in text]
+            alerts = [text for text in posts if " warning · " in text]
             self.assertTrue(alerts, posts)
             self.assertIn("<@UJONNY>", alerts[-1])
 
@@ -5497,7 +5668,7 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, people=people, result=failed)
-            self.assertIn("<@UFALLBACK>", [text for text in posts if "FAILED" in text][0])
+            self.assertIn("<@UFALLBACK>", [text for text in posts if " down · " in text][0])
 
     def test_the_author_is_the_newest_pr_not_a_later_direct_commit(self) -> None:
         """A direct or automated commit after the PR never takes ownership from the PR's author."""
@@ -5523,8 +5694,67 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
                 "claimed",
             )
             with mock.patch.object(rv, "load_people", return_value=PEOPLE):
-                self.assertEqual(rv.owner_suffix(stale), " <@UJONNY>")
-                self.assertEqual(rv.owner_suffix(stale, store), "")
+                self.assertEqual(rv.owner_now(stale), ["<@UJONNY>"])
+                self.assertEqual(rv.owner_now(stale, store), [])
+
+    def test_the_owner_is_the_author_of_the_release_commits_pr_as_github_reports_it(self) -> None:
+        """The commit author can differ from the PR author (a cherry-picked commit), and a commit list over 250
+        commits can miss the release PR: the record keeps the PR GitHub links to the release commit."""
+        pulls = [{"number": 99, "merged_at": "2026-10-26T10:00:00Z", "user": {"login": "pr-author"}}]
+        compare = {"commits": [], "total_commits": 300, "status": "ahead"}
+
+        def github(path, token):
+            if "/pulls" in path:
+                return pulls
+            return compare
+
+        with (
+            mock.patch.object(rr, "github_json", side_effect=github),
+            mock.patch.object(rr, "github_compare_status", return_value="ahead"),
+        ):
+            record = rr.new_record(
+                PROD,
+                kind="promote",
+                commit=COMMIT,
+                images={},
+                build={"id": "b1"},
+                previous={"commit": PREVIOUS},
+                started_at="2026-10-26T10:00:00Z",
+                token="t",
+            )
+        self.assertEqual(record["head_pr"], {"pr": 99, "author": "pr-author"})
+        record["commits"] = [{"sha": COMMIT, "title": "Fix (#99)", "pr": 99, "author": "commit-author"}]
+        self.assertEqual(rv.ro.release_author(record), ("pr-author", 99))
+        with mock.patch.object(rr, "github_json", side_effect=guard.GuardError("unavailable")):
+            self.assertIsNone(rr.head_pr("o/r", COMMIT, "t"))
+
+    def test_the_rollback_alert_mentions_the_owner_and_not_the_fallback(self) -> None:
+        """An unclaimed release's failed-release alert mentions its PR author with the suspects' authors."""
+        record = _record(followup={}, verdict={"status": "failed", "reasons": ["error rate regressed"]})
+        older = {"sha": "c" * 40, "title": "Old change (#11)", "pr": 11, "author": "mapped-other"}
+        people = {"slack_ids": {"jonnybcw": "UJONNY", "mapped-other": "UOTHER"}, "fallback": ["UFALLBACK"]}
+        with (
+            mock.patch.object(rv, "load_people", return_value=people),
+            mock.patch.object(rv, "likely_prs", return_value=[older]),
+        ):
+            mentions, _ = rv.rollback_alert(SERVICE, record, None, "gs://x/r.json")
+            self.assertEqual(mentions, ["<@UOTHER>", "<@UJONNY>"])
+            claimed = _record(verdict=record["verdict"])
+            self.assertEqual(rv.rollback_alert(SERVICE, claimed, None, "gs://x/r.json")[0], ["<@UOTHER>"])
+
+    def test_an_unmapped_owner_gets_the_fallback_next_to_a_mapped_suspect(self) -> None:
+        """The owner's fallback does not depend on the suspects: a mapped earlier contributor and an unmapped
+        release author mention both that contributor and the fallback people."""
+        record = _record(followup={})
+        older = {"sha": "c" * 40, "title": "Old change (#11)", "pr": 11, "author": "mapped-other"}
+        people = {"slack_ids": {"mapped-other": "UOTHER"}, "fallback": ["UFALLBACK"]}
+        self.assertEqual(rv.failure_mentions(record, people, [older]), ["<@UOTHER>", "<@UFALLBACK>"])
+        mapped = {"slack_ids": {"mapped-other": "UOTHER", "jonnybcw": "UJONNY"}, "fallback": ["UFALLBACK"]}
+        self.assertEqual(rv.failure_mentions(record, mapped, [older]), ["<@UOTHER>", "<@UJONNY>"])
+        # An agent-claimed release: the suspects only, the fallback when none of them is mapped.
+        claimed = _record()
+        self.assertEqual(rv.failure_mentions(claimed, people, [older]), ["<@UOTHER>"])
+        self.assertEqual(rv.failure_mentions(claimed, {"slack_ids": {}, "fallback": ["UF"]}, [older]), ["<@UF>"])
 
     def _light_watch(self, store, record, *, error=None):
         """Run the Cloud Run watch over +60; return (exit code, every Slack text)."""
@@ -5556,9 +5786,125 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._light_watch(store, record, error=rr.RecordError("logging unavailable"))
-            alerts = [text for text in posts if "inconclusive" in text]
+            alerts = [text for text in posts if " warning · " in text]
             self.assertTrue(alerts, posts)
             self.assertIn("<@UJONNY>", alerts[-1])
+
+
+class DescribeTest(unittest.TestCase):
+    """Every release record names its repository, deploy target and domains (Orbit Ops finds services by them)."""
+
+    def _new(self, env: rc.Environment) -> dict:
+        """A new record of env, without GitHub."""
+        return rr.new_record(
+            env,
+            kind="promote",
+            commit=COMMIT,
+            images={"app": f"{REPO}@{NEW}"},
+            build={"id": "b1"},
+            previous={"release_id": None, "commit": PREVIOUS},
+            started_at="2026-10-28T12:00:00Z",
+            token=None,
+        )
+
+    def test_gke_record_names_cluster_namespace_and_workloads(self) -> None:
+        """A GKE record: project, region, cluster, namespace, the main Deployment and all of them; old fields stay."""
+        record = self._new(PROD)
+        self.assertEqual(record["repo"], "orbit-search/demo")
+        self.assertEqual(
+            record["deploy_target"],
+            {
+                "platform": "gke",
+                "project": "orbit-search",
+                "region": "us-central1",
+                "cluster": "prod",
+                "namespace": "demo",
+                "workload": "prod-demo",
+                "workloads": ["prod-demo", "prod-demo-worker"],
+            },
+        )
+        self.assertNotIn("domains", record)
+        self.assertEqual(record["schema_version"], rr.SCHEMA_VERSION)
+        self.assertEqual(record["service"], "demo")
+        self.assertEqual(record["status"], "deploying")
+        dev = self._new(SERVICE.dev)
+        self.assertEqual(dev["deploy_target"]["cluster"], "dev")
+        self.assertEqual(dev["deploy_target"]["workload"], "dev-demo")
+        self.assertNotIn("workloads", dev["deploy_target"])
+        json.dumps(record)
+
+    def test_gke_domains_from_config_and_public_smoke(self) -> None:
+        """GKE domains: environments.<env>.domains first, then the hosts of http_public smoke checks, each once."""
+        data = service_data()
+        prod = data["environments"]["prod"]
+        prod["domains"] = ["demo.example.com"]
+        prod["smoke"] = [
+            *prod["smoke"],
+            {"type": "http_public", "url": "https://www.demo.example.com/"},
+            {"type": "http_public", "url": "https://demo.example.com/health"},
+        ]
+        record = self._new(rc.parse_service(data).prod)
+        self.assertEqual(record["domains"], ["demo.example.com", "www.demo.example.com"])
+        for bad in (["Demo.Example.com"], ["https://demo.example.com"], "", [""], [3]):
+            prod["domains"] = bad
+            with self.assertRaises(rc.ConfigError, msg=repr(bad)):
+                rc.parse_service(data)
+
+    def test_light_kinds(self) -> None:
+        """Cloud Run, Composer, Vercel, Railway and the static site each name their platform's target."""
+        import test_release_railway as trw  # noqa: PLC0415 - fixtures of the other kinds
+        import test_release_vercel as tvc  # noqa: PLC0415
+
+        run = self._new(RUN.prod)
+        self.assertEqual(
+            run["deploy_target"],
+            {
+                "platform": "cloud-run",
+                "project": "orbit-search",
+                "region": "us-central1",
+                "workload": "demo-a",
+                "workloads": ["demo-a", "demo-b"],
+            },
+        )
+        self.assertEqual(run["domains"], ["demo-a-xyz-uc.a.run.app", "demo-b-xyz-uc.a.run.app"])
+        dev = self._new(RUN.dev)
+        self.assertEqual(dev["deploy_target"], run["deploy_target"])
+        self.assertNotIn("domains", dev)
+
+        flow = self._new(FLOW.prod)
+        self.assertEqual(
+            flow["deploy_target"],
+            {"platform": "composer", "project": "orbit-search", "region": "us-central1", "workload": "env-v3"},
+        )
+        self.assertNotIn("domains", flow)
+
+        web = self._new(tvc.WEB.prod)
+        self.assertEqual(web["repo"], "orbit-search/demo-web")
+        self.assertEqual(web["deploy_target"], {"platform": "vercel", "vercel_project": "demo-web"})
+        self.assertEqual(web["domains"], [tvc.DOMAIN])
+        self.assertNotIn("domains", self._new(tvc.WEB.dev))
+
+        api = self._new(trw.API.prod)
+        self.assertEqual(
+            api["deploy_target"],
+            {"platform": "railway", "railway_project": trw.PROJECT, "railway_service": trw.SERVICE},
+        )
+        self.assertEqual(api["domains"], ["api.demo.example.com"])
+        self.assertEqual(self._new(trw.API.dev)["domains"], ["demo-staging.up.railway.app"])
+
+        docs = self._new(trw.DOCS.prod)
+        self.assertEqual(docs["deploy_target"], {"platform": "mintlify"})
+        self.assertEqual(docs["domains"], ["docs.example.com"])
+
+    def test_unknown_values_are_left_out(self) -> None:
+        """An environment that knows nothing of its target gives a record without the fields, never nulls."""
+        bare = rc.Environment(**{**PROD.__dict__, "github_repo": "", "deploy_target": (), "domains": ()})
+        record = self._new(bare)
+        for key in ("repo", "deploy_target", "domains"):
+            self.assertNotIn(key, record)
+        self.assertEqual(rr.describe(bare), {})
+        target = rc.deploy_target("gke", project="", region="r", workload=("", "w"))
+        self.assertEqual(target, (("platform", "gke"), ("region", "r"), ("workload", "w")))
 
 
 if __name__ == "__main__":
