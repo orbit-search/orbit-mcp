@@ -157,7 +157,8 @@ steps:
           exit 0
         fi
         python3 release/release_light.py check --env prod --release-id-file /workspace/release_id \
-          --failed-marker /workspace/release_verify_failed
+          --failed-marker /workspace/release_verify_failed \
+          --alerted-marker /workspace/release_verify_alerted
         VERIFY_STATUS=$$?
         if [ "$${VERIFY_STATUS}" -ne 0 ] && [ "$${VERIFY_STATUS}" -ne 2 ]; then
           echo "release-verify could not run (exit $${VERIFY_STATUS}); release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
@@ -188,10 +189,13 @@ steps:
           TEXT=":white_check_mark: orbit-mcp prod promote completed for commit \`$SHORT_SHA\`"
         fi
         echo "$${TEXT}"
-        # Slack gets a status line only for a moment no other step posts: a failed check posted its
-        # down line, the promote said deploying, the watch says up. The reason stays in this build log.
+        # Slack gets a status line only for a moment no other step posts. The promote said deploying,
+        # the watch says up, release_light.py finish posts down when the finish failed after the promote,
+        # and the check wrote release_verify_alerted when Slack took its failed release line.
+        # The reason stays in this build log.
         STATE=""
-        if [ -f /workspace/deploy_superseded ] || [ -f /workspace/release_verify_failed ]; then :
+        if [ -f /workspace/deploy_superseded ] || [ -f /workspace/release_verify_alerted ]; then :
+        elif [ -f /workspace/release_record_failed ]; then :
         elif [ -f /workspace/deploy_failed ]; then STATE="down"
         elif [ -s /workspace/release_verify_unchecked ]; then STATE="warning"
         fi
