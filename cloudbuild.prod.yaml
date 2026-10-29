@@ -53,7 +53,7 @@ steps:
         if [ "$${GATE_STATUS}" -eq 4 ]; then touch /workspace/deploy_superseded; exit 0; fi
         if [ "$${GATE_STATUS}" -ne 0 ]; then touch /workspace/promote_blocked; exit 1; fi
 
-  - name: gcr.io/cloud-builders/curl
+  - name: gcr.io/cloud-builders/gcloud
     id: notify-promote-blocked
     entrypoint: bash
     secretEnv: [WEBHOOK_ORBIT]
@@ -65,9 +65,8 @@ steps:
         if [ -n "$${BUILDER_OUTPUT:-}" ]; then
           printf '%s\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
         fi
-        curl -s -X POST -H 'Content-type: application/json' \
-          --data '{"text":":x: orbit-mcp prod promote blocked for commit `$SHORT_SHA` (not on main, dev build missing or failed, dev verify not passed, or the candidate revisions changed); see the promote-preflight and promote-gate steps of <https://console.cloud.google.com/cloud-build/builds;region=us-central1/$BUILD_ID?project=$PROJECT_ID|the prod build>"}' \
-          "$$WEBHOOK_ORBIT"
+        echo 'orbit-mcp prod promote blocked for commit `$SHORT_SHA` (not on main, dev build missing or failed, dev verify not passed, or the candidate revisions changed); see the promote-preflight and promote-gate steps of <https://console.cloud.google.com/cloud-build/builds;region=us-central1/$BUILD_ID?project=$PROJECT_ID|the prod build>' >&2
+        python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "on hold" orbit-mcp || true
         exit 1
 
   # Still current: right before the traffic moves, no newer prod build exists,
@@ -188,8 +187,17 @@ steps:
         else
           TEXT=":white_check_mark: orbit-mcp prod promote completed for commit \`$SHORT_SHA\`"
         fi
-        PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$${TEXT}")"
-        curl -s -X POST -H 'Content-type: application/json' --data "$${PAYLOAD}" "$$WEBHOOK_ORBIT"
+        echo "$${TEXT}"
+        # Slack gets a status line only for a moment no other step posts: a failed check posted its
+        # down line, the promote said deploying, the watch says up. The reason stays in this build log.
+        STATE=""
+        if [ -f /workspace/deploy_superseded ] || [ -f /workspace/release_verify_failed ]; then :
+        elif [ -f /workspace/deploy_failed ]; then STATE="down"
+        elif [ -s /workspace/release_verify_unchecked ]; then STATE="warning"
+        fi
+        if [ -n "$${STATE}" ]; then
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "$${STATE}" orbit-mcp || true
+        fi
         if [ -f /workspace/deploy_failed ]; then exit 1; fi
 
   # A failed release-verify check ends the build red (the record holds the rollback suggestion).
