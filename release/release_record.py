@@ -781,20 +781,26 @@ STATUS_DOTS = {
 }
 
 
-def ops_url(service: str) -> str:
-    """The ops board page of a service: RELEASE_OPS_URL (default OPS_URL) + /<service>."""
-    base = os.environ.get("RELEASE_OPS_URL", "").strip().rstrip("/") or OPS_URL
+def ops_url(service: str, base: str | None = None) -> str:
+    """The ops board page of a service: base, else RELEASE_OPS_URL, else OPS_URL; then /<service>."""
+    base = (base or os.environ.get("RELEASE_OPS_URL", "")).strip().rstrip("/") or OPS_URL
     return f"{base}/{service}"
 
 
-def status_line(state: str, service: str, mentions: list[str] | tuple[str, ...] = ()) -> str:
+def status_line(state: str, service: str, mentions: list[str] | tuple[str, ...] = (), base: str | None = None) -> str:
     """The one Slack line of a release moment: dot, service, state and the ops board link.
 
     state: deploying, up, warning, on hold or down. mentions: the owner Slack mentions of an alert,
-    at the end of the line. Raise KeyError on an unknown state."""
-    url = ops_url(service)
+    at the end of the line. base: the ops board (see ops_url). Raise KeyError on an unknown state."""
+    url = ops_url(service, base)
     line = f"{STATUS_DOTS[state]} *{service}* {state} · <{url}|{url.split('://', 1)[-1]}>"
     return " ".join([line, *mentions])
+
+
+def rendered_status_line(state: str, service: str) -> str:
+    """The status line a rendered build posts with curl. Always the OPS_URL link: a committed build file
+    must not depend on the environment of whoever rendered it (release_kit.py check renders it again)."""
+    return status_line(state, service, base=OPS_URL)
 
 
 def post_status(state: str, service: str, mentions: list[str] | tuple[str, ...] = (), detail: str = "") -> bool:

@@ -2150,11 +2150,18 @@ def owner_now(record: dict, store: rr.Store | None = None) -> list[str]:
     return owner_mentions(record)
 
 
-ALERT_CLAIM_SECONDS = 300
+# A claim older than this belongs to a caller that died mid-post (a Slack post times out after 15 s).
+ALERT_CLAIM_SECONDS = 120
+# How often a caller that found another caller's live claim reads the record again.
+ALERT_POLL_SECONDS = 5
 
 
 class AlertTaken(Exception):
-    """Another caller posted, or is posting, the alert line of this release."""
+    """Another caller posted the alert line of this release: Slack took it."""
+
+
+class AlertPending(Exception):
+    """Another live caller holds the alert claim and has not posted yet."""
 
 
 def alert_once(
@@ -2164,21 +2171,28 @@ def alert_once(
 
     The check build, the watch and the rollback all reach the same failed release. A caller first claims the
     alert in the record (a conditional write, so of two callers only one wins), then posts, then notes
-    "alert": posted. A post that Slack did not take frees the claim for the next caller; a claim older than
-    ALERT_CLAIM_SECONDS (its caller died) is taken over. Whether the line is in Slack, or another caller has it.
+    "alert": posted. Only that note counts as sent. A caller that finds another caller's live claim waits for
+    it: a post that Slack did not take frees the claim and the waiting caller posts; a claim older than
+    ALERT_CLAIM_SECONDS (its caller died) is taken over. Returns whether the line is in Slack.
     """
     release_id = record["release_id"]
     claim_id = uuid.uuid4().hex
+    # The other caller's claim this caller waits on, and how long it has waited on that claim.
+    seen: dict = {"claim": None, "waited": 0.0}
 
     def claim(current: dict) -> None:
-        """Claim the alert; raise AlertTaken when it was posted or another live caller holds it."""
+        """Claim the alert; raise AlertTaken when it was posted, AlertPending when another live caller holds it."""
         alert = current.get("alert") or {}
         if alert.get("posted"):
             raise AlertTaken(release_id)
-        if alert.get("claim") and alert.get("claim") != claim_id:
+        holder = alert.get("claim")
+        if holder and holder != claim_id:
+            if holder != seen["claim"]:
+                seen.update(claim=holder, waited=0.0)  # a new holder (a takeover): its wait starts again
             age = (datetime.now(rr.UTC) - rr.parse_utc(alert.get("at") or rr.utc_now())).total_seconds()
-            if age < ALERT_CLAIM_SECONDS:
-                raise AlertTaken(release_id)
+            # The time this caller waited on this claim counts too, so the wait ends when the clocks disagree.
+            if max(age, seen["waited"]) < ALERT_CLAIM_SECONDS:
+                raise AlertPending(release_id)
         current["alert"] = {"claim": claim_id, "at": rr.utc_now()}
 
     def settle(posted: bool) -> Callable[[dict], None]:
@@ -2190,15 +2204,23 @@ def alert_once(
 
         return change
 
-    try:
-        rr.update_record(store, release_id, claim, "alert_claimed", {"claim": claim_id})
-    except AlertTaken:
-        print(f"The alert of {release_id} is sent already: {rr.redact_slack_ids(detail)}", flush=True)
-        return True
-    except (rr.RecordError, GuardError, OSError) as error:
-        # The record cannot be written: post anyway, a duplicate line beats a lost alert.
-        print(f"WARNING: could not claim the alert: {error}", file=sys.stderr, flush=True)
-        return rr.post_status(state, service.name, mentions, detail)
+    while True:
+        try:
+            rr.update_record(store, release_id, claim, "alert_claimed", {"claim": claim_id})
+            break
+        except AlertTaken:
+            print(f"The alert of {release_id} is sent already: {rr.redact_slack_ids(detail)}", flush=True)
+            return True
+        except AlertPending:
+            # A claim is not a post: wait until the other caller posts, frees the claim or dies.
+            if not seen["waited"]:
+                print(f"Another caller is posting the alert of {release_id}; waiting for it", flush=True)
+            time.sleep(ALERT_POLL_SECONDS)
+            seen["waited"] += ALERT_POLL_SECONDS
+        except (rr.RecordError, GuardError, OSError) as error:
+            # The record cannot be written: post anyway, a duplicate line beats a lost alert.
+            print(f"WARNING: could not claim the alert: {error}", file=sys.stderr, flush=True)
+            return rr.post_status(state, service.name, mentions, detail)
     posted = rr.post_status(state, service.name, mentions, detail)
     try:
         rr.update_record(store, release_id, settle(posted), "alert_posted" if posted else "alert_not_posted")

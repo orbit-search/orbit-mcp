@@ -234,6 +234,7 @@ def _args(**values) -> argparse.Namespace:
         "status": "deployed",
         "force_fail": "",
         "failed_marker": "",
+        "alerted_marker": "",
         "parse_result": "",
         "build_url": "https://build",
         "wait": False,
@@ -344,10 +345,30 @@ class RailwayConfigTest(unittest.TestCase):
                 if "curl" in line and "WEBHOOK_ORBIT" in line
             ]
             self.assertTrue(posts, service.name)
-            lines = [rr.status_line(state, service.name) for state in ("on hold", "warning")]
+            lines = [rr.rendered_status_line(state, service.name) for state in ("on hold", "warning", "down")]
             for post in posts:
                 self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
             self.assertNotIn("PAYLOAD", "".join(files.values()))
+
+    def test_a_failed_deploy_posts_one_line(self) -> None:
+        """A failed prod deploy posts the deploy check's down line only, never down and then warning (tier
+        full: the promote build; check_rollback: the merge build)."""
+        import test_release_kit as tk
+
+        for service, build in ((API, "promote"), (DIRECT, "release")):
+            with self.subTest(service=build):
+                text = kit.rendered(service)[f"release/services/demo-api.{build}.yaml"]
+                self.assertIn('id: "notify-result"', text)
+                tk.assert_one_line_per_result(self, text, service.name)
+
+    def test_rendering_ignores_release_ops_url(self) -> None:
+        """The rendered builds link the fixed ops board: a local RELEASE_OPS_URL never makes check reject them."""
+        for service in (API, DIRECT, DOCS):
+            with self.subTest(service=service.name):
+                with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+                    default = kit.rendered(service)
+                with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": "https://ops.example.com"}):
+                    self.assertEqual(kit.rendered(service), default)
 
     def test_render(self) -> None:
         """Tier full renders the merge (dev), promote, window and rollback builds; check_rollback has no promote."""
