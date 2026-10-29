@@ -699,8 +699,10 @@ steps:
                 echo "release record missing; release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
                 exit 0
               fi
+              # --alerted-marker: written only when Slack took the failed release's line (down, or on hold).
               python3 release/release_light.py --service {service} check --env prod \\
-                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed
+                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed \\
+                --alerted-marker /workspace/release_verify_alerted
               VERIFY_STATUS=$$?
               if [ "$${{VERIFY_STATUS}}" -ne 0 ] && [ "$${{VERIFY_STATUS}}" -ne 2 ]; then
                 echo "release-verify could not run (exit $${{VERIFY_STATUS}}); release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
@@ -744,9 +746,14 @@ steps:
                 TEXT=":white_check_mark: {title} prod promote completed for commit \\`$SHORT_SHA\\`"
               fi
               echo "$${{TEXT}}"
-              # Slack gets a status line only when no other step posts this moment: a failed deploy or an
-              # unchecked prod. A failed check posted its down line; the promote said deploying; the watch says up.
-              if [ -f /workspace/deploy_failed ] || [ -f /workspace/release_verify_unchecked ]; then
+              # One status line per moment. When Slack took the deploy check's line of a failed release (a failed
+              # deploy fails it), nothing more; else a failed deploy posts down and an unchecked prod warning.
+              # The promote said deploying; the watch says up.
+              if [ -f /workspace/release_verify_alerted ]; then
+                :
+              elif [ -f /workspace/deploy_failed ]; then
+                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_down}"}}' "$$WEBHOOK_ORBIT"
+              elif [ -f /workspace/release_verify_unchecked ]; then
                 curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_warning}"}}' "$$WEBHOOK_ORBIT"
               fi
               if [ -f /workspace/deploy_failed ]; then exit 1; fi
@@ -903,8 +910,9 @@ def rendered_vercel(service: object) -> dict[str, str]:
         "wait_seconds": (service.deployment_wait_minutes + 5) * 60,  # type: ignore[attr-defined]
         "build_seconds": (service.deployment_wait_minutes + 60) * 60,  # type: ignore[attr-defined]
         # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
-        "line_on_hold": rr.status_line("on hold", service.name),  # type: ignore[attr-defined]
-        "line_warning": rr.status_line("warning", service.name),  # type: ignore[attr-defined]
+        "line_on_hold": rr.rendered_status_line("on hold", service.name),  # type: ignore[attr-defined]
+        "line_warning": rr.rendered_status_line("warning", service.name),  # type: ignore[attr-defined]
+        "line_down": rr.rendered_status_line("down", service.name),  # type: ignore[attr-defined]
     }
     files = {
         service.release_build_config: VERCEL_RELEASE_TEMPLATE.format(**values),  # type: ignore[attr-defined]

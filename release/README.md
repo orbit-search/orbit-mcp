@@ -22,8 +22,10 @@ The repo owns only `release/services/<service>.json` and the build files that
 ## Slack
 
 Every post to #deployments is one line: a status dot, the service, its state and a link to the
-service's page on the ops board, `<RELEASE_OPS_URL>/<service>` (default `https://ops.orbitsearch.com`;
-`<service>` is the folder of the service's records in `gs://orbit-search-release-records/`).
+service's page on the ops board, `https://ops.orbitsearch.com/<service>` (`<service>` is the folder of
+the service's records in `gs://orbit-search-release-records/`). The rendered build files always link
+that board; `RELEASE_OPS_URL` changes only the lines the Python steps post, so a local value never
+makes `release_kit.py check` reject the committed build files.
 The reasons (failed checks, error rates, suspects, rollback targets, holds, commits) are on the
 ops board and in the build log, never in the post.
 
@@ -37,11 +39,16 @@ ops board and in the build log, never in the post.
 | `up` | green | The release passed; a hold or freeze ended; a recovered signal; a test run. |
 | `warning` | yellow | Not verified: an inconclusive check, a checkpoint that could not run, warnings that do not roll back, a promote that did not start. |
 | `on hold` | yellow | Prod promotes hold: after a rollback, a forward-only release, a freeze, a failed dev verify. |
-| `down` | red | A release failed (once per release, also when its rollback starts), a rollback failed or could not start, a signal still fails after a rollback. |
+| `down` | red | A release failed (once per release, also when its rollback starts; a failed promote or deploy is one `down` line), a rollback failed or could not start, a signal still fails after a rollback. |
 
 An alert about a release no agent claimed ends with the mentions of its owner (and of the suspects'
 authors for a failed release). `release_record.status_line` builds the line; `post_status` prints the
 detail to the build log (Slack ids redacted) and posts the line.
+
+The deploy check, the watch and the rollback can reach the same failed release; `release_verify.alert_once`
+lets one of them post its line. A caller that finds another caller's claim waits until that caller notes
+the post. When that post fails the claim is freed and the waiting caller posts; a claim older than two
+minutes (its caller died) is taken over.
 
 ## Files
 

@@ -1240,25 +1240,37 @@ class StatusLineTest(unittest.TestCase):
         self.assertIn("check images failed; <@...> owns it", out.getvalue())
         self.assertNotIn("UJONNY", out.getvalue())
 
+    @staticmethod
+    def _other_caller(store: rr.Store, release_id: str, outcome: str):
+        """A sleep that, on the first poll, settles the live claim of another caller: "posted" or "failed"."""
+        calls: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            calls.append(seconds)
+            if len(calls) == 1:
+                alert = {"posted": True, "at": rr.utc_now()} if outcome == "posted" else {}
+                rr.update_record(store, release_id, lambda current: current.update(alert=alert), "other_caller")
+
+        return sleep, calls
+
     def test_overlapping_alerts_post_one_line(self) -> None:
-        """Two callers reach the same failed release at once: the claim lets only one post. A post that Slack did
-        not take frees the claim for the next caller; a claim whose caller died is taken over."""
+        """Two callers reach the same failed release at once: the claim lets only one post, and the second
+        waits for that post. A post that Slack did not take frees the claim for the next caller; a claim whose
+        caller died is taken over."""
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             store = _store(tmp)
             record = _record(verdict={"status": "failed"})
             _save(store, record)
-            inner: list[bool] = []
-
-            def slack(text: str, blocks: object = None) -> bool:
-                """While the first caller posts, a second caller (the watch) reaches the same release."""
-                if not inner:
-                    inner.append(rv.alert_once(SERVICE, store, record, "down", [], "second"))
-                return True
-
-            with mock.patch.object(rr, "post_slack", side_effect=slack) as posted:
-                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", ["<@UJONNY>"], "first"))
-            self.assertEqual(posted.call_count, 1)
-            self.assertEqual(inner, [True])
+            live = {"claim": "first", "at": rr.utc_now()}
+            rr.update_record(store, record["release_id"], lambda current: current.update(alert=live), "test")
+            sleep, polls = self._other_caller(store, record["release_id"], "posted")
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as posted,
+                mock.patch.object(rv.time, "sleep", side_effect=sleep),
+            ):
+                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", [], "second"))
+            self.assertEqual(posted.call_count, 0)
+            self.assertEqual(len(polls), 1)
             self.assertTrue(rr.read_record(store, record["release_id"])["alert"]["posted"])
 
             other = _record(release_id="20261021T120000Z-ccccccccc", verdict={"status": "failed"})
@@ -1272,6 +1284,73 @@ class StatusLineTest(unittest.TestCase):
                 self.assertTrue(rv.alert_once(SERVICE, store, other, "down", [], "retry"))
                 self.assertTrue(rv.alert_once(SERVICE, store, other, "down", [], "again"))
             self.assertEqual(posted.call_count, 1)
+
+    def test_alert_is_sent_when_the_other_callers_post_fails(self) -> None:
+        """A live claim is not a post. The caller holding it fails to post and frees the claim: the caller that
+        found the claim waits for it and sends the alert itself, so the failed release still gets its line."""
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"})
+            _save(store, record)
+            live = {"claim": "first", "at": rr.utc_now()}
+            rr.update_record(store, record["release_id"], lambda current: current.update(alert=live), "test")
+            sleep, _ = self._other_caller(store, record["release_id"], "failed")
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as posted,
+                mock.patch.object(rv.time, "sleep", side_effect=sleep),
+            ):
+                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", ["<@UJONNY>"], "second"))
+            posted.assert_called_once_with(rr.status_line("down", SERVICE.name, ["<@UJONNY>"]))
+            self.assertTrue(rr.read_record(store, record["release_id"])["alert"]["posted"])
+
+    def test_alert_wait_ends_when_the_claim_never_settles(self) -> None:
+        """A caller that died mid-post never settles its claim: the waiting caller takes it over after
+        ALERT_CLAIM_SECONDS of polls and posts, even when the claim's own time looks fresh."""
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"})
+            _save(store, record)
+            fresh = {"claim": "dead", "at": "2099-01-01T00:00:00Z"}
+            rr.update_record(store, record["release_id"], lambda current: current.update(alert=fresh), "test")
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as posted,
+                mock.patch.object(rv.time, "sleep") as sleep,
+            ):
+                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", [], "second"))
+            posted.assert_called_once()
+            self.assertEqual(sleep.call_count, rv.ALERT_CLAIM_SECONDS // rv.ALERT_POLL_SECONDS)
+            self.assertTrue(rr.read_record(store, record["release_id"])["alert"]["posted"])
+
+    def test_alert_wait_restarts_when_another_caller_takes_the_claim_over(self) -> None:
+        """The wait belongs to the claim it watches: another caller that takes an expired claim over just
+        before this caller's last poll holds a fresh claim, so this caller waits again instead of posting."""
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            store = _store(tmp)
+            record = _record(verdict={"status": "failed"})
+            _save(store, record)
+            dead = {"claim": "dead", "at": "2099-01-01T00:00:00Z"}
+            rr.update_record(store, record["release_id"], lambda current: current.update(alert=dead), "test")
+            last = rv.ALERT_CLAIM_SECONDS // rv.ALERT_POLL_SECONDS
+            calls: list[float] = []
+
+            def sleep(seconds: float) -> None:
+                """Just before the last poll a third caller takes over; later that caller posts."""
+                calls.append(seconds)
+                alert = None
+                if len(calls) == last - 1:
+                    alert = {"claim": "third", "at": "2099-01-01T00:00:00Z"}
+                elif len(calls) == last + 3:
+                    alert = {"posted": True, "at": rr.utc_now()}
+                if alert is not None:
+                    rr.update_record(store, record["release_id"], lambda current: current.update(alert=alert), "x")
+
+            with (
+                mock.patch.object(rr, "post_slack", return_value=True) as posted,
+                mock.patch.object(rv.time, "sleep", side_effect=sleep),
+            ):
+                self.assertTrue(rv.alert_once(SERVICE, store, record, "down", [], "second"))
+            posted.assert_not_called()
+            self.assertEqual(len(calls), last + 3)
 
     def test_check_results_map_to_states(self) -> None:
         """A check result posts its state: failed down once (with the owner), passed up, inconclusive warning,
@@ -2855,21 +2934,31 @@ class LightTest(unittest.TestCase):
         self.assertIn("--to-revisions=b-2=90,b-3=10", command)
 
     def test_failed_deploy_fails_the_check(self) -> None:
-        """Failed deploy fails the check."""
+        """Failed deploy fails the check. The alerted marker (the build's notify-result then posts nothing)
+        is written only when Slack took the failed release's line."""
         service = rl.parse_light(light_data("cloud_run"))
-        with tempfile.TemporaryDirectory() as tmp:
-            store = _store(tmp)
-            _save(store, _record(status="deploy_failed"))
-            args = mock.Mock(release_id=_record()["release_id"], wait=False, failed_marker="", force_fail=False)
-            passed = rv.Check("revisions", "passed", ["2 services checked"])
-            with (
-                mock.patch.object(rl, "deploy_checks", return_value=([passed], {})),
-                mock.patch.object(rl, "GoogleApi"),
-                mock.patch.object(rl, "_fail", side_effect=lambda *a: a[2]) as failed,
-                mock.patch.object(rl, "alert"),
-            ):
-                self.assertEqual(rl.cmd_check(args, service, store, mock.Mock()), rv.EXIT_FAILED)
-            self.assertEqual(failed.call_args[0][4][0]["name"], "deploy")
+        for slack_took in (True, False):
+            with self.subTest(slack_took=slack_took), tempfile.TemporaryDirectory() as tmp:
+                store = _store(tmp)
+                _save(store, _record(status="deploy_failed"))
+                marker = Path(tmp, "alerted")
+                args = mock.Mock(
+                    release_id=_record()["release_id"],
+                    wait=False,
+                    failed_marker="",
+                    alerted_marker=str(marker),
+                    force_fail=False,
+                )
+                passed = rv.Check("revisions", "passed", ["2 services checked"])
+                with (
+                    mock.patch.object(rl, "deploy_checks", return_value=([passed], {})),
+                    mock.patch.object(rl, "GoogleApi"),
+                    mock.patch.object(rl, "_fail", side_effect=lambda *a: a[2]) as failed,
+                    mock.patch.object(rl, "alert", return_value=slack_took),
+                ):
+                    self.assertEqual(rl.cmd_check(args, service, store, mock.Mock()), rv.EXIT_FAILED)
+                self.assertEqual(failed.call_args[0][4][0]["name"], "deploy")
+                self.assertEqual(marker.exists(), slack_took)
 
     def test_first_light_release_is_a_target(self) -> None:
         """The first recorded Cloud Run release has no previous commit, only its before-snapshot."""
@@ -3069,6 +3158,7 @@ def _args(**values) -> argparse.Namespace:
         "status": "deployed",
         "force_fail": "",
         "failed_marker": "",
+        "alerted_marker": "",
         "parse_result": "",
         "build_url": "https://build",
         "wait": False,
@@ -5165,6 +5255,71 @@ def assert_receipts(test: unittest.TestCase, begin: str, blocked: str | None) ->
             receipt = output / "output"
             test.assertTrue(receipt.exists(), f"{kind} {marker}: no receipt")
             test.assertEqual(json.loads(receipt.read_text()), {"release_deploy": "skipped_before_mutation"})
+
+
+def result_posts(
+    build: str, check_exit: int | None, markers: tuple[str, ...] = (), slack_takes: bool = True
+) -> list[str]:
+    """Run a rendered prod build's release-verify-deploy and notify-result steps with stub python3 and curl.
+
+    The stub deploy check exits check_exit; on 2 (a failed verdict) it posts its line, as release_light.py
+    check does: when slack_takes, Slack takes it ("check") and the stub writes the --alerted-marker file.
+    None: no release record, so the check never runs. markers: workspace files the earlier steps left
+    (deploy_failed). Returns every post Slack took, in order: "check", or the curl payload's text."""
+    steps = {kit._step_id(block): block for block in kit.STEP_START.split(build)}
+    with tempfile.TemporaryDirectory() as tmp:
+        stub, workspace, posts = Path(tmp, "bin"), Path(tmp, "ws"), Path(tmp, "posts")
+        stub.mkdir()
+        workspace.mkdir()
+        posts.touch()
+        code = 0 if check_exit is None else check_exit
+        takes = "1" if slack_takes else "0"
+        scripts = {
+            "python3": (
+                '#!/bin/sh\ncase " $* " in *" check "*)\n'
+                '  marker=""\n'
+                '  while [ $# -gt 0 ]; do if [ "$1" = "--alerted-marker" ]; then marker="$2"; fi; shift; done\n'
+                f'  if [ {code} -eq 2 ] && [ {takes} = 1 ]; then echo check >> "{posts}"; touch "$marker"; fi\n'
+                f"  exit {code};;\nesac\nexit 0\n"
+            ),
+            "curl": (
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n"
+                f'  if [ "$1" = "--data" ]; then printf "%s\\n" "$2" >> "{posts}"; fi\n  shift\ndone\n'
+            ),
+        }
+        for name, text in scripts.items():
+            (stub / name).write_text(text, encoding="utf-8")
+            (stub / name).chmod(0o700)
+        if check_exit is not None:
+            (workspace / "release_id").write_text("20261028T120000Z-aaaaaaaaa\n", encoding="utf-8")
+        for marker in markers:
+            (workspace / marker).touch()
+        env = {"PATH": f"{stub}:/usr/bin:/bin", "WEBHOOK_ORBIT": "https://hooks.invalid", "SHORT_SHA": "abc1234"}
+        for step in ("release-verify-deploy", "notify-result"):
+            script = step_script(steps[step]).replace("/workspace", str(workspace))
+            subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False, timeout=30)
+        return [
+            line if line == "check" else json.loads(line)["text"]
+            for line in posts.read_text(encoding="utf-8").splitlines()
+        ]
+
+
+def assert_one_line_per_result(test: unittest.TestCase, build: str, service: str) -> None:
+    """A failed promote posts one line: the deploy check's down when Slack took it, else notify-result's down.
+    An unchecked prod posts warning; a passed release posts nothing here (the watch says up)."""
+    down, warning = rr.rendered_status_line("down", service), rr.rendered_status_line("warning", service)
+    cases = [
+        ("failed promote, check posted", 2, ("deploy_failed",), True, ["check"]),
+        ("failed promote, Slack refused the check's line", 2, ("deploy_failed",), False, [down]),
+        ("failed promote, check could not run", 1, ("deploy_failed",), True, [down]),
+        ("failed promote, no record", None, ("deploy_failed",), True, [down]),
+        ("failed check", 2, (), True, ["check"]),
+        ("unchecked", 1, (), True, [warning]),
+        ("passed", 0, (), True, []),
+    ]
+    for name, check_exit, markers, slack_takes, expected in cases:
+        with test.subTest(case=name):
+            test.assertEqual(result_posts(build, check_exit, markers, slack_takes), expected)
 
 
 # --------------------------------------------------------------------------- people map in public repositories

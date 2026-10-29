@@ -2014,15 +2014,16 @@ def forward_resume(service: LightService, release_id: str) -> str:
     )
 
 
-def forward_hold(service: LightService, store: rr.Store, record: dict, *, force: bool = False) -> None:
+def forward_hold(service: LightService, store: rr.Store, record: dict, *, force: bool = False) -> bool:
     """A failed release that changed the database schema: no rollback; hold prod deploys and ping the author.
 
     The hold lives on the failed release's own record (promote_hold with forward_only); release_gate.py
-    holds every later deploy until a commit with `Fixes-release: <release id>` or `resume`.
+    holds every later deploy until a commit with `Fixes-release: <release id>` or `resume`. Returns whether
+    the "on hold" line is in Slack.
     """
     if not force and os.environ.get("RELEASE_AUTO_ROLLBACK", "").strip() != "1":
         print("Forward-only release failed; this run holds nothing (RELEASE_AUTO_ROLLBACK is not 1)", flush=True)
-        return
+        return False
     release_id = record["release_id"]
     state = record.get("migrations") or {}
     why = ", ".join(state.get("migrations") or []) or str(state.get("unknown") or "a migration")
@@ -2046,7 +2047,7 @@ def forward_hold(service: LightService, store: rr.Store, record: dict, *, force:
     saved = rr.update_record(store, release_id, change, "forward_hold", {"why": why[:200]})
     location = store.location(rr.record_name(release_id))
     mentions, detail = forward_alert(service, saved, location, why)
-    rv.alert_once(service, store, saved, "on hold", mentions, detail)
+    return rv.alert_once(service, store, saved, "on hold", mentions, detail)
 
 
 def forward_alert(service: LightService, record: dict, location: str, why: str) -> tuple[list[str], str]:
@@ -2739,22 +2740,22 @@ def suggested(service: LightService, record: dict) -> str:
     return how[0] if how else rollback_command(service, record)
 
 
-def alert(service: LightService, store: rr.Store, record: dict) -> None:
+def alert(service: LightService, store: rr.Store, record: dict) -> bool:
     """The failed-release status line with the author ping; the fix prompt and the rollback command go to the log.
 
     Sent once per release (rv.alert_once): the deploy check and the watch both reach a failed verdict,
-    and only a post that Slack did not take is sent again.
+    and only a post that Slack did not take is sent again. Returns whether the line is in Slack.
     """
     if os.environ.get("RELEASE_SLACK_DISABLED", "").strip() == "1":
         print("Test run: no alert", flush=True)
-        return
+        return False
     location = store.location(rr.record_name(record["release_id"]))
     if service.kind == "static_site":
         state, mentions, detail = static_alert(service, record, location, suggested(service, record))
     else:
         state = "down"
         mentions, detail = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
-    rv.alert_once(service, store, record, state, mentions, detail)
+    return rv.alert_once(service, store, record, state, mentions, detail)
 
 
 def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2799,7 +2800,7 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         ]
         saved = _fail(service, store, saved, "deploy", regressions)
         if args.force_fail:
-            rr.post_status(
+            posted = rr.post_status(
                 "up",
                 service.name,
                 detail=f"{rv.TEST_RUN_LINE}. A test of {service.title} release-verify failed on purpose; no action needed.",
@@ -2809,10 +2810,10 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
             # forward-only release holds now, before another prod build can pass the gate.
             state = forward_state(service, saved) if service.kind == "railway" else None
             if state is not None:
-                forward_hold(service, store, {**saved, "migrations": state}, force=True)
-            if state is None:
-                # A forward-only release posted its "on hold" line in forward_hold: one line for this moment.
-                rv.alert_once(
+                posted = forward_hold(service, store, {**saved, "migrations": state}, force=True)
+            else:
+                # One line for this moment: the down line here, or the "on hold" line of forward_hold above.
+                posted = rv.alert_once(
                     service,
                     store,
                     saved,
@@ -2822,7 +2823,10 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
                     f"{saved['rollback_suggestion']['summary'][:300]} An automatic rollback follows. Record {where}",
                 )
         else:
-            alert(service, store, saved)
+            posted = alert(service, store, saved)
+        if posted and args.alerted_marker:
+            # Only a line Slack took: without it the build's notify-result step posts the failed deploy itself.
+            Path(args.alerted_marker).write_text("true\n", encoding="utf-8")
         return rv.EXIT_FAILED
     minutes = " and ".join(f"+{value}" for value in service.checkpoints)
     detail = (
@@ -4055,6 +4059,7 @@ def main(argv: list[str] | None = None) -> int:
     release_id_args(check)
     check.add_argument("--wait", action="store_true", help="composer: wait for the DAG processor first")
     check.add_argument("--failed-marker")
+    check.add_argument("--alerted-marker", default="", help="prod: written when Slack took the failed release's line")
     check.add_argument("--force-fail", default="", help="test runs: the alert says TEST RUN")
     check.add_argument("--parse-result", default="", help="composer dev verify: the parse-dags result")
     check.add_argument("--build-id", default="", help="dev verify: the dev build, to tell a superseded verify")

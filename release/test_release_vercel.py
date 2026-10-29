@@ -217,6 +217,7 @@ def _args(**values) -> argparse.Namespace:
         "status": "deployed",
         "force_fail": "",
         "failed_marker": "",
+        "alerted_marker": "",
         "parse_result": "",
         "build_url": "https://build",
         "wait": False,
@@ -446,8 +447,8 @@ class VercelConfigTest(unittest.TestCase):
             for line in text.splitlines()
             if "curl" in line and "WEBHOOK_ORBIT" in line
         ]
-        self.assertEqual(len(posts), 3, posts)
-        lines = {rr.status_line(state, WEB.name) for state in ("on hold", "warning")}
+        self.assertEqual(len(posts), 4, posts)
+        lines = {rr.rendered_status_line(state, WEB.name) for state in ("on hold", "warning", "down")}
         for post in posts:
             self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
         self.assertNotIn("PAYLOAD", "".join(files.values()))
@@ -461,6 +462,20 @@ class VercelConfigTest(unittest.TestCase):
         steps = {kit._step_id(block): block for block in kit.STEP_START.split(promote)}
         tk.assert_receipts(self, steps["release-record-begin"], steps["notify-promote-blocked"])
         self.assertIn("WEBHOOK_ORBIT", steps["release-record-finish"])
+
+    def test_a_failed_promote_posts_one_line(self) -> None:
+        """A failed promote posts the deploy check's down line only, never down and then warning."""
+        import test_release_kit as tk
+
+        tk.assert_one_line_per_result(self, kit.rendered(WEB)["release/services/demo-web.promote.yaml"], WEB.name)
+
+    def test_rendering_ignores_release_ops_url(self) -> None:
+        """The rendered builds link the fixed ops board: a local RELEASE_OPS_URL never makes check reject them."""
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+            default = kit.rendered(WEB)
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": "https://ops.example.com"}):
+            self.assertEqual(kit.rendered(WEB), default)
+        self.assertIn("https://ops.orbitsearch.com/demo-web", default["release/services/demo-web.promote.yaml"])
 
     def test_kit_files_include_vercel(self) -> None:
         """The module and its tests are pinned kit files (sync copies them)."""
