@@ -189,13 +189,12 @@ steps:
           TEXT=":white_check_mark: orbit-mcp prod promote completed for commit \`$SHORT_SHA\`"
         fi
         echo "$${TEXT}"
-        # Slack gets a status line only for a moment no other step posts. The promote said deploying,
-        # the watch says up, release_light.py finish posts down when the finish failed after the promote,
-        # and the check wrote release_verify_alerted when Slack took its failed release line.
+        # Slack gets a status line only for a moment no other step posts: the promote said deploying,
+        # the watch says up, and a check that ended with a failed verdict posted down (release_verify_alerted).
         # The reason stays in this build log.
         STATE=""
         if [ -f /workspace/deploy_superseded ] || [ -f /workspace/release_verify_alerted ]; then :
-        elif [ -f /workspace/release_record_failed ]; then :
+        elif [ -f /workspace/release_record_failed ] && [ ! -s /workspace/release_id ]; then STATE="warning"  # begin failed: no deploy
         elif [ -f /workspace/deploy_failed ]; then STATE="down"
         elif [ -s /workspace/release_verify_unchecked ]; then STATE="warning"
         fi
