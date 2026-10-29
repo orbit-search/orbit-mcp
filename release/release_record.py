@@ -796,6 +796,24 @@ SHORT_SHA = 7
 # and on each service page, and the build log has the line (Nicholas, 2026-10-29: a sync round of about 17
 # merges posted about 15 green lines in a row).
 QUIET_STATES = frozenset({"deploying", "up"})
+# A human's freeze, unfreeze or resume is posted in every state (post_status announce=True): the others on the
+# channel should know that releases stopped or go again, and who did it.
+REASON_LIMIT = 200
+
+
+def slack_text(text: str, limit: int = REASON_LIMIT) -> str:
+    """Free text (a human's reason) made safe for a status line: one line, at most limit characters, and
+    Slack's control characters escaped (no mention, channel ping or link can come from it)."""
+    flat = " ".join(str(text).split())
+    if len(flat) > limit:
+        flat = flat[: limit - 3].rstrip() + "..."
+    return flat.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def human_words(event: str, by: str, reason: str = "") -> str:
+    """The words of a human's release command: "<event> by <who>", then ": <reason>" when there is one."""
+    reason = slack_text(reason)
+    return f"{event} by {slack_text(by, 60)}" + (f": {reason}" if reason else "")
 
 
 def ops_url(service: str, base: str | None = None) -> str:
@@ -861,16 +879,17 @@ def post_status(
     *,
     record: dict | None = None,
     words: str | None = None,
+    announce: bool = False,
 ) -> bool:
     """Print the detail for the build log (Slack ids redacted) and post the status line; whether Slack took it.
 
     A routine state (QUIET_STATES: deploying, up) is not posted: the line goes to the build log only, and the
-    result is False (nothing is in Slack). record: the release the line is about (its PR and short sha go on the
-    line). words: see status_line."""
+    result is False (nothing is in Slack). announce: post it anyway (a human's freeze, unfreeze or resume).
+    record: the release the line is about (its PR and short sha go on the line). words: see status_line."""
     if detail:
         print(f"{state}: {redact_slack_ids(detail)}", flush=True)
     line = status_line(state, service, mentions, release=release_label(record), words=words)
-    if state in QUIET_STATES:
+    if state in QUIET_STATES and not announce:
         print(f"Slack (not sent, routine): {redact_slack_ids(line)}", flush=True)
         return False
     return post_slack(line)

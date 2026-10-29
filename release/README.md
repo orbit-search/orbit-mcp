@@ -39,6 +39,11 @@ progress posts nothing: `deploying` and `up` go to the build log only (`release_
 the ops board shows them on its Changes page and on each service page. A sync round that merges in many
 repositories at once therefore adds no lines when its releases pass.
 
+A human's release command is a line the channel should see, in every state: "releases frozen by <who>",
+"freeze ended by <who>", "releases resumed by <who>" (`release_gate.py freeze`, `unfreeze`, `resume`;
+`post_status(..., announce=True)`), then ": <reason>", one line, at most 200 characters, with Slack's
+control characters escaped (`release_record.human_words`).
+
 The line names the release event, not the health of the service: a release that failed its check is
 "release failed", and the service may be healthy. After the service come the release's PR and short
 commit when its record has them (`release_record.release_label`). The rendered Vercel and Railway builds
@@ -48,9 +53,9 @@ more exact words (in parentheses). The ops board keeps its own labels.
 | State | Dot | Words | Posted | When |
 |---|---|---|---|---|
 | `deploying` | green | deploying | no | The prod promote started; for a service without a dev stage, the deploy checks passed. |
-| `up` | green | released | no | The release passed (also: "signals recovered", "unfrozen", "deploys resumed", "test run"). |
+| `up` | green | released | no | The release passed (also: "signals recovered", "test run"). A human's "freeze ended by" and "releases resumed by" lines are posted. |
 | `warning` | yellow | release check inconclusive | yes | Not verified: an inconclusive check, a checkpoint that could not run (also: "release check warning" for warnings that do not roll back, "dev check inconclusive", "promote did not start", "release failed · not published" for a static site that never went live). |
-| `on hold` | yellow | on hold | yes | Prod promotes hold: after a rollback, a forward-only release, a freeze, a failed dev verify. |
+| `on hold` | yellow | on hold | yes | Prod promotes hold: after a rollback, a forward-only release, a failed dev verify (also: "releases frozen by <who>: <reason>"). |
 | `down` | red | release failed | yes | A release failed, once per release; a failed promote or deploy is one line. A service with an automatic rollback adds "· rolling back to <short sha>" (`release_verify.failed_words`); others say only "release failed". Also: "rollback failed", "rollback has no result", "release failed · rollback did not start", "release failed · no automatic rollback", "rollback did not help", "release unchecked" (the record finish failed). |
 
 A failed release posts only its failure line: its warnings that do not roll back stay unposted, in the

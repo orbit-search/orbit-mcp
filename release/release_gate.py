@@ -743,10 +743,12 @@ def cmd_freeze(args: argparse.Namespace, stores: Stores, frozen: bool) -> int:
     state = {"frozen": frozen, "by": _who(args), "reason": args.reason, "at": rr.utc_now()}
     rr.update_object(stores.prod, FREEZE_OBJECT, lambda _: state)
     word = "frozen" if frozen else "unfrozen"
+    # A human's command: posted also when it ends the freeze (announce), with who and why.
     rr.post_status(
         "on hold" if frozen else "up",
         stores.service.name,
-        words=None if frozen else "unfrozen",
+        words=rr.human_words("releases frozen" if frozen else "freeze ended", state["by"], args.reason),
+        announce=True,
         detail=f"{stores.service.title} automatic prod deploys {word} by {state['by']}: {args.reason[:200]}",
     )
     print(f"Automatic prod deploys {word}: {stores.prod.location(FREEZE_OBJECT)}")
@@ -759,9 +761,12 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
     if not args.reason.strip():
         raise rr.RecordError("--reason is required")
     pointer, _ = stores.prod.read("latest.json")
-    if holding_record(stores, pointer) is None:
+    holder = holding_record(stores, pointer)
+    if holder is None:
         print("No hold: the newest prod record is not a rollback or a failed forward-only release.")
         return EXIT_GO
+    # The line names the release that the hold kept out (a rollback's own commit is the rollback target).
+    held = hold_of(service, holder).get("rolled_back_release") or holder.get("release_id")
     release_hold(stores, pointer["release_id"], f"resumed by a human: {args.reason}", _who(args))
     after = (
         f"`{service.kit_command('release_gate.py', 'promote')}` promotes the newest verified commit now."
@@ -769,10 +774,13 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
         else "the next merge deploys."
     )
     what = "rollback" if pointer.get("kind") == "rollback" else "forward-only release"
+    # A human's command: posted (announce), with who and why; the line names the held release.
     rr.post_status(
         "up",
         service.name,
-        words="deploys resumed",
+        record={"release_id": held} if held else None,
+        words=rr.human_words("releases resumed", _who(args), args.reason),
+        announce=True,
         detail=(
             f"{service.title} automatic prod deploys resumed by {_who(args)} after {what} "
             f"{pointer['release_id']}: {args.reason[:200]}. The next merge deploys; {after}"
