@@ -460,6 +460,67 @@ class GateTest(unittest.TestCase):
         self.assertIn("unfreeze", decision.resume_hint)
         self.assertEqual(rg.decide_direct(self.stores, COMMIT, "t").status, "frozen")
 
+    def test_a_humans_freeze_unfreeze_and_resume_post_who_and_why(self) -> None:
+        """A human's release command is a line the channel should see, also when it ends a freeze or a hold
+        (the routine "up" posts nothing): who did it and the reason, escaped for Slack."""
+        link = "<https://ops.orbitsearch.com/demo|ops.orbitsearch.com/demo>"
+        bad = _record(commit=PREVIOUS, release_id="20261021T090000Z-bbbbbbbbb")
+        rollback = _record(
+            release_id="20261021T093000Z-ccccccccc",
+            kind="rollback",
+            commit="c" * 40,
+            promote_hold={"status": "held", "rolled_back_release": bad["release_id"], "resume": "x"},
+        )
+        _save(self.stores.prod, bad, latest=False)
+        _save(self.stores.prod, rollback)
+
+        def run(command, reason: str) -> None:
+            args = argparse.Namespace(by="nicholas", reason=reason)
+            command(args)
+
+        with (
+            mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}),
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            run(lambda args: rg.cmd_freeze(args, self.stores, True), "incident <!channel>")
+            run(lambda args: rg.cmd_freeze(args, self.stores, False), "fixed")
+            run(lambda args: rg.cmd_resume(args, self.stores), "the parser fix   is\nout")
+        self.assertEqual(
+            [call.args[0] for call in slack.call_args_list],
+            [
+                f":large_yellow_circle: *demo* releases frozen by nicholas: incident &lt;!channel&gt; · {link}",
+                f":large_green_circle: *demo* freeze ended by nicholas: fixed · {link}",
+                f":large_green_circle: *demo* bbbbbbb releases resumed by nicholas: the parser fix is out · {link}",
+            ],
+        )
+        self.assertEqual(
+            rr.human_words("releases resumed", "n", "x" * 300), "releases resumed by n: " + "x" * 197 + "..."
+        )
+
+    def test_resume_of_an_older_rollback_names_the_release_it_kept_out(self) -> None:
+        """An older rollback record has no promote_hold; the held release is in rollback.rolled_back_release."""
+        bad = _record(commit=PREVIOUS, release_id="20261021T090000Z-bbbbbbbbb")
+        rollback = _record(
+            release_id="20261021T093000Z-ccccccccc",
+            kind="rollback",
+            commit="c" * 40,
+            rollback={"rolled_back_release": bad["release_id"]},
+        )
+        _save(self.stores.prod, bad, latest=False)
+        _save(self.stores.prod, rollback)
+        with (
+            mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}),
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            rg.cmd_resume(argparse.Namespace(by="nicholas", reason="fixed"), self.stores)
+        self.assertEqual(
+            slack.call_args[0][0],
+            ":large_green_circle: *demo* bbbbbbb releases resumed by nicholas: fixed · "
+            "<https://ops.orbitsearch.com/demo|ops.orbitsearch.com/demo>",
+        )
+
     def test_hold_and_trailer(self) -> None:
         """Hold and trailer."""
         _verified(self.stores)
