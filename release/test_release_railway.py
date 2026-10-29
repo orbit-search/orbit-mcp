@@ -345,7 +345,10 @@ class RailwayConfigTest(unittest.TestCase):
                 if "curl" in line and "WEBHOOK_ORBIT" in line
             ]
             self.assertTrue(posts, service.name)
-            lines = [rr.rendered_status_line(state, service.name) for state in ("on hold", "warning", "down")]
+            lines = [
+                rr.rendered_status_line("on hold", service.name),
+                *(rr.rendered_status_line(state, service.name, "$SHORT_SHA") for state in ("warning", "down")),
+            ]
             for post in posts:
                 self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
             self.assertNotIn("PAYLOAD", "".join(files.values()))
@@ -891,7 +894,10 @@ class RailwayWindowTest(RailwayCase):
         self.assertTrue(saved["promote_hold"]["forward_only"])
         self.assertEqual(saved["auto_rollback"]["status"], "skipped")
         self.assertEqual(len(self.slack), 1)
-        self.assertTrue(self.slack[0].startswith(rr.status_line("on hold", API.name)), self.slack[0])
+        self.assertTrue(
+            self.slack[0].startswith(rr.status_line("on hold", API.name, release=rr.release_label(record))),
+            self.slack[0],
+        )
         self.assertIn("Fixes-release: " + record["release_id"], log.getvalue())
         self.assertEqual(self.railway.mutations(), [])
 

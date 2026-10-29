@@ -557,6 +557,8 @@ def note_recovered(service: rc.Service, store: rr.Store, record: dict, keys: lis
         rr.post_status(
             "up",
             service.name,
+            record=record,
+            words="signals recovered",
             detail=(
                 f"{service.title} {record['environment']}: {', '.join(ended)} recovered (release "
                 f"{record['commit'][:9]}); automatic rollbacks on it are on again."
@@ -717,7 +719,7 @@ def _watch_rollback(
         flush=True,
     )
     # The signals still fail on the rollback target: the service is down for an environmental cause.
-    alert = rr.status_line("down", service.name)
+    alert = rr.status_line("down", service.name, release=rr.release_label(record), words="rollback did not help")
 
     def mark(current: dict | None) -> dict:
         """Mark each signal that still fails (a mark that is active stays as it is)."""
@@ -1908,10 +1910,16 @@ def post_warnings(
     """Post the fresh warnings; mark them posted only when Slack took them. Never raises.
 
     command: how a human rolls back (default: release_rollback.py run; light services pass their own).
+    A failed release posts only its failure line: its warnings stay unposted, in the record (the ops board)
+    and in the build log.
     """
-    if not warnings or not rr.post_status(
-        "warning", service.name, detail=warning_line(service, record, warnings, store, command)
-    ):
+    if not warnings:
+        return
+    detail = warning_line(service, record, warnings, store, command)
+    if (record.get("verdict") or {}).get("status") == "failed":
+        print(f"warning (not posted, the release failed): {rr.redact_slack_ids(detail)}", flush=True)
+        return
+    if not rr.post_status("warning", service.name, record=record, words="release check warning", detail=detail):
         return
     names = {warning["name"] for warning in warnings}
 
@@ -1948,26 +1956,44 @@ def inconclusive_parts(result: dict) -> str:
     return f" New-error checks not run: {', '.join(names)}." if names else ""
 
 
+def rollback_target_commit(record: dict) -> str:
+    """The commit a rollback of this release goes to: the suggested target, else the previous release; "" unknown.
+
+    A target named only by release ("previous-of:<release>", no commit) is unknown here, not the previous one."""
+    target = (record.get("rollback_suggestion") or {}).get("target") or {}
+    if target.get("commit"):
+        return str(target["commit"])
+    return "" if target.get("rollback_to") else str((record.get("previous") or {}).get("commit") or "")
+
+
+def failed_words(service: rc.Service, record: dict) -> str:
+    """The words of a failed release's line: where its automatic rollback goes, when the service has one."""
+    if not getattr(service, "auto_rollback", False):
+        return "release failed"
+    target = rollback_target_commit(record)
+    return f"release failed · rolling back to {target[: rr.SHORT_SHA]}" if target else "release failed · rolling back"
+
+
 def post_result(service: rc.Service, store: rr.Store, record: dict, result: dict) -> None:
     """Post the status line of a check result; the detail (result_detail) goes to the build log.
 
-    failed: "down" once per release with the failure mentions; passed: "up"; inconclusive: "warning" (with the
-    owner unless capacity caused it); the deploy checks passed: "deploying" for a service without a dev stage
-    (with one, the promote line said so); a window checkpoint that passed: the log only (the final line follows).
+    failed: "down" (failed_words) once per release with the failure mentions; inconclusive: "warning" (with the
+    owner unless capacity caused it). Routine results reach the build log only (rr.QUIET_STATES): passed ("up"),
+    the deploy checks passed ("deploying", for a service without a dev stage), a window checkpoint that passed.
     """
     detail = result_detail(service, record, result, store)
     verdict = record.get("verdict") or {}
     status = verdict.get("status")
     if status == "failed":
         mentions = failure_mentions(record, load_people(), likely_prs(record))
-        alert_once(service, store, record, "down", mentions, detail)
+        alert_once(service, store, record, "down", mentions, detail, words=failed_words(service, record))
     elif status == "passed":
-        rr.post_status("up", service.name, detail=detail)
+        rr.post_status("up", service.name, detail=detail, record=record)
     elif status == "inconclusive":
         mentions = [] if verdict.get("cause") == "capacity" else owner_now(record, store)
-        rr.post_status("warning", service.name, mentions, detail)
+        rr.post_status("warning", service.name, mentions, detail, record=record)
     elif result["phase"] == "deploy" and not service.has_dev:
-        rr.post_status("deploying", service.name, detail=detail)
+        rr.post_status("deploying", service.name, detail=detail, record=record)
     else:
         print(detail, flush=True)
 
@@ -2165,9 +2191,17 @@ class AlertPending(Exception):
 
 
 def alert_once(
-    service: rc.Service, store: rr.Store, record: dict, state: str, mentions: list[str], detail: str
+    service: rc.Service,
+    store: rr.Store,
+    record: dict,
+    state: str,
+    mentions: list[str],
+    detail: str,
+    words: str | None = None,
 ) -> bool:
     """Post the one alert line of a failed release ("down", or "on hold" for a forward-only one), once.
+
+    words: the event words of the line (rr.status_line); the line also names the release (rr.release_label).
 
     The check build, the watch and the rollback all reach the same failed release. A caller first claims the
     alert in the record (a conditional write, so of two callers only one wins), then posts, then notes
@@ -2220,8 +2254,8 @@ def alert_once(
         except (rr.RecordError, GuardError, OSError) as error:
             # The record cannot be written: post anyway, a duplicate line beats a lost alert.
             print(f"WARNING: could not claim the alert: {error}", file=sys.stderr, flush=True)
-            return rr.post_status(state, service.name, mentions, detail)
-    posted = rr.post_status(state, service.name, mentions, detail)
+            return rr.post_status(state, service.name, mentions, detail, record=record, words=words)
+    posted = rr.post_status(state, service.name, mentions, detail, record=record, words=words)
     try:
         rr.update_record(store, release_id, settle(posted), "alert_posted" if posted else "alert_not_posted")
     except (rr.RecordError, GuardError, OSError) as error:
@@ -2355,6 +2389,8 @@ def cmd_check(
             rr.post_status(
                 "up",
                 service.name,
+                record=saved,
+                words="test run",
                 detail=(
                     f"{TEST_RUN_LINE}. A test of {service.title} release-verify forced a failure for "
                     f"{record['commit'][:9]}; the window build of a test run never rolls back. No action needed."
@@ -2527,6 +2563,8 @@ def finish_dev_verify(
         rr.post_status(
             "warning",
             service.name,
+            record=saved,
+            words="dev check inconclusive",
             detail=(
                 f"{service.title} dev verify inconclusive for {saved['commit'][:9]}: {verdict['reason']}. Not "
                 f"verified, so prod does not promote it; a later dev build that passes does.{link}"
@@ -2535,7 +2573,7 @@ def finish_dev_verify(
     else:
         location = store.location(rr.record_name(saved["release_id"]))
         state, mentions, detail = dev_verify_alert(service, saved, build_url, location, test_run)
-        rr.post_status(state, service.name, mentions, detail)
+        rr.post_status(state, service.name, mentions, detail, record=saved, words="test run" if test_run else None)
     return saved
 
 
@@ -2969,6 +3007,7 @@ def cmd_watch(
                     service.name,
                     owner_now(record, store),
                     f"release-verify {record['release_id']} unchecked: {reason}",
+                    record=record,
                 )
                 return EXIT_FAILED
             extend = (
@@ -3016,6 +3055,7 @@ def cmd_watch(
                 owner_now(record, store),
                 f"{service.title} release-verify {record['commit'][:9]} +{minutes} min check could not run: "
                 f"{str(error)[:200]}",
+                record=record,
             )
             if last:
                 return EXIT_FAILED  # a failed receipt write cannot make a failed checker green
@@ -3077,7 +3117,7 @@ def on_failure(service: rc.Service, store: rr.Store, record: dict, dd: DatadogCl
         return
     current = rr.read_record(store, record["release_id"])
     mentions, detail = rollback_alert(service, current, None, store.location(rr.record_name(record["release_id"])))
-    alert_once(service, store, current, "down", mentions, detail)
+    alert_once(service, store, current, "down", mentions, detail, words=failed_words(service, current))
 
 
 # --------------------------------------------------------------------------- automatic rollback
@@ -3212,6 +3252,8 @@ def follow_rollback(
         rr.post_status(
             "down",
             service.name,
+            record={"release_id": release_id},
+            words="rollback has no result",
             detail=(
                 f"{service.title} automatic rollback build {build_id} has no result after "
                 f"{ROLLBACK_WAIT_SECONDS // 60} min ({status}); check it: {rr.build_url(service.prod, build_id)}"
@@ -3254,6 +3296,8 @@ def follow_rollback(
     rr.post_status(
         "down",
         service.name,
+        record={"release_id": release_id},
+        words="rollback failed",
         detail=(
             f"{service.title} automatic rollback build {build_id} ended {status}; prod may still run the failed "
             f"release {release_id}. Roll back by hand: {rollback_cli(service, 'run', target)} --reason '<why>' "
@@ -3321,6 +3365,8 @@ def start_rollback(
                 rr.post_status(
                     "down",
                     service.name,
+                    record=current,
+                    words="release failed · no automatic rollback",
                     detail=(
                         f"{title} release-verify {short} failed, but {others[0]} changes prod now, so no "
                         f"automatic rollback started. Check prod; roll back by hand with "
@@ -3396,6 +3442,8 @@ def start_rollback(
         rr.post_status(
             "down",
             service.name,
+            record=record,
+            words="release failed · rollback did not start",
             detail=(
                 f"{title} release-verify {short} failed and the automatic rollback did not start: "
                 f"{str(error)[:200]}. Roll back by hand: {suggested_command(service, record)} --reason '<why>'"
@@ -3405,7 +3453,7 @@ def start_rollback(
     url = rr.build_url(service.prod, build_id)
     print(f"Automatic rollback build {build_id} started: {url}", flush=True)
     mentions, detail = rollback_alert(service, current, url, store.location(rr.record_name(release_id)))
-    alert_once(service, store, current, "down", mentions, detail)
+    alert_once(service, store, current, "down", mentions, detail, words=failed_words(service, current))
     if follow:
         status = follow_rollback(service, store, release_id, build_id, claim_id, target=target)
         if followed is not None and not followed(status):

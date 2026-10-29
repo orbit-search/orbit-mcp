@@ -448,7 +448,10 @@ class VercelConfigTest(unittest.TestCase):
             if "curl" in line and "WEBHOOK_ORBIT" in line
         ]
         self.assertEqual(len(posts), 4, posts)
-        lines = {rr.rendered_status_line(state, WEB.name) for state in ("on hold", "warning", "down")}
+        lines = {
+            rr.rendered_status_line("on hold", WEB.name),
+            *(rr.rendered_status_line(state, WEB.name, "$SHORT_SHA") for state in ("warning", "down")),
+        }
         for post in posts:
             self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
         self.assertNotIn("PAYLOAD", "".join(files.values()))
