@@ -2752,10 +2752,13 @@ def alert(service: LightService, store: rr.Store, record: dict) -> bool:
     location = store.location(rr.record_name(record["release_id"]))
     if service.kind == "static_site":
         state, mentions, detail = static_alert(service, record, location, suggested(service, record))
+        # A release that never went live: the old site still serves.
+        words = "release failed · not published" if state == "warning" else None
     else:
         state = "down"
         mentions, detail = rv.rollback_alert(service, record, None, location, command=suggested(service, record))
-    return rv.alert_once(service, store, record, state, mentions, detail)
+        words = rv.failed_words(service, record)
+    return rv.alert_once(service, store, record, state, mentions, detail, words=words)
 
 
 def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, runner: Runner) -> int:
@@ -2803,6 +2806,8 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
             posted = rr.post_status(
                 "up",
                 service.name,
+                record=saved,
+                words="test run",
                 detail=f"{rv.TEST_RUN_LINE}. A test of {service.title} release-verify failed on purpose; no action needed.",
             )
         elif service.auto_rollback:
@@ -2821,6 +2826,7 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
                     rv.failure_mentions(saved, rv.load_people(), rv.likely_prs(saved)),
                     f"{service.title} release-verify {record['commit'][:9]} FAILED (deploy): "
                     f"{saved['rollback_suggestion']['summary'][:300]} An automatic rollback follows. Record {where}",
+                    words=rv.failed_words(service, saved),
                 )
         else:
             posted = alert(service, store, saved)
@@ -2834,9 +2840,9 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         f"at {minutes} min. Record {where}"
     )
     if service.has_dev:
-        print(detail, flush=True)  # the promote line said "deploying" already
+        print(detail, flush=True)  # routine progress: the build log only
     else:
-        rr.post_status("deploying", service.name, detail=detail)
+        rr.post_status("deploying", service.name, detail=detail, record=record)
     return rv.EXIT_OK
 
 
@@ -3057,6 +3063,7 @@ def finish_inconclusive(service: LightService, store: rr.Store, record: dict, ke
         f"{service.title} release-verify {record['commit'][:9]} inconclusive: the last checkpoint "
         f"could not run ({why[:200]}). Check the release by hand. "
         f"Record {store.location(rr.record_name(record['release_id']))}",
+        record=record,
     )
 
 
@@ -3135,6 +3142,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                         service.name,
                         rv.owner_now(record, store),
                         f"{service.title} release-verify unchecked: {reason}",
+                        record=record,
                     )
                     return rv.EXIT_FAILED
                 break
@@ -3148,6 +3156,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 service.name,
                 rv.owner_now(record, store),
                 f"{service.title} +{minutes} min checkpoint inconclusive: could not run: {str(error)[:200]}",
+                record=record,
             )
             if last:
                 return rv.EXIT_FAILED
@@ -3234,6 +3243,7 @@ def cmd_watch(args: argparse.Namespace, service: LightService, store: rr.Store, 
                 [] if checked else rv.owner_now(final, store),
                 f"{service.title} release-verify {record['commit'][:9]} {status}. "
                 f"Record {store.location(rr.record_name(record['release_id']))}",
+                record=final,
             )
     current = rr.read_record(store, record["release_id"])
     return (

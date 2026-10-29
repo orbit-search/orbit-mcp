@@ -503,8 +503,8 @@ class GateTest(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()) as log,
         ):
             self.assertEqual(rg.cmd_request_promote(args, self.stores), rg.EXIT_GO)
-        # A test run changes nothing: prod is up; the log says it was a test.
-        self.assertEqual(slack.call_args[0][0], rr.status_line("up", self.stores.service.name))
+        # A test run changes nothing: no line in Slack; the log says it was a test.
+        slack.assert_not_called()
         self.assertIn("up: TEST RUN, nothing is wrong", log.getvalue())
         index, _ = self.stores.dev.read(rg.dev_commit_index(COMMIT))
         self.assertNotIn("promote", index)
@@ -1189,7 +1189,9 @@ class VerdictTest(unittest.TestCase):
 
 
 class StatusLineTest(unittest.TestCase):
-    """Every #deployments post is one line: dot, service, state, the ops board link, then any mentions."""
+    """Every #deployments post is one line: dot, service, release, the event words, the ops board link, then any
+    mentions. The words name the release event (2026-10-29: "down" read as a service outage when a release
+    failed its check)."""
 
     def test_each_state_is_one_exact_line(self) -> None:
         """The exact line of each state, with the default ops board link."""
@@ -1200,14 +1202,49 @@ class StatusLineTest(unittest.TestCase):
             lines,
             {
                 "deploying": f":large_green_circle: *orbit-api* deploying · {link}",
-                "up": f":large_green_circle: *orbit-api* up · {link}",
-                "warning": f":large_yellow_circle: *orbit-api* warning · {link}",
+                "up": f":large_green_circle: *orbit-api* released · {link}",
+                "warning": f":large_yellow_circle: *orbit-api* release check inconclusive · {link}",
                 "on hold": f":large_yellow_circle: *orbit-api* on hold · {link}",
-                "down": f":red_circle: *orbit-api* down · {link}",
+                "down": f":red_circle: *orbit-api* release failed · {link}",
             },
         )
         with self.assertRaises(KeyError):
             rr.status_line("passed", "orbit-api")
+        with self.assertRaises(KeyError):
+            rr.status_line("passed", "orbit-api", words="released")
+
+    def test_the_line_names_the_release_pr_and_commit(self) -> None:
+        """The release's PR and short sha follow the service, when the record has them."""
+        link = "<https://ops.orbitsearch.com/demo|ops.orbitsearch.com/demo>"
+        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
+            self.assertEqual(rr.release_label(_record()), f"#12 {COMMIT[:7]}")
+            self.assertEqual(rr.release_label(_record(head_pr={"pr": 2430, "author": "a"})), f"#2430 {COMMIT[:7]}")
+            self.assertEqual(rr.release_label(_record(commits=[])), COMMIT[:7])
+            self.assertEqual(rr.release_label({"release_id": "20261029T040343Z-8a6cd79fc"}), "8a6cd79")
+            self.assertEqual(rr.release_label({"commit": "", "release_id": ""}), "")
+            self.assertEqual(rr.release_label(None), "")
+            self.assertEqual(
+                rr.status_line("up", "demo", release=rr.release_label(_record())),
+                f":large_green_circle: *demo* #12 {COMMIT[:7]} released · {link}",
+            )
+            self.assertEqual(
+                rr.status_line("down", "demo", words="rollback failed"), f":red_circle: *demo* rollback failed · {link}"
+            )
+
+    def test_a_failed_release_names_its_rollback_target(self) -> None:
+        """A service with an automatic rollback says where it goes; one without says only that the release failed."""
+        data = service_data(tier="check_only")
+        del data["environments"]["dev"]
+        data["triggers"] = {"prod": ["demo-prod"]}
+        check_only = rc.parse_service(data)
+        record = _record()
+        self.assertEqual(rv.failed_words(SERVICE, record), f"release failed · rolling back to {PREVIOUS[:7]}")
+        suggested = _record(rollback_suggestion={"target": {"commit": "c" * 40}})
+        self.assertEqual(rv.failed_words(SERVICE, suggested), "release failed · rolling back to ccccccc")
+        self.assertEqual(rv.failed_words(SERVICE, _record(previous={})), "release failed · rolling back")
+        chain = _record(rollback_suggestion={"target": {"rollback_to": "previous-of:20261020T100000Z-bbbbbbbbb"}})
+        self.assertEqual(rv.failed_words(SERVICE, chain), "release failed · rolling back")
+        self.assertEqual(rv.failed_words(check_only, record), "release failed")
 
     def test_mentions_end_the_line(self) -> None:
         """The owner mentions of an alert come last, on the same line."""
@@ -1215,7 +1252,8 @@ class StatusLineTest(unittest.TestCase):
             line = rr.status_line("down", "smp", ["<@UJONNY>", "<@UNICK>"])
         self.assertEqual(
             line,
-            ":red_circle: *smp* down · <https://ops.orbitsearch.com/smp|ops.orbitsearch.com/smp> <@UJONNY> <@UNICK>",
+            ":red_circle: *smp* release failed · <https://ops.orbitsearch.com/smp|ops.orbitsearch.com/smp> "
+            "<@UJONNY> <@UNICK>",
         )
         self.assertNotIn("\n", line)
 
@@ -1227,6 +1265,26 @@ class StatusLineTest(unittest.TestCase):
                 rr.status_line("on hold", "demo"),
                 ":large_yellow_circle: *demo* on hold · <https://ops.example.com/demo|ops.example.com/demo>",
             )
+
+    def test_routine_states_are_not_posted(self) -> None:
+        """deploying and up go to the build log only; the states a human should look at are posted."""
+        out = io.StringIO()
+        with (
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertFalse(rr.post_status("deploying", "demo", detail="prod promote started"))
+            self.assertFalse(rr.post_status("up", "demo", detail="release-verify passed", record=_record()))
+            slack.assert_not_called()
+            for state in ("warning", "on hold", "down"):
+                self.assertTrue(rr.post_status(state, "demo"))
+        self.assertEqual(
+            [call.args[0] for call in slack.call_args_list],
+            [rr.status_line(state, "demo") for state in ("warning", "on hold", "down")],
+        )
+        self.assertIn(
+            f"Slack (not sent, routine): {rr.status_line('up', 'demo', release=f'#12 {COMMIT[:7]}')}", out.getvalue()
+        )
 
     def test_post_status_logs_the_detail_and_posts_only_the_line(self) -> None:
         """The detail goes to the build log with Slack ids redacted; Slack gets the line alone."""
@@ -1300,7 +1358,9 @@ class StatusLineTest(unittest.TestCase):
                 mock.patch.object(rv.time, "sleep", side_effect=sleep),
             ):
                 self.assertTrue(rv.alert_once(SERVICE, store, record, "down", ["<@UJONNY>"], "second"))
-            posted.assert_called_once_with(rr.status_line("down", SERVICE.name, ["<@UJONNY>"]))
+            posted.assert_called_once_with(
+                rr.status_line("down", SERVICE.name, ["<@UJONNY>"], release=rr.release_label(record))
+            )
             self.assertTrue(rr.read_record(store, record["release_id"])["alert"]["posted"])
 
     def test_alert_wait_ends_when_the_claim_never_settles(self) -> None:
@@ -1353,8 +1413,8 @@ class StatusLineTest(unittest.TestCase):
             self.assertEqual(len(calls), last + 3)
 
     def test_check_results_map_to_states(self) -> None:
-        """A check result posts its state: failed down once (with the owner), passed up, inconclusive warning,
-        the deploy checks passed deploying only without a dev stage, a passed window checkpoint nothing."""
+        """A check result posts a line only when a human should look: failed down once (with the owner),
+        inconclusive warning. A pass, the deploy checks that passed and a passed checkpoint post nothing."""
         data = service_data(tier="check_rollback")
         del data["environments"]["dev"]
         data["triggers"] = {"prod": ["demo-prod"], "rollback": "demo-rollback"}
@@ -1363,10 +1423,10 @@ class StatusLineTest(unittest.TestCase):
         deploy = VerdictTest._result(self, phase="deploy")
         cases = [
             (SERVICE, {"status": "failed", "phase": "window_15m"}, window, ["down", "<@UJONNY>"]),
-            (SERVICE, {"status": "passed"}, window, ["up"]),
+            (SERVICE, {"status": "passed"}, window, []),
             (SERVICE, {"status": "inconclusive", "reason": "x"}, window, ["warning", "<@UJONNY>"]),
             (SERVICE, {"status": "inconclusive", "cause": "capacity"}, window, ["warning"]),
-            (no_dev, {"status": "pending"}, deploy, ["deploying"]),
+            (no_dev, {"status": "pending"}, deploy, []),
             (SERVICE, {"status": "pending"}, deploy, []),
             (no_dev, {"status": "pending"}, window, []),
         ]
@@ -1387,7 +1447,10 @@ class StatusLineTest(unittest.TestCase):
                 if not expected:
                     self.assertEqual(lines, [])
                     continue
-                line = rr.status_line(expected[0], service.name, expected[1:])
+                words = rv.failed_words(service, record) if expected[0] == "down" else None
+                line = rr.status_line(
+                    expected[0], service.name, expected[1:], release=rr.release_label(record), words=words
+                )
                 # A failed release posts its down line once; the other states post each time.
                 self.assertEqual(lines, [line] if expected[0] == "down" else [line, line])
 
@@ -1985,7 +2048,9 @@ class ReviewFixTest(unittest.TestCase):
                     get_build=lambda _: mock.Mock(status="FAILURE"),
                 )
             self.assertEqual(status, "FAILURE")
-            self.assertEqual(slack.call_args[0][0], rr.status_line("down", SERVICE.name))
+            self.assertEqual(
+                slack.call_args[0][0], rr.status_line("down", SERVICE.name, release=COMMIT[:7], words="rollback failed")
+            )
             self.assertIn("--to previous-of:r1", log.getvalue())
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual(saved["auto_rollback"]["status"], "failed")
@@ -2042,9 +2107,42 @@ class ReviewFixTest(unittest.TestCase):
             self.assertEqual(status, "FAILURE")
             self.assertEqual(rr.read_record(store, record["release_id"])["auto_rollback"]["status"], "started")
             # One line for the restored, held moment (from the rollback build); the watch adds none.
-            self.assertEqual(slack.call_args_list, [mock.call(rr.status_line("on hold", SERVICE.name))])
+            self.assertEqual(
+                slack.call_args_list,
+                [mock.call(rr.status_line("on hold", SERVICE.name, release=rr.release_label(record)))],
+            )
             self.assertIn("do not roll back again", log.getvalue())
             self.assertNotIn("Roll back by hand", log.getvalue())
+
+    def test_an_incomplete_rollback_says_rollback_failed(self) -> None:
+        """A rollback that did not finish posts "rollback failed" for the release it rolled back, not "down"."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            store = _store(tmp)
+            record = _record()
+            _save(store, record)
+            rollback = _record(release_id="20261021T110000Z-bbbbbbbbb", kind="rollback", status="deploying")
+            _save(store, rollback, latest=False)
+            code = rb.finish_rollback(
+                SERVICE,
+                store,
+                argparse.Namespace(requested_by="test", reason="restore prod"),
+                rollback,
+                record,
+                {"commit": PREVIOUS},
+                {},
+                [],
+                ["deployment/prod-demo did not roll out"],
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                slack.call_args_list,
+                [mock.call(rr.status_line("down", SERVICE.name, release=f"#12 {COMMIT[:7]}", words="rollback failed"))],
+            )
 
     def test_single_pod_spread(self) -> None:
         """Single pod spread."""
@@ -2896,7 +2994,12 @@ class LightTest(unittest.TestCase):
                 rl.alert(service, store, saved)
                 rl.alert(service, store, rr.read_record(store, newer["release_id"]))
             self.assertEqual(slack.call_count, 1)
-            self.assertTrue(slack.call_args[0][0].startswith(rr.status_line("down", service.name)))
+            self.assertTrue(
+                slack.call_args[0][0].startswith(
+                    rr.status_line("down", service.name, release=rr.release_label(newer), words="release failed")
+                ),
+                slack.call_args[0][0],
+            )
             self.assertIn(f"--sha={'e' * 40}", log.getvalue())
 
     def test_watch_waits_for_a_running_sync(self) -> None:
@@ -3013,7 +3116,12 @@ class LightTest(unittest.TestCase):
                 self.assertEqual(rl.cmd_watch(args, service, store, mock.Mock()), rv.EXIT_FAILED)
             saved = rr.read_record(store, record["release_id"])
             self.assertEqual((saved["verdict"]["status"], saved["verdict"]["unchecked"]), ("inconclusive", True))
-            self.assertTrue(slack.call_args[0][0].startswith(rr.status_line("warning", service.name)))
+            self.assertTrue(
+                slack.call_args[0][0].startswith(
+                    rr.status_line("warning", service.name, release=rr.release_label(record))
+                ),
+                slack.call_args[0][0],
+            )
             self.assertIn("inconclusive", log.getvalue())
             # The next release's watch judges the unchecked release with it.
             newer = _record(
@@ -3780,7 +3888,18 @@ class LightFullProdTest(unittest.TestCase):
                 rl.cmd_check(_args(release_id=record["release_id"]), RUN, self.prod, self.gcloud), rv.EXIT_FAILED
             )
             alert.assert_not_called()
-            self.assertTrue(rr.post_slack.call_args[0][0].startswith(rr.status_line("down", RUN.name)))
+            # Tier full: the line says where the automatic rollback goes.
+            self.assertTrue(
+                rr.post_slack.call_args[0][0].startswith(
+                    rr.status_line(
+                        "down",
+                        RUN.name,
+                        release=rr.release_label(record),
+                        words=f"release failed · rolling back to {PREVIOUS[:7]}",
+                    )
+                ),
+                rr.post_slack.call_args[0][0],
+            )
             self.assertIn("An automatic rollback follows", log.getvalue())
             # The down line is sent once per release: the check build noted it in the record.
             self.assertTrue(rr.read_record(self.prod, record["release_id"])["alert"]["posted"])
@@ -4387,7 +4506,10 @@ class VersionTest(unittest.TestCase):
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["cause"], "environmental")
             hold = rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]
             self.assertEqual(hold["status"], "released")
-            self.assertEqual(slack.call_args_list[-1].args[0], rr.status_line("down", SERVICE.name))
+            self.assertEqual(
+                slack.call_args_list[-1].args[0],
+                rr.status_line("down", SERVICE.name, release=rr.release_label(record), words="rollback did not help"),
+            )
             self.assertIn("did not help", log.getvalue())
             self.assertTrue(
                 json.loads((Path(tmp) / rv.ENVIRONMENTAL_OBJECT).read_text())["signals"]["http_error_rate demo GET /b"][
@@ -4441,7 +4563,10 @@ class VersionTest(unittest.TestCase):
             self.assertNotIn("cause", verdict)
             self.assertEqual(verdict["environmental_signals"], ["http_error_rate demo GET /b"])
             self.assertEqual(rr.read_record(store, "20261021T110000Z-bbbbbbbbb")["promote_hold"]["status"], "holding")
-            self.assertEqual(slack.call_args_list[-1].args[0], rr.status_line("down", SERVICE.name))
+            self.assertEqual(
+                slack.call_args_list[-1].args[0],
+                rr.status_line("down", SERVICE.name, release=rr.release_label(record), words="rollback did not help"),
+            )
             self.assertIn("keep the promote hold", log.getvalue())
 
     def test_rollback_check_skips_spread_and_busy_prod(self) -> None:
@@ -5001,7 +5126,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         # Slack gets the down line; the recovery commands are in the build log.
-        self.assertEqual(slack.call_args[0][0], rr.status_line("down", "demo"))
+        self.assertEqual(slack.call_args[0][0], rr.status_line("down", "demo", words="release unchecked"))
         text = log.getvalue()
         for command in recovery:
             self.assertIn(command, text)
@@ -5037,7 +5162,7 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
                     + ["--status", "deployed"]
                 )
             self.assertEqual((code, finish.call_count), (1, 3))
-            self.assertEqual(slack.call_args[0][0], rr.status_line("down", SERVICE.name))
+            self.assertEqual(slack.call_args[0][0], rr.status_line("down", SERVICE.name, words="release unchecked"))
             self.assertIn("--release-id r1", log.getvalue())
 
     def test_prod_build_contract(self) -> None:
@@ -5188,7 +5313,12 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
             index, _ = store.read(rg.dev_commit_index(record["commit"]))
             self.assertEqual(index["verdict"]["status"], "inconclusive")
             pointed.assert_not_called()
-            self.assertEqual(slack.call_args[0][0], rr.status_line("warning", SERVICE.name))
+            self.assertEqual(
+                slack.call_args[0][0],
+                rr.status_line(
+                    "warning", SERVICE.name, release=rr.release_label(record), words="dev check inconclusive"
+                ),
+            )
             self.assertIn("dev verify inconclusive", log.getvalue())
 
     def test_rollback_watch_reads_a_failed_early_check(self) -> None:
@@ -5210,8 +5340,12 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertEqual(rv.ro.phase_result(same, "early_3m"), failing)
 
 
-def step_script(block: str) -> str:
-    """The bash script of one Cloud Build step block (the "- |" argument), with Cloud Build's $$ unescaped."""
+def step_script(block: str, substitutions: dict[str, str] | None = None) -> str:
+    """The bash script of one Cloud Build step block (the "- |" argument), with Cloud Build's $$ unescaped.
+
+    substitutions: Cloud Build substitutions to fill in first, such as {"SHORT_SHA": "abc1234"}."""
+    for name, value in (substitutions or {}).items():
+        block = re.sub(rf"(?<!\$)\${name}\b", value, block)
     lines = block.splitlines()
     start = next(index for index, line in enumerate(lines) if line.strip() == "- |") + 1
     indent = len(lines[start]) - len(lines[start].lstrip())
@@ -5296,7 +5430,7 @@ def result_posts(
             (workspace / marker).touch()
         env = {"PATH": f"{stub}:/usr/bin:/bin", "WEBHOOK_ORBIT": "https://hooks.invalid", "SHORT_SHA": "abc1234"}
         for step in ("release-verify-deploy", "notify-result"):
-            script = step_script(steps[step]).replace("/workspace", str(workspace))
+            script = step_script(steps[step], {"SHORT_SHA": "abc1234"}).replace("/workspace", str(workspace))
             subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False, timeout=30)
         return [
             line if line == "check" else json.loads(line)["text"]
@@ -5306,8 +5440,14 @@ def result_posts(
 
 def assert_one_line_per_result(test: unittest.TestCase, build: str, service: str) -> None:
     """A failed promote posts one line: the deploy check's down when Slack took it, else notify-result's down.
-    An unchecked prod posts warning; a passed release posts nothing here (the watch says up)."""
-    down, warning = rr.rendered_status_line("down", service), rr.rendered_status_line("warning", service)
+    An unchecked prod posts warning; a passed release posts nothing. The lines name the
+    release commit (result_posts fills in SHORT_SHA abc1234)."""
+    down, warning = (rr.rendered_status_line(state, service, "abc1234") for state in ("down", "warning"))
+    test.assertEqual(
+        down,
+        f":red_circle: *{service}* abc1234 release failed · "
+        f"<https://ops.orbitsearch.com/{service}|ops.orbitsearch.com/{service}>",
+    )
     cases = [
         ("failed promote, check posted", 2, ("deploy_failed",), True, ["check"]),
         ("failed promote, Slack refused the check's line", 2, ("deploy_failed",), False, [down]),
@@ -5775,8 +5915,9 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, result=failed)
-            alerts = [text for text in posts if " down · " in text]
+            alerts = [text for text in posts if text.startswith(":red_circle:")]
             self.assertTrue(alerts, posts)
+            self.assertIn(f"#12 {COMMIT[:7]} release failed · rolling back to {PREVIOUS[:7]} · ", alerts[0])
             self.assertIn("<@UJONNY>", alerts[0])
             # One down line per failed release: the rollback that follows adds none.
             self.assertEqual(len(alerts), 1, posts)
@@ -5786,9 +5927,42 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, error=rr.RecordError("cluster unavailable"))
-            alerts = [text for text in posts if " warning · " in text]
+            alerts = [text for text in posts if " release check inconclusive · " in text]
             self.assertTrue(alerts, posts)
             self.assertIn("<@UJONNY>", alerts[-1])
+
+    def test_a_failed_release_posts_one_line_and_not_its_warnings(self) -> None:
+        """2026-10-29 05:13 UTC: a release failed its +60 check, and #deployments got a down line and a warning
+        line in the same second. A failed release posts its failure line only; its warnings stay in the record."""
+        failed = VerdictTest._result(
+            self,
+            result="failed",
+            regressions=[{"kind": "metric", "text": "step p95 regressed"}],
+            warnings=[{"kind": "new_error", "name": "new_error:abc", "text": "a new error with no clear suspect"}],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._watch(store, record, result=failed)
+            self.assertEqual(len(posts), 1, posts)
+            self.assertTrue(posts[0].startswith(":red_circle:"), posts)
+            saved = rr.read_record(store, record["release_id"])
+            self.assertFalse(saved["warnings"]["new_error:abc"]["posted"])
+        # A release that passes still posts its warning, once, as a release check warning.
+        passed = VerdictTest._result(self, warnings=failed["warnings"])
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            _, posts = self._watch(store, record, result=passed)
+            link = "<https://ops.orbitsearch.com/demo|ops.orbitsearch.com/demo>"
+            self.assertEqual(
+                [text for text in posts if text.startswith(":large_yellow_circle:")],
+                [f":large_yellow_circle: *demo* #12 {COMMIT[:7]} release check warning · {link}"],
+            )
+            saved = rr.read_record(store, record["release_id"])
+            self.assertTrue(saved["warnings"]["new_error:abc"]["posted"])
 
     def test_an_agent_claim_is_unchanged(self) -> None:
         failed = VerdictTest._result(
@@ -5823,7 +5997,7 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._watch(store, record, people=people, result=failed)
-            self.assertIn("<@UFALLBACK>", [text for text in posts if " down · " in text][0])
+            self.assertIn("<@UFALLBACK>", [text for text in posts if text.startswith(":red_circle:")][0])
 
     def test_the_author_is_the_newest_pr_not_a_later_direct_commit(self) -> None:
         """A direct or automated commit after the PR never takes ownership from the PR's author."""
@@ -5927,6 +6101,26 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             outcome = rl.cmd_watch(args, service, store, mock.Mock())
         return outcome, [" ".join(str(part) for part in call.args) for call in slack.call_args_list]
 
+    def test_a_successful_release_posts_nothing(self) -> None:
+        """2026-10-29 05:30 UTC: a sync round of about 17 merges posted about 15 green lines in a row. A release
+        that passes its +15 and +60 checks posts no line (GKE and light); the ops board shows it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, posts = self._watch(store, record)
+            self.assertEqual(outcome, rv.EXIT_OK)
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
+            self.assertEqual(posts, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            record = _record(followup={})
+            _save(store, record)
+            outcome, posts = self._light_watch(store, record)
+            self.assertEqual(outcome, rv.EXIT_OK)
+            self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
+            self.assertEqual(posts, [])
+
     def test_light_unclaimed_release_passes_quietly_and_mentions_the_author_when_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
@@ -5941,7 +6135,7 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             record = _record(followup={})
             _save(store, record)
             _, posts = self._light_watch(store, record, error=rr.RecordError("logging unavailable"))
-            alerts = [text for text in posts if " warning · " in text]
+            alerts = [text for text in posts if " release check inconclusive · " in text]
             self.assertTrue(alerts, posts)
             self.assertIn("<@UJONNY>", alerts[-1])
 

@@ -877,7 +877,9 @@ class ReleaseCaseTest(unittest.TestCase):
                 rv.post_result(ORBIT_API, store, saved, result)
         self.assertIn("no rollback", line)
         # Capacity is environmental: a warning line that mentions nobody.
-        self.assertEqual(slack.call_args[0][0], rr.status_line("warning", ORBIT_API.name))
+        self.assertEqual(
+            slack.call_args[0][0], rr.status_line("warning", ORBIT_API.name, release=rr.release_label(saved))
+        )
 
     def test_the_capacity_wait_counts_the_first_wait(self) -> None:
         """Greptile #499: the first wait took 10 min, so the capacity wait gets what is left of 2 x 1,020 s."""

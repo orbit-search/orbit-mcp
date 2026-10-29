@@ -517,6 +517,7 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
                 rr.post_status(
                     "on hold",
                     service.name,
+                    record={"commit": args.commit},
                     detail=(
                         f"{title} dev verify passed for {short}; prod promote {decision.status}: "
                         f"{decision.reason}. To resume: {decision.resume_hint}."
@@ -531,6 +532,8 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
             rr.post_status(
                 "up",
                 service.name,
+                record={"commit": args.commit},
+                words="test run",
                 detail=(
                     f"TEST RUN, nothing is wrong. {title} dev verify passed for {short}; the gate says go "
                     f"({decision.reason}), and a real merge would start the prod promote now. Nothing was promoted."
@@ -541,6 +544,7 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
         rr.post_status(
             "deploying",
             service.name,
+            record={"commit": args.commit},
             detail=(
                 f"{title} dev verify passed for {short}; prod promote started "
                 f"({_build_url(service, build_id)}). {decision.reason}."
@@ -551,6 +555,8 @@ def cmd_request_promote(args: argparse.Namespace, stores: Stores) -> int:
         rr.post_status(
             "warning",
             service.name,
+            record={"commit": args.commit},
+            words="promote did not start",
             detail=(
                 f"{title} dev verify passed for {short}, but the prod promote did not start: {str(error)[:200]}. "
                 f"Start it by hand: {service.kit_command('release_gate.py', 'promote')} --commit {args.commit}"
@@ -740,6 +746,7 @@ def cmd_freeze(args: argparse.Namespace, stores: Stores, frozen: bool) -> int:
     rr.post_status(
         "on hold" if frozen else "up",
         stores.service.name,
+        words=None if frozen else "unfrozen",
         detail=f"{stores.service.title} automatic prod deploys {word} by {state['by']}: {args.reason[:200]}",
     )
     print(f"Automatic prod deploys {word}: {stores.prod.location(FREEZE_OBJECT)}")
@@ -765,6 +772,7 @@ def cmd_resume(args: argparse.Namespace, stores: Stores) -> int:
     rr.post_status(
         "up",
         service.name,
+        words="deploys resumed",
         detail=(
             f"{service.title} automatic prod deploys resumed by {_who(args)} after {what} "
             f"{pointer['release_id']}: {args.reason[:200]}. The next merge deploys; {after}"

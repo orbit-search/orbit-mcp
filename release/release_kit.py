@@ -748,7 +748,7 @@ steps:
               echo "$${{TEXT}}"
               # One status line per moment. When Slack took the deploy check's line of a failed release (a failed
               # deploy fails it), nothing more; else a failed deploy posts down and an unchecked prod warning.
-              # The promote said deploying; the watch says up.
+              # A release that passes posts nothing (the ops board shows it).
               if [ -f /workspace/release_verify_alerted ]; then
                 :
               elif [ -f /workspace/deploy_failed ]; then
@@ -910,9 +910,10 @@ def rendered_vercel(service: object) -> dict[str, str]:
         "wait_seconds": (service.deployment_wait_minutes + 5) * 60,  # type: ignore[attr-defined]
         "build_seconds": (service.deployment_wait_minutes + 60) * 60,  # type: ignore[attr-defined]
         # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
+        # The notify-result lines name the release commit ($SHORT_SHA, filled in by Cloud Build).
         "line_on_hold": rr.rendered_status_line("on hold", service.name),  # type: ignore[attr-defined]
-        "line_warning": rr.rendered_status_line("warning", service.name),  # type: ignore[attr-defined]
-        "line_down": rr.rendered_status_line("down", service.name),  # type: ignore[attr-defined]
+        "line_warning": rr.rendered_status_line("warning", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
+        "line_down": rr.rendered_status_line("down", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
     }
     files = {
         service.release_build_config: VERCEL_RELEASE_TEMPLATE.format(**values),  # type: ignore[attr-defined]

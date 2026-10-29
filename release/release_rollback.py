@@ -476,6 +476,8 @@ def finish_rollback(
         rr.post_status(
             "down",
             service.name,
+            record=latest,
+            words="rollback failed",
             detail=(
                 f"{title} prod rollback incomplete ({summary}). {failures[0][:300]}. "
                 f"Retry with the same target. Record {where}"
@@ -504,6 +506,7 @@ def finish_rollback(
     rr.post_status(
         "on hold",
         service.name,
+        record=latest,
         detail=(
             f"{title} prod rolled back ({summary}); automatic prod deploys are on hold after rollback "
             f"{saved['release_id']} of {latest['release_id']}. To resume: {hold.get('resume')}.{cleanup} Record {where}"

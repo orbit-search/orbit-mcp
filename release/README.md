@@ -17,7 +17,7 @@ The repo owns only `release/services/<service>.json` and the build files that
 |---|---|---|---|
 | `full` | A merge deploys dev; dev verify gates; the dev build starts the prod build, which promotes the dev digest (Cloud Run: the dev revisions; Composer: the dev candidate folder). | Smoke checks after the deploy, watch window at +15 and +60 min. | Rolls back on its own; promotes hold. |
 | `check_rollback` | The prod build of a merge deploys (no dev stage), after single flight and the freeze and hold gate. | Same. | Rolls back on its own; deploys hold. |
-| `check_only` | Same as `check_rollback`. | Same. | A `down` line in Slack with the author ping (the fix prompt is in the build log); a human rolls back. |
+| `check_only` | Same as `check_rollback`. | Same. | A red "release failed" line in Slack with the author ping (the fix prompt is in the build log); a human rolls back. |
 
 ## Slack
 
@@ -30,20 +30,35 @@ The reasons (failed checks, error rates, suspects, rollback targets, holds, comm
 ops board and in the build log, never in the post.
 
 ```text
-:large_green_circle: *orbit-api* up · <https://ops.orbitsearch.com/orbit-api|ops.orbitsearch.com/orbit-api>
+:red_circle: *deep-search* #2430 8a6cd79 release failed · rolling back to 1a2b3c4 · <https://ops.orbitsearch.com/deep-search|ops.orbitsearch.com/deep-search>
 ```
 
-| State | Dot | When |
-|---|---|---|
-| `deploying` | green | The prod promote started; for a service without a dev stage, the deploy checks passed. |
-| `up` | green | The release passed; a hold or freeze ended; a recovered signal; a test run. |
-| `warning` | yellow | Not verified: an inconclusive check, a checkpoint that could not run, warnings that do not roll back, a promote that did not start. |
-| `on hold` | yellow | Prod promotes hold: after a rollback, a forward-only release, a freeze, a failed dev verify. |
-| `down` | red | A release failed (once per release, also when its rollback starts; a failed promote or deploy is one `down` line), a rollback failed or could not start, a signal still fails after a rollback. |
+#deployments gets a line only when a human should look: a release failed or a rollback failed (red), a
+promote hold or a freeze (yellow, `on hold`), a release check that could not decide (yellow). Routine
+progress posts nothing: `deploying` and `up` go to the build log only (`release_record.QUIET_STATES`), and
+the ops board shows them on its Changes page and on each service page. A sync round that merges in many
+repositories at once therefore adds no lines when its releases pass.
+
+The line names the release event, not the health of the service: a release that failed its check is
+"release failed", and the service may be healthy. After the service come the release's PR and short
+commit when its record has them (`release_record.release_label`). The rendered Vercel and Railway builds
+put `$SHORT_SHA` there. The state keys and the dots stay; the words are these, unless the moment has
+more exact words (in parentheses). The ops board keeps its own labels.
+
+| State | Dot | Words | Posted | When |
+|---|---|---|---|---|
+| `deploying` | green | deploying | no | The prod promote started; for a service without a dev stage, the deploy checks passed. |
+| `up` | green | released | no | The release passed (also: "signals recovered", "unfrozen", "deploys resumed", "test run"). |
+| `warning` | yellow | release check inconclusive | yes | Not verified: an inconclusive check, a checkpoint that could not run (also: "release check warning" for warnings that do not roll back, "dev check inconclusive", "promote did not start", "release failed · not published" for a static site that never went live). |
+| `on hold` | yellow | on hold | yes | Prod promotes hold: after a rollback, a forward-only release, a freeze, a failed dev verify. |
+| `down` | red | release failed | yes | A release failed, once per release; a failed promote or deploy is one line. A service with an automatic rollback adds "· rolling back to <short sha>" (`release_verify.failed_words`); others say only "release failed". Also: "rollback failed", "rollback has no result", "release failed · rollback did not start", "release failed · no automatic rollback", "rollback did not help", "release unchecked" (the record finish failed). |
+
+A failed release posts only its failure line: its warnings that do not roll back stay unposted, in the
+record (the ops board) and in the build log.
 
 An alert about a release no agent claimed ends with the mentions of its owner (and of the suspects'
 authors for a failed release). `release_record.status_line` builds the line; `post_status` prints the
-detail to the build log (Slack ids redacted) and posts the line.
+detail to the build log (Slack ids redacted) and posts the line (a routine state: the build log only).
 
 The deploy check, the watch and the rollback can reach the same failed release; `release_verify.alert_once`
 lets one of them post its line. A caller that finds another caller's claim waits until that caller notes
@@ -718,7 +733,7 @@ staged build and no rollback API, so the kit watches and pings:
    `required_paths` entry answers 200; each page the release changed answers
    and carries its frontmatter title (a warning at +0, a failure later); the
    internal links on the changed pages resolve. External links are not checked.
-4. A failed check pings the PR author in Slack (a `down` line); the build log has the exact revert
+4. A failed check pings the PR author in Slack (a red "release failed" line); the build log has the exact revert
    command (`git revert` of the release's commits into a PR) and a fix prompt.
    Nothing reverts by itself: a bot must not author commits.
 

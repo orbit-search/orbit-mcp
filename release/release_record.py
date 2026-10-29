@@ -779,6 +779,23 @@ STATUS_DOTS = {
     "on hold": ":large_yellow_circle:",
     "down": ":red_circle:",
 }
+# The words a line shows for each state: they name the release event, not the health of the service (a failed
+# release is not a service that is down). A caller with a more exact event passes its own words. The ops
+# board keeps its own labels for these states.
+STATUS_WORDS = {
+    "deploying": "deploying",
+    "up": "released",
+    "warning": "release check inconclusive",
+    "on hold": "on hold",
+    "down": "release failed",
+}
+SHORT_SHA = 7
+# #deployments gets a line only when a human should look: a failed release or rollback ("down"), a hold or a
+# freeze ("on hold"), a release check that could not decide ("warning"). Routine progress (a promote that
+# started, a release that passed, a hold that ended) posts nothing: the ops board shows it on its Changes page
+# and on each service page, and the build log has the line (Nicholas, 2026-10-29: a sync round of about 17
+# merges posted about 15 green lines in a row).
+QUIET_STATES = frozenset({"deploying", "up"})
 
 
 def ops_url(service: str, base: str | None = None) -> str:
@@ -787,27 +804,76 @@ def ops_url(service: str, base: str | None = None) -> str:
     return f"{base}/{service}"
 
 
-def status_line(state: str, service: str, mentions: list[str] | tuple[str, ...] = (), base: str | None = None) -> str:
-    """The one Slack line of a release moment: dot, service, state and the ops board link.
+def release_label(record: dict | None) -> str:
+    """The label of a release record on its status line: "#<pr> <short sha>", the parts it has; "" for none.
 
-    state: deploying, up, warning, on hold or down. mentions: the owner Slack mentions of an alert,
-    at the end of the line. base: the ops board (see ops_url). Raise KeyError on an unknown state."""
+    The commit is the record's commit, else the one in its release id (<time>-<commit>). The PR is the
+    release commit's merged PR (head_pr), else the PR of that commit in the record's commit list."""
+    if not record:
+        return ""
+    release_id = str(record.get("release_id") or "")
+    commit = str(record.get("commit") or (release_id.rsplit("-", 1)[-1] if "-" in release_id else ""))
+    pr = (record.get("head_pr") or {}).get("pr")
+    if not pr and commit:
+        pr = next(
+            (
+                item.get("pr")
+                for item in record.get("commits") or []
+                if isinstance(item, dict) and item.get("pr") and str(item.get("sha") or "").startswith(commit)
+            ),
+            None,
+        )
+    return " ".join([*([f"#{pr}"] if pr else []), *([commit[:SHORT_SHA]] if commit else [])])
+
+
+def status_line(
+    state: str,
+    service: str,
+    mentions: list[str] | tuple[str, ...] = (),
+    base: str | None = None,
+    *,
+    release: str = "",
+    words: str | None = None,
+) -> str:
+    """The one Slack line of a release moment: dot, service, release, the event words and the ops board link.
+
+    state: deploying, up, warning, on hold or down (the dot). release: "#<pr> <short sha>" (release_label).
+    words: the event, default STATUS_WORDS[state]. mentions: the owner Slack mentions of an alert, at the end
+    of the line. base: the ops board (see ops_url). Raise KeyError on an unknown state."""
     url = ops_url(service, base)
-    line = f"{STATUS_DOTS[state]} *{service}* {state} · <{url}|{url.split('://', 1)[-1]}>"
+    head = " ".join(part for part in (STATUS_DOTS[state], f"*{service}*", release) if part)
+    line = f"{head} {words or STATUS_WORDS[state]} · <{url}|{url.split('://', 1)[-1]}>"
     return " ".join([line, *mentions])
 
 
-def rendered_status_line(state: str, service: str) -> str:
+def rendered_status_line(state: str, service: str, release: str = "") -> str:
     """The status line a rendered build posts with curl. Always the OPS_URL link: a committed build file
-    must not depend on the environment of whoever rendered it (release_kit.py check renders it again)."""
-    return status_line(state, service, base=OPS_URL)
+    must not depend on the environment of whoever rendered it (release_kit.py check renders it again).
+    release: what the build fills in, such as "$SHORT_SHA" (a Cloud Build substitution)."""
+    return status_line(state, service, base=OPS_URL, release=release)
 
 
-def post_status(state: str, service: str, mentions: list[str] | tuple[str, ...] = (), detail: str = "") -> bool:
-    """Print the detail for the build log (Slack ids redacted) and post the status line; whether Slack took it."""
+def post_status(
+    state: str,
+    service: str,
+    mentions: list[str] | tuple[str, ...] = (),
+    detail: str = "",
+    *,
+    record: dict | None = None,
+    words: str | None = None,
+) -> bool:
+    """Print the detail for the build log (Slack ids redacted) and post the status line; whether Slack took it.
+
+    A routine state (QUIET_STATES: deploying, up) is not posted: the line goes to the build log only, and the
+    result is False (nothing is in Slack). record: the release the line is about (its PR and short sha go on the
+    line). words: see status_line."""
     if detail:
         print(f"{state}: {redact_slack_ids(detail)}", flush=True)
-    return post_slack(status_line(state, service, mentions))
+    line = status_line(state, service, mentions, release=release_label(record), words=words)
+    if state in QUIET_STATES:
+        print(f"Slack (not sent, routine): {redact_slack_ids(line)}", flush=True)
+        return False
+    return post_slack(line)
 
 
 def post_slack(text: str, blocks: list[dict] | None = None) -> bool:
@@ -1122,7 +1188,7 @@ def finish_with_retries(
     )
     print(text, file=sys.stderr, flush=True)
     if env == "prod":
-        post_slack(status_line("down", service))
+        post_status("down", service, record={"release_id": release_id}, words="release unchecked")
     return 1
 
 
