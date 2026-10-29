@@ -123,9 +123,8 @@ steps:
         if [ -f /workspace/deploy_failed ] || [ -f /workspace/deploy_superseded ]; then exit 0; fi
         if [ ! -s /workspace/release_id ]; then
           touch /workspace/release_verify_failed
-          curl -s -X POST -H 'Content-type: application/json' \
-            --data '{"text":":x: orbit-mcp dev verify could not run for `$SHORT_SHA` (no dev release record); the prod promote did not start"}' \
-            "$$WEBHOOK_ORBIT"
+          echo 'orbit-mcp dev verify could not run for `$SHORT_SHA` (no dev release record); the prod promote did not start' >&2
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "on hold" orbit-mcp || true
           exit 0
         fi
         python3 release/release_light.py check --env dev \
@@ -137,9 +136,8 @@ steps:
         VERIFY_STATUS=$$?
         if [ "$${VERIFY_STATUS}" -ne 0 ] && [ "$${VERIFY_STATUS}" -ne 2 ]; then
           touch /workspace/release_verify_failed
-          curl -s -X POST -H 'Content-type: application/json' \
-            --data '{"text":":x: orbit-mcp dev verify could not run for `$SHORT_SHA`; the prod promote did not start (see the dev-verify step)"}' \
-            "$$WEBHOOK_ORBIT"
+          echo 'orbit-mcp dev verify could not run for `$SHORT_SHA`; the prod promote did not start (see the dev-verify step)' >&2
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "on hold" orbit-mcp || true
         fi
         exit 0
     env:
@@ -193,23 +191,21 @@ steps:
       - |
         if [ -f /workspace/deploy_superseded ]; then exit 0; fi
         if [ -f /workspace/candidate_cleanup_failed ]; then
-          curl -s -X POST -H 'Content-type: application/json' \
-            --data '{"text":":x: orbit-mcp failed-candidate tag cleanup FAILED for `$SHORT_SHA`; the failed revision may still be public. Inspect cleanup-failed-candidates immediately."}' \
-            "$$WEBHOOK_ORBIT"
+          echo 'orbit-mcp failed-candidate tag cleanup FAILED for `$SHORT_SHA`; the failed revision may still be public. Inspect cleanup-failed-candidates immediately.' >&2
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "warning" orbit-mcp || true
           exit 1
         fi
         if [ -f /workspace/release_record_failed ]; then
           PHASE=begin
           if [ -s /workspace/release_id ]; then PHASE=finish; fi
           TEXT=":x: orbit-mcp dev release record phase $${PHASE} failed for commit $SHORT_SHA; verification and promotion stopped. Inspect release-record steps before retrying."
-          PAYLOAD="$$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$${TEXT}")"
-          curl -s -X POST -H 'Content-type: application/json' --data "$${PAYLOAD}" "$$WEBHOOK_ORBIT" || true
+          echo "$${TEXT}" >&2
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "on hold" orbit-mcp || true
           exit 1
         fi
         if [ -f /workspace/deploy_failed ]; then
-          curl -s -X POST -H 'Content-type: application/json' \
-            --data '{"text":":x: orbit-mcp candidate deploy failed for commit `$SHORT_SHA`; prod traffic did not move and the prod promote did not start"}' \
-            "$$WEBHOOK_ORBIT"
+          echo 'orbit-mcp candidate deploy failed for commit `$SHORT_SHA`; prod traffic did not move and the prod promote did not start' >&2
+          python3 -c 'import sys; sys.path.insert(0, "/workspace/release"); import release_record as rr; rr.post_status(sys.argv[1], sys.argv[2])' "on hold" orbit-mcp || true
           echo "a candidate deploy failed; see the deploy-candidates step" >&2
           exit 1
         fi
