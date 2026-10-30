@@ -29,7 +29,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import release_config as rc  # noqa: E402
-import release_record as rr  # noqa: E402
 
 KIT_DIR = Path(__file__).resolve().parent
 MANIFEST = KIT_DIR / "KIT.json"
@@ -510,8 +509,6 @@ steps:
                 TEXT=":x: {title} could not set the commit status {context} on $SHORT_SHA; see the status-gate step"
               fi
               if [ -n "$${{TEXT}}" ]; then
-                # Slack gets the status line; the reason stays in this build log.
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT" || true
                 echo "$${{TEXT}}" >&2
                 exit 1
               fi
@@ -607,7 +604,6 @@ steps:
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
               echo '{title} prod promote blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, dev verify not passed, the deployment changed, or Vercel holds the project after an unrecorded rollback); the deployment stays staged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>'
-              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
     # Still current: right before the status, no newer prod build or deployment exists, no older
@@ -699,10 +695,8 @@ steps:
                 echo "release record missing; release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
                 exit 0
               fi
-              # --alerted-marker: written only when Slack took the failed release's line (down, or on hold).
               python3 release/release_light.py --service {service} check --env prod \\
-                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed \\
-                --alerted-marker /workspace/release_verify_alerted
+                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed
               VERIFY_STATUS=$$?
               if [ "$${{VERIFY_STATUS}}" -ne 0 ] && [ "$${{VERIFY_STATUS}}" -ne 2 ]; then
                 echo "release-verify could not run (exit $${{VERIFY_STATUS}}); release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
@@ -746,16 +740,6 @@ steps:
                 TEXT=":white_check_mark: {title} prod promote completed for commit \\`$SHORT_SHA\\`"
               fi
               echo "$${{TEXT}}"
-              # One status line per moment. When Slack took the deploy check's line of a failed release (a failed
-              # deploy fails it), nothing more; else a failed deploy posts down and an unchecked prod warning.
-              # A release that passes posts nothing (the ops board shows it).
-              if [ -f /workspace/release_verify_alerted ]; then
-                :
-              elif [ -f /workspace/deploy_failed ]; then
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_down}"}}' "$$WEBHOOK_ORBIT"
-              elif [ -f /workspace/release_verify_unchecked ]; then
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_warning}"}}' "$$WEBHOOK_ORBIT"
-              fi
               if [ -f /workspace/deploy_failed ]; then exit 1; fi
 
     - name: "gcr.io/cloud-builders/gcloud"
@@ -909,11 +893,6 @@ def rendered_vercel(service: object) -> dict[str, str]:
         "wait_minutes": service.deployment_wait_minutes,  # type: ignore[attr-defined]
         "wait_seconds": (service.deployment_wait_minutes + 5) * 60,  # type: ignore[attr-defined]
         "build_seconds": (service.deployment_wait_minutes + 60) * 60,  # type: ignore[attr-defined]
-        # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
-        # The notify-result lines name the release commit ($SHORT_SHA, filled in by Cloud Build).
-        "line_on_hold": rr.rendered_status_line("on hold", service.name),  # type: ignore[attr-defined]
-        "line_warning": rr.rendered_status_line("warning", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
-        "line_down": rr.rendered_status_line("down", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
     }
     files = {
         service.release_build_config: VERCEL_RELEASE_TEMPLATE.format(**values),  # type: ignore[attr-defined]
@@ -1051,11 +1030,6 @@ def _rendered(service: object) -> dict[str, str]:
 
 NO_CHANGE_RECEIPT = '{"release_deploy":"skipped_before_mutation"}'
 STEP_START = re.compile(r"(?m)^(?=[ \t]*- (?:id|name):)")
-# secretEnv naming WEBHOOK_ORBIT: a flow list (["A", "WEBHOOK_ORBIT"], on one or more lines) or a block list.
-FINISH_ALERT_SECRET = re.compile(
-    r"(?m)^(?P<i>[ \t]*)secretEnv:[ \t]*(?:\[[^\]]*\bWEBHOOK_ORBIT\b[^\]]*\]"
-    r"|\n(?:(?P=i)[ \t]*-[ \t]*[^\n]*\n)*?(?P=i)[ \t]*-[ \t]*[\"']?WEBHOOK_ORBIT[\"']?[ \t]*$)"
-)
 PROD_RECORD = re.compile(r"\b(?:begin|finish)\b[^\n]*--env prod\b")
 
 
@@ -1073,8 +1047,8 @@ def prod_build_problems(name: str, text: str) -> list[str]:
        release_no_change, called on the skip path and on the record-begin failure path, and the skip
        path covers deploy_failed, deploy_superseded and promote_blocked.
     2. notify-promote-blocked (when present) leaves the receipt before it ends the build.
-    3. release-record-finish retries (--attempts) and has secretEnv WEBHOOK_ORBIT: the deploy changed prod,
-       and a finish that still fails posts the recovery commands to Slack.
+    3. release-record-finish retries (--attempts): the deploy changed prod, and a finish that still fails
+       prints the recovery commands.
     Files without a prod release-record-begin step (dev builds, other builds) have no contract.
     """
     steps = {_step_id(block): block for block in STEP_START.split(text) if _step_id(block)}
@@ -1098,11 +1072,6 @@ def prod_build_problems(name: str, text: str) -> list[str]:
     finish = steps.get("release-record-finish", "")
     if not re.search(r"\bfinish\b[^\n]*--attempts [2-9]", finish):
         problems.append(f"{name}: release-record-finish must retry the prod finish (finish --env prod --attempts 3)")
-    if not FINISH_ALERT_SECRET.search(finish):
-        problems.append(
-            f"{name}: release-record-finish must have secretEnv WEBHOOK_ORBIT, so a finish that still fails "
-            "posts the recovery commands"
-        )
     return problems
 
 
