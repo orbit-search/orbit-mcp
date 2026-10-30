@@ -24,12 +24,12 @@
     "run_offline_checks.py": "3d2878280960b997400b80478e30afdd5785ac7e142c79221c3853c39fd0fcb6",
     "test_release_capacity.py": "a95a1761d09d527a2b13f0ea1b268b17421a61ef8d95abd1b93731fa762bec75",
     "test_release_cases.py": "1d77f09c7bb020406be13d57f0a29fb931f8573a2d8c5253ad752efa0d1a9e57",
-    "test_release_kit.py": "a361a3c95e9babf4a80d2be4777fce4a967bc8ef53c72077a18b36418e919edf",
+    "test_release_kit.py": "34f64af6ba8828d9fa96641fa07592facb8fb8f0efab9f4678ff7c2a77d29bfb",
     "test_release_observation.py": "ee07bc1e4f8a13f7eb8732ccfcb2d984b97d53bb1f05a193f896252ab9401489",
     "test_release_railway.py": "fc87ceb778af57401fef567ffc49f79a47ee7862d78964cf8292d6d76dc2798c",
     "test_release_vercel.py": "609d8c8f71ad4440bbb89db1f1f6c067a05769f66053607e450475a8007419da"
   },
   "source": "orbit-search/orbit-infrastructure release-kit/release",
-  "version": "kit-e2d0abe2a3d3",
+  "version": "kit-b1e6f4b1a2cb",
   "visibility": "public"
 }

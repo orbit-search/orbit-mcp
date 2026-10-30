@@ -5441,12 +5441,13 @@ def assert_receipts(test: unittest.TestCase, begin: str, blocked: str | None) ->
             test.assertEqual(json.loads(receipt.read_text()), {"release_deploy": "skipped_before_mutation"})
 
 
-def result_posts(build: str, check_exit: int | None, markers: tuple[str, ...] = ()) -> list[str]:
+def result_posts(build: str, check_exit: int | None, markers: tuple[str, ...] = ()) -> dict:
     """Run a rendered prod build's release-verify-deploy and notify-result steps with stub python3 and curl.
 
     The stub deploy check exits check_exit; on 2 (a failed verdict) it notes "check", as release_light.py check
     prints its line. None: no release record, so the check never runs. markers: workspace files the earlier
-    steps left (deploy_failed). Returns "check" and the payload of every curl post, in order."""
+    steps left (deploy_failed). Returns {"posts": "check" and the payload of every curl post, in order,
+    "exits": the exit code of each step, "unchecked": whether the release_verify_unchecked marker exists}."""
     steps = {kit._step_id(block): block for block in kit.STEP_START.split(build)}
     with tempfile.TemporaryDirectory() as tmp:
         stub, workspace, posts = Path(tmp, "bin"), Path(tmp, "ws"), Path(tmp, "posts")
@@ -5473,15 +5474,23 @@ def result_posts(build: str, check_exit: int | None, markers: tuple[str, ...] = 
         for marker in markers:
             (workspace / marker).touch()
         env = {"PATH": f"{stub}:/usr/bin:/bin", "WEBHOOK_ORBIT": "https://hooks.invalid", "SHORT_SHA": "abc1234"}
+        exits = []
         for step in ("release-verify-deploy", "notify-result"):
             script = step_script(steps[step], {"SHORT_SHA": "abc1234"}).replace("/workspace", str(workspace))
-            subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False, timeout=30)
-        return posts.read_text(encoding="utf-8").splitlines()
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+            exits.append(done.returncode)
+        return {
+            "posts": posts.read_text(encoding="utf-8").splitlines(),
+            "exits": exits,
+            "unchecked": (workspace / "release_verify_unchecked").exists(),
+        }
 
 
 def assert_no_slack_post(test: unittest.TestCase, build: str) -> None:
     """Nicholas, 2026-10-29: a rendered prod build posts nothing to #deployments. No step curls the webhook, and
-    a failed, unchecked or passed promote runs its result steps without one curl post."""
+    a failed, unchecked or passed promote runs its result steps without one curl post. The steps still run: the
+    deploy check runs when there is a record (its line on a failed verdict), a check that could not run or a
+    missing record marks the release unchecked, and notify-result fails the build after a failed promote."""
     test.assertFalse([line for line in build.splitlines() if "curl" in line and "WEBHOOK_ORBIT" in line])
     cases = [
         ("failed promote, check ran", 2, ("deploy_failed",)),
@@ -5493,7 +5502,10 @@ def assert_no_slack_post(test: unittest.TestCase, build: str) -> None:
     ]
     for name, check_exit, markers in cases:
         with test.subTest(case=name):
-            test.assertEqual([post for post in result_posts(build, check_exit, markers) if post != "check"], [])
+            result = result_posts(build, check_exit, markers)
+            test.assertEqual(result["posts"], ["check"] if check_exit == 2 else [])
+            test.assertEqual(result["exits"], [0, 1 if "deploy_failed" in markers else 0])
+            test.assertEqual(result["unchecked"], check_exit in (None, 1))
 
 
 # --------------------------------------------------------------------------- people map in public repositories
