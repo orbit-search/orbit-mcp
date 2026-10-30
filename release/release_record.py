@@ -32,7 +32,6 @@ import shlex
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -768,9 +767,10 @@ def redact_slack_ids(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>", "<@...>", text)
 
 
-# Every #deployments post is one status line. The reasons (checks, error rates, holds, rollback targets,
-# commits) are on the ops board, one page per service at <RELEASE_OPS_URL>/<service>, where <service> is
-# the folder of the service's release records (gs://orbit-search-release-records/<service>/).
+# Every release moment has one status line, in the build log only (post_slack). The reasons (checks, error
+# rates, holds, rollback targets, commits) are on the ops board, one page per service at
+# <RELEASE_OPS_URL>/<service>, where <service> is the folder of the service's release records
+# (gs://orbit-search-release-records/<service>/).
 OPS_URL = "https://ops.orbitsearch.com"
 STATUS_DOTS = {
     "deploying": ":large_green_circle:",
@@ -790,14 +790,6 @@ STATUS_WORDS = {
     "down": "release failed",
 }
 SHORT_SHA = 7
-# #deployments gets a line only when a human should look: a failed release or rollback ("down"), a hold or a
-# freeze ("on hold"), a release check that could not decide ("warning"). Routine progress (a promote that
-# started, a release that passed, a hold that ended) posts nothing: the ops board shows it on its Changes page
-# and on each service page, and the build log has the line (Nicholas, 2026-10-29: a sync round of about 17
-# merges posted about 15 green lines in a row).
-QUIET_STATES = frozenset({"deploying", "up"})
-# A human's freeze, unfreeze or resume is posted in every state (post_status announce=True): the others on the
-# channel should know that releases stopped or go again, and who did it.
 REASON_LIMIT = 200
 
 
@@ -864,13 +856,6 @@ def status_line(
     return " ".join([line, *mentions])
 
 
-def rendered_status_line(state: str, service: str, release: str = "") -> str:
-    """The status line a rendered build posts with curl. Always the OPS_URL link: a committed build file
-    must not depend on the environment of whoever rendered it (release_kit.py check renders it again).
-    release: what the build fills in, such as "$SHORT_SHA" (a Cloud Build substitution)."""
-    return status_line(state, service, base=OPS_URL, release=release)
-
-
 def post_status(
     state: str,
     service: str,
@@ -879,45 +864,26 @@ def post_status(
     *,
     record: dict | None = None,
     words: str | None = None,
-    announce: bool = False,
 ) -> bool:
-    """Print the detail for the build log (Slack ids redacted) and post the status line; whether Slack took it.
+    """Print the detail and the status line for the build log (Slack ids redacted); always True.
 
-    A routine state (QUIET_STATES: deploying, up) is not posted: the line goes to the build log only, and the
-    result is False (nothing is in Slack). announce: post it anyway (a human's freeze, unfreeze or resume).
-    record: the release the line is about (its PR and short sha go on the line). words: see status_line."""
+    Nothing goes to Slack (see post_slack). record: the release the line is about (its PR and short sha go on
+    the line). words: see status_line."""
     if detail:
         print(f"{state}: {redact_slack_ids(detail)}", flush=True)
-    line = status_line(state, service, mentions, release=release_label(record), words=words)
-    if state in QUIET_STATES and not announce:
-        print(f"Slack (not sent, routine): {redact_slack_ids(line)}", flush=True)
-        return False
-    return post_slack(line)
+    return post_slack(status_line(state, service, mentions, release=release_label(record), words=words))
 
 
 def post_slack(text: str, blocks: list[dict] | None = None) -> bool:
-    """Post one line (and optional Block Kit blocks) to the Orbit workspace webhook when WEBHOOK_ORBIT is set.
+    """Print one release line for the build log (Slack ids redacted) and return True, as if it was sent.
 
-    Never fails the caller; returns whether Slack took the post. With blocks, text is
-    the notification and fallback text. RELEASE_SLACK_DISABLED=1 (test runs) prints only.
-    """
-    webhook = os.environ.get("WEBHOOK_ORBIT", "").strip()
-    if os.environ.get("RELEASE_SLACK_DISABLED", "").strip() == "1":
-        webhook = ""
-    if not webhook:
-        print(f"Slack (not sent, no WEBHOOK_ORBIT): {redact_slack_ids(text)}", flush=True)
-        return False
-    request = urllib.request.Request(
-        webhook,
-        data=json.dumps({"text": text, **({"blocks": blocks} if blocks else {})}).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15):
-            return True
-    except (urllib.error.URLError, TimeoutError) as error:
-        print(f"WARNING: Slack post failed: {error}", file=sys.stderr, flush=True)
-        return False
+    The release tooling posts nothing to #deployments (Nicholas, 2026-10-29: the lines were not useful, and
+    other alerts cover releases). The ops board and the build log have every release moment. Callers that
+    note a post (alert_once, the warnings, the environmental marks) settle at once and never wait or retry.
+    blocks: accepted and ignored."""
+    del blocks
+    print(f"Release line (build log only): {redact_slack_ids(text)}", flush=True)
+    return True
 
 
 # --------------------------------------------------------------------------- record lifecycle

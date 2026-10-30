@@ -475,6 +475,7 @@ class GateTest(unittest.TestCase):
         _save(self.stores.prod, rollback)
 
         def run(command, reason: str) -> None:
+            """Run one human command as nicholas with this reason."""
             args = argparse.Namespace(by="nicholas", reason=reason)
             command(args)
 
@@ -564,8 +565,8 @@ class GateTest(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()) as log,
         ):
             self.assertEqual(rg.cmd_request_promote(args, self.stores), rg.EXIT_GO)
-        # A test run changes nothing: no line in Slack; the log says it was a test.
-        slack.assert_not_called()
+        # A test run changes nothing: one routine (green) line in the build log; the log says it was a test.
+        self.assertEqual([call.args[0].split(" ", 1)[0] for call in slack.call_args_list], [rr.STATUS_DOTS["up"]])
         self.assertIn("up: TEST RUN, nothing is wrong", log.getvalue())
         index, _ = self.stores.dev.read(rg.dev_commit_index(COMMIT))
         self.assertNotIn("promote", index)
@@ -1327,25 +1328,23 @@ class StatusLineTest(unittest.TestCase):
                 ":large_yellow_circle: *demo* on hold · <https://ops.example.com/demo|ops.example.com/demo>",
             )
 
-    def test_routine_states_are_not_posted(self) -> None:
-        """deploying and up go to the build log only; the states a human should look at are posted."""
+    def test_every_state_goes_to_the_build_log_only(self) -> None:
+        """Nicholas, 2026-10-29: no release line goes to #deployments. Every state prints its line for the build
+        log and counts as sent, even with a webhook set, and nothing reaches the network."""
         out = io.StringIO()
         with (
-            mock.patch.object(rr, "post_slack", return_value=True) as slack,
+            mock.patch.dict(os.environ, {"WEBHOOK_ORBIT": "https://hooks.invalid/x", "RELEASE_SLACK_DISABLED": "0"}),
+            mock.patch.object(rr.urllib.request, "urlopen", side_effect=AssertionError("network")) as urlopen,
             contextlib.redirect_stdout(out),
         ):
-            self.assertFalse(rr.post_status("deploying", "demo", detail="prod promote started"))
-            self.assertFalse(rr.post_status("up", "demo", detail="release-verify passed", record=_record()))
-            slack.assert_not_called()
-            for state in ("warning", "on hold", "down"):
-                self.assertTrue(rr.post_status(state, "demo"))
-        self.assertEqual(
-            [call.args[0] for call in slack.call_args_list],
-            [rr.status_line(state, "demo") for state in ("warning", "on hold", "down")],
-        )
-        self.assertIn(
-            f"Slack (not sent, routine): {rr.status_line('up', 'demo', release=f'#12 {COMMIT[:7]}')}", out.getvalue()
-        )
+            for state in ("deploying", "up", "warning", "on hold", "down"):
+                self.assertTrue(rr.post_status(state, "demo", ["<@UJONNY>"], record=_record()))
+            self.assertTrue(rr.post_slack("<@UJONNY> release failed", [{"type": "section"}]))
+        urlopen.assert_not_called()
+        for state in ("deploying", "up", "warning", "on hold", "down"):
+            line = rr.status_line(state, "demo", ["<@...>"], release=f"#12 {COMMIT[:7]}")
+            self.assertIn(f"Release line (build log only): {line}", out.getvalue())
+        self.assertNotIn("UJONNY", out.getvalue())
 
     def test_post_status_logs_the_detail_and_posts_only_the_line(self) -> None:
         """The detail goes to the build log with Slack ids redacted; Slack gets the line alone."""
@@ -1475,7 +1474,8 @@ class StatusLineTest(unittest.TestCase):
 
     def test_check_results_map_to_states(self) -> None:
         """A check result posts a line only when a human should look: failed down once (with the owner),
-        inconclusive warning. A pass, the deploy checks that passed and a passed checkpoint post nothing."""
+        inconclusive warning. A pass, the deploy checks that passed and a passed checkpoint have only routine
+        (green) lines."""
         data = service_data(tier="check_rollback")
         del data["environments"]["dev"]
         data["triggers"] = {"prod": ["demo-prod"], "rollback": "demo-rollback"}
@@ -1506,7 +1506,7 @@ class StatusLineTest(unittest.TestCase):
                 rv.post_result(service, store, rr.read_record(store, record["release_id"]), result)
                 lines = [call.args[0] for call in slack.call_args_list]
                 if not expected:
-                    self.assertEqual(lines, [])
+                    self.assertEqual([line for line in lines if not line.startswith(rr.STATUS_DOTS["up"])], [])
                     continue
                 words = rv.failed_words(service, record) if expected[0] == "down" else None
                 line = rr.status_line(
@@ -5263,20 +5263,9 @@ class CheckpointReviewDefectsTest(unittest.TestCase):
         self.assertIn("release_no_change", kit.prod_build_problems("b.yaml", no_failure_receipt)[0])
         no_retry = good.replace(" --attempts 3", "")
         self.assertIn("--attempts", kit.prod_build_problems("b.yaml", no_retry)[0])
-        no_alert = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', "")
-        self.assertEqual(len(kit.prod_build_problems("b.yaml", no_alert)), 1)
-        self.assertIn("WEBHOOK_ORBIT", kit.prod_build_problems("b.yaml", no_alert)[0])
-        block_lists = [
-            "    secretEnv:\n      - GITHUB_TOKEN\n      - WEBHOOK_ORBIT\n",
-            '    secretEnv:\n    - "WEBHOOK_ORBIT"\n',
-            '    secretEnv: [\n      "GITHUB_TOKEN",\n      "WEBHOOK_ORBIT",\n    ]\n',
-        ]
-        for listing in block_lists:
-            with self.subTest(listing=listing):
-                variant = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', listing)
-                self.assertEqual(kit.prod_build_problems("b.yaml", variant), [])
-        other = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', "    secretEnv:\n      - GITHUB_TOKEN\n")
-        self.assertIn("WEBHOOK_ORBIT", kit.prod_build_problems("b.yaml", other)[0])
+        # Nothing posts to Slack any more: the finish needs no webhook secret.
+        no_webhook = good.replace('    secretEnv: ["WEBHOOK_ORBIT"]\n', "")
+        self.assertEqual(kit.prod_build_problems("b.yaml", no_webhook), [])
         silent_block = good.replace(
             """        printf '%s\\n' '{"release_deploy":"skipped_before_mutation"}' > "$${BUILDER_OUTPUT}/output"
         exit 1""",
@@ -5452,15 +5441,12 @@ def assert_receipts(test: unittest.TestCase, begin: str, blocked: str | None) ->
             test.assertEqual(json.loads(receipt.read_text()), {"release_deploy": "skipped_before_mutation"})
 
 
-def result_posts(
-    build: str, check_exit: int | None, markers: tuple[str, ...] = (), slack_takes: bool = True
-) -> list[str]:
+def result_posts(build: str, check_exit: int | None, markers: tuple[str, ...] = ()) -> list[str]:
     """Run a rendered prod build's release-verify-deploy and notify-result steps with stub python3 and curl.
 
-    The stub deploy check exits check_exit; on 2 (a failed verdict) it posts its line, as release_light.py
-    check does: when slack_takes, Slack takes it ("check") and the stub writes the --alerted-marker file.
-    None: no release record, so the check never runs. markers: workspace files the earlier steps left
-    (deploy_failed). Returns every post Slack took, in order: "check", or the curl payload's text."""
+    The stub deploy check exits check_exit; on 2 (a failed verdict) it notes "check", as release_light.py check
+    prints its line. None: no release record, so the check never runs. markers: workspace files the earlier
+    steps left (deploy_failed). Returns "check" and the payload of every curl post, in order."""
     steps = {kit._step_id(block): block for block in kit.STEP_START.split(build)}
     with tempfile.TemporaryDirectory() as tmp:
         stub, workspace, posts = Path(tmp, "bin"), Path(tmp, "ws"), Path(tmp, "posts")
@@ -5468,13 +5454,10 @@ def result_posts(
         workspace.mkdir()
         posts.touch()
         code = 0 if check_exit is None else check_exit
-        takes = "1" if slack_takes else "0"
         scripts = {
             "python3": (
                 '#!/bin/sh\ncase " $* " in *" check "*)\n'
-                '  marker=""\n'
-                '  while [ $# -gt 0 ]; do if [ "$1" = "--alerted-marker" ]; then marker="$2"; fi; shift; done\n'
-                f'  if [ {code} -eq 2 ] && [ {takes} = 1 ]; then echo check >> "{posts}"; touch "$marker"; fi\n'
+                f'  if [ {code} -eq 2 ]; then echo check >> "{posts}"; fi\n'
                 f"  exit {code};;\nesac\nexit 0\n"
             ),
             "curl": (
@@ -5493,34 +5476,24 @@ def result_posts(
         for step in ("release-verify-deploy", "notify-result"):
             script = step_script(steps[step], {"SHORT_SHA": "abc1234"}).replace("/workspace", str(workspace))
             subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False, timeout=30)
-        return [
-            line if line == "check" else json.loads(line)["text"]
-            for line in posts.read_text(encoding="utf-8").splitlines()
-        ]
+        return posts.read_text(encoding="utf-8").splitlines()
 
 
-def assert_one_line_per_result(test: unittest.TestCase, build: str, service: str) -> None:
-    """A failed promote posts one line: the deploy check's down when Slack took it, else notify-result's down.
-    An unchecked prod posts warning; a passed release posts nothing. The lines name the
-    release commit (result_posts fills in SHORT_SHA abc1234)."""
-    down, warning = (rr.rendered_status_line(state, service, "abc1234") for state in ("down", "warning"))
-    test.assertEqual(
-        down,
-        f":red_circle: *{service}* abc1234 release failed · "
-        f"<https://ops.orbitsearch.com/{service}|ops.orbitsearch.com/{service}>",
-    )
+def assert_no_slack_post(test: unittest.TestCase, build: str) -> None:
+    """Nicholas, 2026-10-29: a rendered prod build posts nothing to #deployments. No step curls the webhook, and
+    a failed, unchecked or passed promote runs its result steps without one curl post."""
+    test.assertFalse([line for line in build.splitlines() if "curl" in line and "WEBHOOK_ORBIT" in line])
     cases = [
-        ("failed promote, check posted", 2, ("deploy_failed",), True, ["check"]),
-        ("failed promote, Slack refused the check's line", 2, ("deploy_failed",), False, [down]),
-        ("failed promote, check could not run", 1, ("deploy_failed",), True, [down]),
-        ("failed promote, no record", None, ("deploy_failed",), True, [down]),
-        ("failed check", 2, (), True, ["check"]),
-        ("unchecked", 1, (), True, [warning]),
-        ("passed", 0, (), True, []),
+        ("failed promote, check ran", 2, ("deploy_failed",)),
+        ("failed promote, check could not run", 1, ("deploy_failed",)),
+        ("failed promote, no record", None, ("deploy_failed",)),
+        ("failed check", 2, ()),
+        ("unchecked", 1, ()),
+        ("passed", 0, ()),
     ]
-    for name, check_exit, markers, slack_takes, expected in cases:
+    for name, check_exit, markers in cases:
         with test.subTest(case=name):
-            test.assertEqual(result_posts(build, check_exit, markers, slack_takes), expected)
+            test.assertEqual([post for post in result_posts(build, check_exit, markers) if post != "check"], [])
 
 
 # --------------------------------------------------------------------------- people map in public repositories
@@ -5603,8 +5576,8 @@ class PeopleMapTest(unittest.TestCase):
 
     def test_logs_never_show_slack_ids(self) -> None:
         self.assertEqual(rr.redact_slack_ids("<@U095N7BBQKD> and <@UFALL> failed"), "<@...> and <@...> failed")
-        with mock.patch.dict(os.environ, {"RELEASE_SLACK_DISABLED": "1"}), mock.patch("builtins.print") as printed:
-            self.assertFalse(rr.post_slack("<@U095N7BBQKD> release failed"))
+        with mock.patch("builtins.print") as printed:
+            self.assertTrue(rr.post_slack("<@U095N7BBQKD> release failed"))
         self.assertIn("<@...> release failed", printed.call_args[0][0])
         self.assertNotIn("U095N7BBQKD", printed.call_args[0][0])
 
@@ -6162,9 +6135,9 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             outcome = rl.cmd_watch(args, service, store, mock.Mock())
         return outcome, [" ".join(str(part) for part in call.args) for call in slack.call_args_list]
 
-    def test_a_successful_release_posts_nothing(self) -> None:
+    def test_a_successful_release_has_only_routine_lines(self) -> None:
         """2026-10-29 05:30 UTC: a sync round of about 17 merges posted about 15 green lines in a row. A release
-        that passes its +15 and +60 checks posts no line (GKE and light); the ops board shows it."""
+        that passes its +15 and +60 checks has only routine (green) lines (GKE and light); the ops board shows it."""
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(followup={})
@@ -6172,7 +6145,7 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             outcome, posts = self._watch(store, record)
             self.assertEqual(outcome, rv.EXIT_OK)
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
-            self.assertEqual(posts, [])
+            self.assertEqual([post for post in posts if not post.startswith(rr.STATUS_DOTS["up"])], [])
         with tempfile.TemporaryDirectory() as tmp:
             store = _store(tmp)
             record = _record(followup={})
@@ -6180,7 +6153,7 @@ class UnclaimedReleaseOwnerTest(unittest.TestCase):
             outcome, posts = self._light_watch(store, record)
             self.assertEqual(outcome, rv.EXIT_OK)
             self.assertEqual(rr.read_record(store, record["release_id"])["verdict"]["status"], "passed")
-            self.assertEqual(posts, [])
+            self.assertEqual([post for post in posts if not post.startswith(rr.STATUS_DOTS["up"])], [])
 
     def test_light_unclaimed_release_passes_quietly_and_mentions_the_author_when_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

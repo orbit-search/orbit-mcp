@@ -2669,7 +2669,7 @@ def dev_fix_prompt(service: rc.Service, record: dict, location: str) -> tuple[st
         "2. Read the dev build log and the dev pods' logs; find which change breaks dev.",
         f"3. Fix it on {branch} with a test, or revert the PR when a fix is not quick. Open the PR as me and "
         "follow the PR review loop in AGENTS.md.",
-        "4. After it merges it deploys by itself: dev, dev verify, then prod. Watch Slack #deployments.",
+        f"4. After it merges it deploys by itself: dev, dev verify, then prod. Watch {rr.ops_url(service.name)}.",
     ]
     return "\n".join(facts), "\n".join(steps)
 
@@ -2734,7 +2734,7 @@ def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: b
     )
     branch = service.release_branch
     started = (
-        f"an automatic rollback to commit {target[:9]} started. Check Slack #deployments for its result."
+        f"an automatic rollback to commit {target[:9]} started. Check {rr.ops_url(service.name)} for its result."
         if automatic
         else f"prod still runs it (tier check_only: no automatic rollback; the target is commit {target[:9]})."
     )
@@ -2767,10 +2767,10 @@ def fix_prompt(service: rc.Service, record: dict, location: str, *, automatic: b
         (
             "4. Automatic prod deploys are on hold after a rollback. Put the trailer "
             f"'Fixes-release: {record['release_id']}' in the fix or revert commit message (a revert of the PR also "
-            "works). After it merges it deploys by itself. Watch Slack #deployments."
+            f"works). After it merges it deploys by itself. Watch {rr.ops_url(service.name)}."
         )
         if getattr(service, "has_gate", True)
-        else "4. After it merges it deploys by itself. Watch Slack #deployments.",
+        else f"4. After it merges it deploys by itself. Watch {rr.ops_url(service.name)}.",
     ]
     return "\n".join(facts), "\n".join(steps)
 

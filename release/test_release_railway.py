@@ -333,36 +333,24 @@ class RailwayConfigTest(unittest.TestCase):
             with self.assertRaises(rc.ConfigError, msg=json.dumps(data)[:200]):
                 rl.parse_light(data)
 
-    def test_rendered_builds_post_only_status_lines(self) -> None:
-        """Every Slack post of a rendered Railway build is a status line; the reasons stay in the build log."""
+    def test_rendered_builds_post_nothing_to_slack(self) -> None:
+        """No rendered Railway build posts to Slack (Nicholas, 2026-10-29); the reasons stay in the build log."""
         for service in (API, DIRECT):
-            with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
-                files = kit.rendered(service)
-            posts = [
-                line
-                for text in files.values()
-                for line in text.splitlines()
-                if "curl" in line and "WEBHOOK_ORBIT" in line
-            ]
-            self.assertTrue(posts, service.name)
-            lines = [
-                rr.rendered_status_line("on hold", service.name),
-                *(rr.rendered_status_line(state, service.name, "$SHORT_SHA") for state in ("warning", "down")),
-            ]
-            for post in posts:
-                self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
-            self.assertNotIn("PAYLOAD", "".join(files.values()))
+            files = kit.rendered(service)
+            posts = [line for text in files.values() for line in text.splitlines() if "curl " in line]
+            self.assertEqual(posts, [], service.name)
+            self.assertNotIn("hooks.slack.com", "".join(files.values()))
 
-    def test_a_failed_deploy_posts_one_line(self) -> None:
-        """A failed prod deploy posts the deploy check's down line only, never down and then warning (tier
-        full: the promote build; check_rollback: the merge build)."""
+    def test_a_failed_deploy_posts_nothing(self) -> None:
+        """A failed prod deploy posts nothing to Slack (tier full: the promote build; check_rollback: the merge
+        build)."""
         import test_release_kit as tk
 
         for service, build in ((API, "promote"), (DIRECT, "release")):
             with self.subTest(service=build):
                 text = kit.rendered(service)[f"release/services/demo-api.{build}.yaml"]
                 self.assertIn('id: "notify-result"', text)
-                tk.assert_one_line_per_result(self, text, service.name)
+                tk.assert_no_slack_post(self, text)
 
     def test_rendering_ignores_release_ops_url(self) -> None:
         """The rendered builds link the fixed ops board: a local RELEASE_OPS_URL never makes check reject them."""

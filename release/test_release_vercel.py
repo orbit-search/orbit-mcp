@@ -437,24 +437,12 @@ class VercelConfigTest(unittest.TestCase):
             '"RELEASE_AUTO_ROLLBACK=${_AUTO_ROLLBACK}"', files["release/services/demo-web.release-verify.yaml"]
         )
 
-    def test_rendered_builds_post_only_status_lines(self) -> None:
-        """Every Slack post of a rendered build is a status line with the ops board link; reasons stay in the log."""
-        with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": ""}):
-            files = kit.rendered(WEB)
-        posts = [
-            line.split("--data ", 1)[1]
-            for text in files.values()
-            for line in text.splitlines()
-            if "curl" in line and "WEBHOOK_ORBIT" in line
-        ]
-        self.assertEqual(len(posts), 4, posts)
-        lines = {
-            rr.rendered_status_line("on hold", WEB.name),
-            *(rr.rendered_status_line(state, WEB.name, "$SHORT_SHA") for state in ("warning", "down")),
-        }
-        for post in posts:
-            self.assertTrue(any(f'"text":"{line}"' in post for line in lines), post)
-        self.assertNotIn("PAYLOAD", "".join(files.values()))
+    def test_rendered_builds_post_nothing_to_slack(self) -> None:
+        """No rendered Vercel build posts to Slack (Nicholas, 2026-10-29); the reasons stay in the build log."""
+        files = kit.rendered(WEB)
+        posts = [line for text in files.values() for line in text.splitlines() if "curl " in line]
+        self.assertEqual(posts, [])
+        self.assertNotIn("hooks.slack.com", "".join(files.values()))
 
     def test_rendered_promote_keeps_the_prod_build_contract(self) -> None:
         """Every stop before the promote leaves the no-change receipt, and the finish retries."""
@@ -464,13 +452,12 @@ class VercelConfigTest(unittest.TestCase):
         self.assertEqual(kit.prod_build_problems("promote.yaml", promote), [])
         steps = {kit._step_id(block): block for block in kit.STEP_START.split(promote)}
         tk.assert_receipts(self, steps["release-record-begin"], steps["notify-promote-blocked"])
-        self.assertIn("WEBHOOK_ORBIT", steps["release-record-finish"])
 
-    def test_a_failed_promote_posts_one_line(self) -> None:
-        """A failed promote posts the deploy check's down line only, never down and then warning."""
+    def test_a_failed_promote_posts_nothing(self) -> None:
+        """A failed promote posts nothing to Slack."""
         import test_release_kit as tk
 
-        tk.assert_one_line_per_result(self, kit.rendered(WEB)["release/services/demo-web.promote.yaml"], WEB.name)
+        tk.assert_no_slack_post(self, kit.rendered(WEB)["release/services/demo-web.promote.yaml"])
 
     def test_rendering_ignores_release_ops_url(self) -> None:
         """The rendered builds link the fixed ops board: a local RELEASE_OPS_URL never makes check reject them."""
@@ -478,7 +465,6 @@ class VercelConfigTest(unittest.TestCase):
             default = kit.rendered(WEB)
         with mock.patch.dict(os.environ, {"RELEASE_OPS_URL": "https://ops.example.com"}):
             self.assertEqual(kit.rendered(WEB), default)
-        self.assertIn("https://ops.orbitsearch.com/demo-web", default["release/services/demo-web.promote.yaml"])
 
     def test_kit_files_include_vercel(self) -> None:
         """The module and its tests are pinned kit files (sync copies them)."""

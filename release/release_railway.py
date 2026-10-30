@@ -777,8 +777,6 @@ steps:
                 TEXT=":x: {title} dev release record failed for $SHORT_SHA; verification and promotion stopped"
               fi
               if [ -n "$${{TEXT}}" ]; then
-                # Slack gets the status line; the reason stays in this build log.
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT" || true
                 echo "$${{TEXT}}" >&2
                 exit 1
               fi
@@ -870,10 +868,8 @@ PROD_DEPLOY_STEPS = """\
                 echo "release record missing; release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
                 exit 0
               fi
-              # --alerted-marker: written only when Slack took the failed release's line (down, or on hold).
               python3 release/release_light.py --service {service} check --env prod \\
-                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed \\
-                --alerted-marker /workspace/release_verify_alerted
+                --release-id-file /workspace/release_id --failed-marker /workspace/release_verify_failed
               VERIFY_STATUS=$$?
               if [ "$${{VERIFY_STATUS}}" -ne 0 ] && [ "$${{VERIFY_STATUS}}" -ne 2 ]; then
                 echo "release-verify could not run (exit $${{VERIFY_STATUS}}); release is unchecked" | tee -a /workspace/release_verify_unchecked >&2
@@ -903,16 +899,6 @@ PROD_DEPLOY_STEPS = """\
                 TEXT=":white_check_mark: {title} prod deploy completed for commit \\`$SHORT_SHA\\`"
               fi
               echo "$${{TEXT}}"
-              # One status line per moment. When Slack took the deploy check's line of a failed release (a failed
-              # deploy fails it), nothing more; else a failed deploy posts down and an unchecked prod warning.
-              # A release that passes posts nothing (the ops board shows it).
-              if [ -f /workspace/release_verify_alerted ]; then
-                :
-              elif [ -f /workspace/deploy_failed ]; then
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_down}"}}' "$$WEBHOOK_ORBIT"
-              elif [ -f /workspace/release_verify_unchecked ]; then
-                curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_warning}"}}' "$$WEBHOOK_ORBIT"
-              fi
               if [ -f /workspace/deploy_failed ]; then exit 1; fi
 
     - name: "gcr.io/cloud-builders/gcloud"
@@ -1000,7 +986,6 @@ steps:
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
               echo '{title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, dev build missing or failed, or dev verify not passed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the prod build>'
-              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
     # Still current: right before the deploy, no newer prod build exists and no older build or rollback started.
@@ -1088,7 +1073,6 @@ steps:
                 printf '%s\\n' '{{"release_deploy":"skipped_before_mutation"}}' > "$${{BUILDER_OUTPUT}}/output"
               fi
               echo '{title} prod deploy blocked for commit `$SHORT_SHA` (not on {branch}, or the single-flight or gate step failed); production is unchanged. See <https://console.cloud.google.com/cloud-build/builds;region={region}/$BUILD_ID?project=$PROJECT_ID|the deploy build>'
-              curl -s -X POST -H 'Content-type: application/json' --data '{{"text":"{line_on_hold}"}}' "$$WEBHOOK_ORBIT"
               exit 1
 
 """
@@ -1236,11 +1220,6 @@ def rendered(service: object) -> dict[str, str]:
         "wait_minutes": wait,
         "wait_seconds": (wait + 5) * 60,
         "build_seconds": (wait + 70) * 60,
-        # The #deployments lines the build steps post with curl (no Python in the curl image): set at render.
-        # The notify-result lines name the release commit ($SHORT_SHA, filled in by Cloud Build).
-        "line_on_hold": rr.rendered_status_line("on hold", service.name),  # type: ignore[attr-defined]
-        "line_warning": rr.rendered_status_line("warning", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
-        "line_down": rr.rendered_status_line("down", service.name, "$SHORT_SHA"),  # type: ignore[attr-defined]
     }
     prod = secrets(service, ["prod"])
     files = {

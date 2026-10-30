@@ -17,58 +17,52 @@ The repo owns only `release/services/<service>.json` and the build files that
 |---|---|---|---|
 | `full` | A merge deploys dev; dev verify gates; the dev build starts the prod build, which promotes the dev digest (Cloud Run: the dev revisions; Composer: the dev candidate folder). | Smoke checks after the deploy, watch window at +15 and +60 min. | Rolls back on its own; promotes hold. |
 | `check_rollback` | The prod build of a merge deploys (no dev stage), after single flight and the freeze and hold gate. | Same. | Rolls back on its own; deploys hold. |
-| `check_only` | Same as `check_rollback`. | Same. | A red "release failed" line in Slack with the author ping (the fix prompt is in the build log); a human rolls back. |
+| `check_only` | Same as `check_rollback`. | Same. | A red "release failed" line on the ops board and in the build log, with the fix prompt; a human rolls back. |
 
-## Slack
+## Status lines
 
-Every post to #deployments is one line: a status dot, the service, its state and a link to the
-service's page on the ops board, `https://ops.orbitsearch.com/<service>` (`<service>` is the folder of
-the service's records in `gs://orbit-search-release-records/`). The rendered build files always link
-that board; `RELEASE_OPS_URL` changes only the lines the Python steps post, so a local value never
-makes `release_kit.py check` reject the committed build files.
-The reasons (failed checks, error rates, suspects, rollback targets, holds, commits) are on the
-ops board and in the build log, never in the post.
+Every release moment has one status line in the build log: a status dot, the service, its state and a
+link to the service's page on the ops board, `https://ops.orbitsearch.com/<service>` (`<service>` is the
+folder of the service's records in `gs://orbit-search-release-records/`). The ops board shows every
+release moment on its Changes page and on each service page, with the reasons (failed checks, error
+rates, suspects, rollback targets, holds, commits).
+
+Nothing in the kit posts to Slack (Nicholas, 2026-10-29: the #deployments lines were not useful, and other
+alerts cover releases). `release_record.post_slack` prints the line for the build log and returns True, as
+if sent, so a caller that notes a post settles at once. `post_status` prints the detail (Slack ids
+redacted) and the line. The rendered builds print their reasons in the build log.
 
 ```text
 :red_circle: *deep-search* #2430 8a6cd79 release failed · rolling back to 1a2b3c4 · <https://ops.orbitsearch.com/deep-search|ops.orbitsearch.com/deep-search>
 ```
 
-#deployments gets a line only when a human should look: a release failed or a rollback failed (red), a
-promote hold or a freeze (yellow, `on hold`), a release check that could not decide (yellow). Routine
-progress posts nothing: `deploying` and `up` go to the build log only (`release_record.QUIET_STATES`), and
-the ops board shows them on its Changes page and on each service page. A sync round that merges in many
-repositories at once therefore adds no lines when its releases pass.
-
-A human's release command is a line the channel should see, in every state: "releases frozen by <who>",
-"freeze ended by <who>", "releases resumed by <who>" (`release_gate.py freeze`, `unfreeze`, `resume`;
-`post_status(..., announce=True)`), then ": <reason>", one line, at most 200 characters, with Slack's
-control characters escaped (`release_record.human_words`).
+A human's release command has its own words: "releases frozen by <who>", "freeze ended by <who>",
+"releases resumed by <who>" (`release_gate.py freeze`, `unfreeze`, `resume`), then ": <reason>". The
+reason is cut to 200 characters and kept on one line, with Slack's control characters escaped
+(`release_record.human_words`).
 
 The line names the release event, not the health of the service: a release that failed its check is
 "release failed", and the service may be healthy. After the service come the release's PR and short
-commit when its record has them (`release_record.release_label`). The rendered Vercel and Railway builds
-put `$SHORT_SHA` there. The state keys and the dots stay; the words are these, unless the moment has
-more exact words (in parentheses). The ops board keeps its own labels.
+commit when its record has them (`release_record.release_label`). The words are these, unless the moment
+has more exact words (in parentheses). The ops board keeps its own labels.
 
-| State | Dot | Words | Posted | When |
-|---|---|---|---|---|
-| `deploying` | green | deploying | no | The prod promote started; for a service without a dev stage, the deploy checks passed. |
-| `up` | green | released | no | The release passed (also: "signals recovered", "test run"). A human's "freeze ended by" and "releases resumed by" lines are posted. |
-| `warning` | yellow | release check inconclusive | yes | Not verified: an inconclusive check, a checkpoint that could not run (also: "release check warning" for warnings that do not roll back, "dev check inconclusive", "promote did not start", "release failed · not published" for a static site that never went live). |
-| `on hold` | yellow | on hold | yes | Prod promotes hold: after a rollback, a forward-only release, a failed dev verify (also: "releases frozen by <who>: <reason>"). |
-| `down` | red | release failed | yes | A release failed, once per release; a failed promote or deploy is one line. A service with an automatic rollback adds "· rolling back to <short sha>" (`release_verify.failed_words`); others say only "release failed". Also: "rollback failed", "rollback has no result", "release failed · rollback did not start", "release failed · no automatic rollback", "rollback did not help", "release unchecked" (the record finish failed). |
+| State | Dot | Words | When |
+|---|---|---|---|
+| `deploying` | green | deploying | The prod promote started; for a service without a dev stage, the deploy checks passed. |
+| `up` | green | released | The release passed (also: "signals recovered", "test run", "freeze ended by", "releases resumed by"). |
+| `warning` | yellow | release check inconclusive | Not verified: an inconclusive check, a checkpoint that could not run (also: "release check warning" for warnings that do not roll back, "dev check inconclusive", "promote did not start", "release failed · not published" for a static site that never went live). |
+| `on hold` | yellow | on hold | Prod promotes hold: after a rollback, a forward-only release, a failed dev verify (also: "releases frozen by <who>: <reason>"). |
+| `down` | red | release failed | A release failed, once per release. A service with an automatic rollback adds "· rolling back to <short sha>" (`release_verify.failed_words`); others say only "release failed". Also: "rollback failed", "rollback has no result", "release failed · rollback did not start", "release failed · no automatic rollback", "rollback did not help", "release unchecked" (the record finish failed). |
 
-A failed release posts only its failure line: its warnings that do not roll back stay unposted, in the
-record (the ops board) and in the build log.
+A failed release has only its failure line: its warnings that do not roll back stay in the record (the
+ops board) and in the build log.
 
 An alert about a release no agent claimed ends with the mentions of its owner (and of the suspects'
-authors for a failed release). `release_record.status_line` builds the line; `post_status` prints the
-detail to the build log (Slack ids redacted) and posts the line (a routine state: the build log only).
+authors for a failed release). `release_record.status_line` builds the line.
 
 The deploy check, the watch and the rollback can reach the same failed release; `release_verify.alert_once`
-lets one of them post its line. A caller that finds another caller's claim waits until that caller notes
-the post. When that post fails the claim is freed and the waiting caller posts; a claim older than two
-minutes (its caller died) is taken over.
+lets one of them log its line. The line counts as sent at once (`post_slack` returns True), so the claim
+settles as posted and no other caller waits; a claim older than two minutes (its caller died) is taken over.
 
 ## Files
 
@@ -77,7 +71,7 @@ minutes (its caller died) is taken over.
 | `release_config.py` | Loads and validates `services/<service>.json`. |
 | `promote_release_guard.py` | Single flight (`turn`), and for the full tier `preflight` (on the release branch, dev build passed, the dev digest) and `still-current`. |
 | `release_record.py` | Records in `gs://orbit-search-release-records/<service>/<env>/`: `begin` before the first cluster change, `finish` after the deploy, `show`, `backfill`. |
-| `release_verify.py` | `check --phase deploy` (smoke checks), `schedule-window`, `watch` (metrics and new errors at each checkpoint), the automatic rollback and the Slack alerts. |
+| `release_verify.py` | `check --phase deploy` (smoke checks), `schedule-window`, `watch` (metrics and new errors at each checkpoint), the automatic rollback and the status lines. |
 | `release_capacity.py` | The capacity verdict of a rollout that did not finish (Rule 1), rollout timeouts scaled by replicas (Rule 3), and `rollout-wait` for the prod build's deploy step. See [Capacity is environmental](#capacity-is-environmental). |
 | `release_signals.py` | New monitor alerts, new Error Tracking issues, new error log lines (Cloud Logging) and new failure series, each traced to a suspected commit. |
 | `release_gate.py` | `request-promote`, `check-prod`, `check-direct`, `status`, `freeze`, `unfreeze`, `resume`, `promote`. |
@@ -232,7 +226,7 @@ with "no checkpoint replay yet": add that replay with the first such case.
   changes prod. Still exceeded: the cause is
   environmental. The signal is marked in `<store>/<service>/prod/environmental_signals.json`
   (an exceeded limit on it is a quiet warning until it is back within its old limit),
-  Slack gets one line, and when every regression was such a signal the rollback's
+  the build log gets one line, and when every regression was such a signal the rollback's
   hold ends.
 - A new error fails a release only with a clear suspect: a score of 4 or more and 2
   above the next PR. A commit that adds the log line itself is never clear.
@@ -295,7 +289,7 @@ kubectl apply -f /workspace/k8-prod-rendered/ || { deploy_step_failed deploy-pro
 ```
 
 Dev verify passes only on a passed result. A dev rollout that capacity still holds back after the extended
-wait is `inconclusive`: the commit is not verified, prod does not promote it, and Slack gets one line.
+wait is `inconclusive`: the commit is not verified, prod does not promote it, and the build log gets one line.
 
 Capacity: the availability checks of those Deployments (images, rollouts, deploy, their `pods_ready`
 checks) get status `environmental`. No rollback, no suspected PRs, no hold, no author ping; one line goes to
@@ -482,9 +476,8 @@ checks of the checkpoint it is on (they passed, but the saved verdict is failed)
   promote) and when `begin` fails. `notify-promote-blocked` writes the receipt
   before it ends the build. A build without the receipt counts as a prod change
   and stops the window watch of the release before it (`builds_since_rollback`).
-- `release-record-finish` runs `finish --env prod --attempts 3` and has
-  `WEBHOOK_ORBIT`. After the deploy changed prod, a finish that still fails posts
-  the recovery commands in order (finish the record, `check --phase deploy`,
+- `release-record-finish` runs `finish --env prod --attempts 3`. After the deploy
+  changed prod, a finish that still fails prints the recovery commands in order (finish the record, `check --phase deploy`,
   `schedule-window`) and the build ends red. Nothing below the finish runs on an
   unfinished record.
   The finish refuses (and changes nothing) once a newer release or rollback is
@@ -599,7 +592,7 @@ writes all four builds: `<service>.release.yaml` (dev, push trigger),
 (window) and `<service>.rollback.yaml`.
 
 Credentials: the builds read two Secret Manager secrets:
-`slack-webhook-workspace-orbit` and the team-scoped Vercel token
+`slack-webhook-workspace-orbit` (in the env, unused: nothing posts to Slack) and the team-scoped Vercel token
 (`vercel-release-token`, env `VERCEL_RELEASE_TOKEN`). GitHub needs no
 secret: reads use the read token of the Cloud Build connection (as for every
 kind), and each commit status uses a read-write token of the connection's
@@ -738,7 +731,7 @@ staged build and no rollback API, so the kit watches and pings:
    `required_paths` entry answers 200; each page the release changed answers
    and carries its frontmatter title (a warning at +0, a failure later); the
    internal links on the changed pages resolve. External links are not checked.
-4. A failed check pings the PR author in Slack (a red "release failed" line); the build log has the exact revert
+4. A failed check marks the release failed on the ops board (a red "release failed" line); the build log has the exact revert
    command (`git revert` of the release's commits into a PR) and a fix prompt.
    Nothing reverts by itself: a bot must not author commits.
 

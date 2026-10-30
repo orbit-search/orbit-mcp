@@ -2831,7 +2831,7 @@ def cmd_check(args: argparse.Namespace, service: LightService, store: rr.Store, 
         else:
             posted = alert(service, store, saved)
         if posted and args.alerted_marker:
-            # Only a line Slack took: without it the build's notify-result step posts the failed deploy itself.
+            # Older rendered builds pass the marker; the kit's builds no longer read it.
             Path(args.alerted_marker).write_text("true\n", encoding="utf-8")
         return rv.EXIT_FAILED
     minutes = " and ".join(f"+{value}" for value in service.checkpoints)
@@ -4069,7 +4069,9 @@ def main(argv: list[str] | None = None) -> int:
     release_id_args(check)
     check.add_argument("--wait", action="store_true", help="composer: wait for the DAG processor first")
     check.add_argument("--failed-marker")
-    check.add_argument("--alerted-marker", default="", help="prod: written when Slack took the failed release's line")
+    check.add_argument(
+        "--alerted-marker", default="", help="prod: written after the failed release's line (older builds only)"
+    )
     check.add_argument("--force-fail", default="", help="test runs: the alert says TEST RUN")
     check.add_argument("--parse-result", default="", help="composer dev verify: the parse-dags result")
     check.add_argument("--build-id", default="", help="dev verify: the dev build, to tell a superseded verify")
