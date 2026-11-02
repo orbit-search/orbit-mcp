@@ -262,7 +262,7 @@ export function createOrbitServer(apiKey: string): McpServer {
         let result;
         try { result = await client.startEnrich(profile_id, operation, id); }
         catch (error) {
-          if (error instanceof Error && (error.name === "TimeoutError" || error.name === "TypeError" || error instanceof OrbitApiError && error.status >= 500)) throw new Error(`Enrichment acceptance is unknown. Retry identical arguments with request_id=${id}, or poll get_enrichment_status if its request_id is known. Do not start another build.`);
+          if (error instanceof Error && (error.name === "TimeoutError" || error.name === "TypeError" || error instanceof OrbitApiError && (error.status === 408 || error.status >= 500))) throw new Error(`Enrichment acceptance is unknown. Retry identical arguments with request_id=${id}, or poll get_enrichment_status if its request_id is known. Do not start another build.`);
           throw error;
         }
         return toolResult(result, result.status === "failed");

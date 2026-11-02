@@ -60,3 +60,30 @@ test('enrich returns running and exposes a separate status tool', async()=>{
     await client.callTool({name:'get_enrichment_status',arguments:{request_id:'e1'}}); assert.match(calls[1].url,/enrich\/requests\/e1$/);
   });
 });
+
+test('HTTP 408 preserves generated and supplied enrichment IDs for retry and polling', async () => {
+  for (const requestedId of [undefined, 'stable-build']) {
+    await withClient((request, count) => {
+      if (count === 1) return response({}, 408);
+      const requestId = request.body?.request_id ?? decodeURIComponent(request.url.split('/').at(-1));
+      return response({ request_id: requestId, profile_id: 'p1', status: 'completed', operation: 'full', include_profile: true });
+    }, async (client, calls) => {
+      const args = { profile_id: 'p1', operation: 'full', ...(requestedId ? { request_id: requestedId } : {}) };
+      const timedOut = await client.callTool({ name: 'enrich_profile', arguments: args });
+      const recoveryId = calls[0].body.request_id;
+      assert.equal(timedOut.isError, true);
+      assert.equal(calls.length, 1, 'unknown acceptance must not trigger an automatic build retry');
+      if (requestedId) assert.equal(recoveryId, requestedId);
+      else assert.match(recoveryId, /^[0-9a-f-]{36}$/);
+      assert.ok(timedOut.content[0].text.includes(`request_id=${recoveryId}`));
+      assert.match(timedOut.content[0].text, /acceptance is unknown/);
+      assert.match(timedOut.content[0].text, /get_enrichment_status/);
+      const retried = await client.callTool({ name: 'enrich_profile', arguments: { ...args, request_id: recoveryId } });
+      assert.notEqual(retried.isError, true);
+      assert.deepEqual(calls[1].body, calls[0].body);
+      await client.callTool({ name: 'get_enrichment_status', arguments: { request_id: recoveryId } });
+      assert.equal(calls[2].method ?? 'GET', 'GET');
+      assert.ok(calls[2].url.endsWith(`/v3/enrich/requests/${recoveryId}`));
+    });
+  }
+});
