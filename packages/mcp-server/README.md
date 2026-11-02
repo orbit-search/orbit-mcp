@@ -13,40 +13,27 @@ release is required; this README alone does not establish production availabilit
 
 ## Tools
 
-| Tool | Purpose | Orbit API |
-|---|---|---|
-| `search_people` | Find people from a plain-English query and/or identity signals, optionally discover candidates, and build quick, partial or full profiles | `POST /v3/search`, then `GET /v3/search/{search_id}` |
-| `quote_population_search` | Price a search for everyone at a company or everyone who attended a school, as one number in credits | `POST /v3/search/populations/quote` |
-| `search_population` | Start a search for everyone in one population at quick, partial or full depth; returns the first snapshot at once | `POST /v3/search/populations` |
-| `get_search_status` | Read the latest snapshot of any v3 search, to follow a population search to its end | `GET /v3/search/{search_id}` |
-| `get_profile` | Read an existing profile as JSON or a Markdown file package; stale data may schedule a refresh | `GET /v3/enrich/{profile_id}` |
-| `enrich_profile` | Ensure a known profile is quick/partial/full or regenerate a full profile | `POST /v3/enrich/{profile_id}`, then `GET /v3/enrich/requests/{request_id}` when needed |
-| `get_credit_usage` | Read usage for the connected API key and available/reserved balance for its billing account | `GET /v3/credits/usage` |
+`search_people` returns an initial snapshot promptly. Poll `get_search_status`
+with its `search_id` until `completed`, `completed_with_errors` or `failed`.
+Discovery and generation run in Orbit after the MCP response. Existing defaults
+remain partial depth, discovery off, ten known results and ten discovery results.
+Explicit `full` requests retain that depth. A client timeout is unknown delivery,
+not proof of server failure: retry identical arguments with the same persisted
+`request_id`, or poll if `search_id` is already known. Never automatically start
+another search ID. Progress and partial hits arrive on status polls; unknown
+percent/ETA is null.
 
-`search_people` and `enrich_profile` poll to a terminal state. `search_population` returns at once because a population can take a long time to fill; follow it with `get_search_status`, spacing polls out. They honor `Retry-After` and retry `429`/`5xx` responses with exponential backoff and jitter. A caller may provide `request_id`; persist and reuse it only when retrying the exact same logical request.
+Use `find_people` for explicit quick identity resolution, then `enrich_profile`
+only for selected profile IDs. Poll `get_enrichment_status` for independent
+builds. Use `search_people_batch` and `get_people_batch_status` for several
+people; keep each person's successful results and follow `next_offset` pages.
+`mode: "sync"` is allowed only for quick known-signal lookups with discovery off;
+it does not wait for background enrichment. Profile reads, population quotes,
+population searches, credit usage and directory tools remain available.
 
-The three search/profile tools declare output schemas and return `structuredContent` alongside
-serialized JSON in `content` by default. With `get_profile` and `format: "markdown"`,
-`content` contains a file-map block followed by one readable text block per file;
-`structuredContent` retains the complete package and billing receipt. Schemas describe the v3
-response envelopes; profile bodies and new API fields remain open-ended so no
-person context or source evidence is dropped. Tool errors retain `isError: true`;
-exception payloads are `{ error: string }` in text content only, outside the
-successful output schema. This keeps schema-validating clients from hiding the
-actionable error behind a structured-output validation failure.
-
-In Markdown mode, profile IDs, generation levels and billing bookkeeping remain
-in `structuredContent` and do not appear in the readable file-map block.
-
-Annotations mark `get_profile` and `get_credit_usage` as read-only; only the usage lookup is idempotent, while independent profile reads consume credits. Search may build
-profiles; enrichment may regenerate and replace existing context. Neither write
-tool promises unconditional idempotency because `request_id` is optional.
-
-After building, `node scripts/server-card.mjs` prints a credential-free discovery
-card from the actual registered tools. Mirror it into the infrastructure Worker's
-`server-card.mjs` only with a coordinated release: deploy the MCP server first,
-compare live discovery, then deploy the card and republish Smithery. Do not
-advertise the new contract before its runtime is deployed.
+See the [person research skill](../../skills/orbit-person-research/SKILL.md) and
+[implementation plan](../../docs/plans/async-people-search.md) for the retry and
+release contract.
 
 ## Authentication
 

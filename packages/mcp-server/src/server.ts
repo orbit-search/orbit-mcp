@@ -1,7 +1,8 @@
 /** General Orbit MCP tools with truthful behavior hints and structured v3 results. */
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { OrbitV3Client } from "./orbit-api.js";
+import { OrbitApiError, OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
 import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
 
@@ -32,6 +33,11 @@ const signalsSchema = z
     phone: z.string().min(1).optional(),
   })
   .strict();
+
+const identityIntentSchema = z.object({
+  names: z.array(z.string().min(1)).max(20).optional(),
+  experiences: z.array(z.object({ organization: z.string().min(1).optional(), title: z.string().min(1).optional() }).strict()).max(20).optional(),
+}).strict().describe("Explicit identity criteria. Quick discovery with URLs requires exactly one names entry; quick company discovery also requires its organization in experiences.");
 
 /** Terminal states that are MCP errors, as search_people reports them: some or all of the work failed. */
 const PARTIAL_OR_FAILED: ReadonlySet<string> = new Set(["completed_with_errors", "failed"]);
@@ -69,29 +75,76 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool(
     "search_people",
     {
-      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. The tool waits for terminal results and includes ready profiles.",
+      description: "Find people with Orbit v3 Search using a plain-English query, identity signals, or both. This call returns quickly; poll get_search_status until terminal (completed, completed_with_errors, failed). Keep partial hits and inspect individual failures. On timeout, retry with the same request_id and identical arguments — do not start a new search. Prefer get_search_status if you already have search_id. Discovery and depth beyond quick always run asynchronously. To resolve candidates without deeper builds, use find_people, then enrich_profile only for selected IDs.",
       outputSchema: searchOutputSchema,
       // Search may generate/upgrade profiles; an omitted request_id creates new work.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       inputSchema: {
+        mode: z.enum(["async", "sync"]).default("async").describe("Async by default. Sync is allowed only for known-signal lookups with discovery off and quick depth; it never waits for enrichment."),
         query: z.string().min(1).max(2_000).optional().describe("Plain-English people search query."),
+        intent: identityIntentSchema.optional(),
         signals: signalsSchema.optional().describe("Exact identity signals such as email, LinkedIn URL, username, URL, address, or phone."),
         candidate_discovery: z.boolean().default(false).describe("Allow Orbit to find and build people beyond known matches. Address and phone disable discovery, except with profile_depth quick: a quick search needs discovery on to build the owners of a phone, email or address; with discovery off it returns only profiles Orbit already has."),
         candidate_discovery_limit: z.number().int().min(1).max(50).optional().describe("Most people discovery adds (Orbit default 10, maximum 50). For a quick phone, email or address search, this caps the owners returned. Sent only when discovery is on."),
         profile_depth: z.enum(["quick", "partial", "full"]).default("partial").describe("Minimum profile depth to build for selected results: quick (level 1), partial (level 2) or full (level 3). Quick never upgrades a known profile; it builds new level 1 profiles only through candidate_discovery."),
         limit: z.number().int().min(1).max(20).default(10).describe("Maximum known-profile results; v3 supports up to 20. People that discovery adds are capped by candidate_discovery_limit."),
-        request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical search."),
+        request_id: z.string().min(1).max(200).optional().describe("Persist this idempotency key before calling. On timeout, retry identical arguments with the same request_id; never start a new search. Prefer get_search_status if search_id is known."),
       },
     },
-    async ({ query, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id }) => {
+    async ({ query, intent, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id, mode }) => {
       try {
-        const result = await client.searchAndWait({ query, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id });
-        return toolResult(result, result.status !== "completed");
+        const result = await client.startSearch({ query, intent, signals, candidate_discovery, candidate_discovery_limit, profile_depth, limit, request_id, mode });
+        return toolResult(result, PARTIAL_OR_FAILED.has(result.status));
       } catch (error) {
         return toolError(error);
       }
     },
   );
+
+  server.registerTool("find_people", {
+    description: "Resolve identity to candidate/profile IDs at quick depth without upgrading known profiles. Explicitly choose this find step before enrich_profile for selected people. Discovery can build new level-1 profiles and uses credits. Quick discovery requires phone/email/address, URL signals with exactly one intent.names entry, or one name plus a company in intent.experiences. For open-ended discovery use search_people at partial/full depth. Returns quickly; poll get_search_status until terminal. On timeout retry the same request_id and identical arguments; if search_id is known, poll it instead.",
+    inputSchema: { query: z.string().min(1).max(2000).optional(), intent: identityIntentSchema.optional(), signals: signalsSchema.optional(),
+      candidate_discovery: z.boolean().default(false), candidate_discovery_limit: z.number().int().min(1).max(50).optional(),
+      limit: z.number().int().min(1).max(20).default(10), request_id: z.string().min(1).max(128) },
+    outputSchema: searchSnapshotOutputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  }, async input => {
+    try { const result = await client.startSearch({ ...input, profile_depth: "quick" }); return toolResult(result, PARTIAL_OR_FAILED.has(result.status)); }
+    catch (error) { return toolError(error); }
+  });
+
+  server.registerTool("search_people_batch", {
+    description: "Start one durable job for independent people queries. Returns job_id quickly; poll get_people_batch_status and paginate next_offset for per-person status/results. One failure never discards other people. Discovery and generation use credits; existing search defaults apply. On timeout retry the same request_id and identical people; if job_id is known poll it instead, never create a new batch.",
+    inputSchema: { request_id: z.string().min(1).max(128).describe("Persist before calling; reuse for the identical batch after timeout."),
+      people: z.array(z.object({ person_key: z.string().min(1).max(128), intent: identityIntentSchema.optional(), query: z.string().min(1).max(2000).optional(), signals: signalsSchema.optional(),
+        candidate_discovery: z.boolean().default(false), candidate_discovery_limit: z.number().int().min(1).max(50).optional(),
+        profile_depth: z.enum(["quick", "partial", "full"]).default("partial"), limit: z.number().int().min(1).max(20).default(10) })).min(1).max(100) },
+    outputSchema: z.object({ job_id: z.string(), status: z.string() }).passthrough(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  }, async ({ request_id, people }) => {
+    try {
+      if (new Set(people.map(person => person.person_key)).size !== people.length) throw new Error("person_key must be unique within the batch");
+      return toolResult(await client.startBatch(request_id, people));
+    } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool("get_people_batch_status", {
+    description: "Poll a batch job without starting work. Each item id is its original person_key; result contains available profile IDs, statuses and profiles after that person finishes. Read all pages with next_offset, even after overall terminal status. Keep successful people when another fails. Poll running/processing/queued jobs every 3 seconds; terminal states are completed, completed_with_errors, failed, canceled.",
+    inputSchema: { job_id: z.string().uuid(), offset: z.number().int().min(0).max(5000).default(0) },
+    outputSchema: z.object({ job_id: z.string(), status: z.string(), items: z.array(z.object({}).passthrough()), next_offset: z.number().nullable() }).passthrough(),
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ job_id, offset }) => {
+    try { return toolResult(await client.getBatch(job_id, offset)); } catch (error) { return toolError(error); }
+  });
+
+  server.registerTool("get_enrichment_status", {
+    description: "Read an independent profile build by its returned request_id. Poll every 3 seconds while running; stop at completed or failed. A transport timeout does not prove the server job failed.",
+    inputSchema: { request_id: z.string().min(1).max(500) }, outputSchema: enrichOutputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ request_id }) => {
+    try { const result = await client.getEnrichment(request_id); return toolResult(result, result.status === "failed"); }
+    catch (error) { return toolError(error); }
+  });
 
   const populationInput = {
     population: z.object({
@@ -126,7 +179,7 @@ export function createOrbitServer(apiKey: string): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       inputSchema: {
         ...populationInput,
-        request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key. Persist and reuse it when retrying the same logical search."),
+        request_id: z.string().min(1).max(200).optional().describe("Persist this idempotency key before calling. On timeout, retry identical arguments with the same request_id; never start a new search. Prefer get_search_status if search_id is known."),
       },
     },
     async ({ population, size, profile_depth, request_id }) => {
@@ -142,7 +195,7 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool(
     "get_search_status",
     {
-      description: "Read the latest snapshot of a v3 search by search_id without starting new work. Use it to follow a population search, or any search whose earlier response was still running. Space polls out.",
+      description: "Read progress, partial hits and individual statuses without starting another search. Poll every 3 seconds while running; stop at completed, completed_with_errors or failed. An empty running snapshot is not no matches. Progress percent/eta_seconds can be null when unknown; never invent an ETA. Keep ready results when other people fail.",
       outputSchema: searchSnapshotOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       inputSchema: {
@@ -193,7 +246,7 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool(
     "enrich_profile",
     {
-      description: "Ensure an existing Orbit profile is quick, partial or full, or regenerate a full profile. The tool waits for terminal v3 Enrich status.",
+      description: "Start an independent build of a selected Orbit profile at quick, partial or full depth, or regenerate it. Returns promptly; poll get_enrichment_status until completed or failed. On timeout retry identical arguments with the same request_id; do not start another build.",
       outputSchema: enrichOutputSchema,
       // Regeneration can replace existing context, and request_id remains optional.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -205,7 +258,13 @@ export function createOrbitServer(apiKey: string): McpServer {
     },
     async ({ profile_id, operation, request_id }) => {
       try {
-        const result = await client.enrichAndWait(profile_id, operation, request_id);
+        const id = request_id ?? randomUUID();
+        let result;
+        try { result = await client.startEnrich(profile_id, operation, id); }
+        catch (error) {
+          if (error instanceof Error && (error.name === "TimeoutError" || error.name === "TypeError" || error instanceof OrbitApiError && (error.status === 408 || error.status >= 500))) throw new Error(`Enrichment acceptance is unknown. Retry identical arguments with request_id=${id}, or poll get_enrichment_status if its request_id is known. Do not start another build.`);
+          throw error;
+        }
         return toolResult(result, result.status === "failed");
       } catch (error) {
         return toolError(error);

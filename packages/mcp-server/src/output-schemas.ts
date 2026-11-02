@@ -47,9 +47,16 @@ const source = z.object({
 
 export const searchOutputSchema = z.object({
   billing: billingSchema.optional(),
+  progress: z.object({
+    phase: z.enum(["matching", "discovering", "enriching", "completed", "failed"]),
+    completed_results: z.number().int().nonnegative(), observed_results: z.number().int().nonnegative(),
+    percent: z.number().min(0).max(100).nullable().describe("Unknown while discovery can add people."),
+    eta_seconds: z.number().nonnegative().nullable().describe("Null when there is no measured estimate; never invent an ETA."),
+    poll_after_seconds: z.number().nonnegative(),
+  }).optional(),
   search_id: z.string().describe("Server-generated search identifier."),
   request_id: z.string().describe("Idempotency key for this logical search; reuse for retries."),
-  status: z.enum(["completed", "completed_with_errors", "failed"]).describe("Terminal search state after polling."),
+  status: z.enum(["running", "completed", "completed_with_errors", "failed"]).describe("Current search state; poll get_search_status while running."),
   candidate_discovery: z.boolean().describe("Whether candidate discovery was enabled."),
   candidate_discovery_completed: z.boolean().optional().describe("Whether discovery can add any more results."),
   profile_depth: z.enum(["quick", "partial", "full"]).describe("Requested minimum profile depth."),
@@ -149,7 +156,7 @@ export const enrichOutputSchema = z.object({
   billing: billingSchema.optional(),
   request_id: z.string().describe("Idempotency key for this enrichment; reuse for retries."),
   profile_id: z.string().describe("Canonical Orbit profile identifier."),
-  status: z.enum(["completed", "failed"]).describe("Terminal enrichment state after polling."),
+  status: z.enum(["running", "completed", "failed"]).describe("Current enrichment state; poll get_enrichment_status while running."),
   operation: z.enum(["quick", "partial", "full", "regenerate"]).describe("Requested enrichment operation."),
   include_profile: z.boolean().describe("Whether available person context is embedded."),
   generation_level: generationLevel.optional(),
