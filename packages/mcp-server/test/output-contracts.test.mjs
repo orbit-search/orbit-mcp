@@ -49,7 +49,7 @@ async function withClient(run, responseBody, responseStatus = 200) {
 test("all tools advertise output schemas and accurate annotations", async () => {
   await withClient(async client => {
     const catalog = await client.listTools();
-    assert.equal(catalog.tools.length, 45);
+    assert.equal(catalog.tools.length, 49);
     const tools = catalog.tools.filter(tool => ["search_people", "get_profile", "enrich_profile"].includes(tool.name));
     assert.equal(client.getServerVersion().version, "2.3.0");
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
@@ -70,7 +70,7 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     assert.deepEqual(catalog.tools.find(tool => tool.name === "get_search_status").annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     // Population tool text names no data provider and says nothing about what Orbit already holds.
     for (const tool of catalog.tools.filter(tool => /population|search_status/.test(tool.name))) assert.doesNotMatch(JSON.stringify(tool), /linkedin|already hold/i, `${tool.name} text`);
-    assert.equal(catalog.tools.length, 45);
+    assert.equal(catalog.tools.length, 49);
   });
 });
 

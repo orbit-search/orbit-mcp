@@ -22,6 +22,8 @@ export interface SearchSignals {
 }
 
 export interface SearchInput {
+  mode?: "async" | "sync";
+  intent?: { names?: string[]; experiences?: Array<{ organization?: string; title?: string }> };
   request_id?: string;
   query?: string;
   signals?: SearchSignals;

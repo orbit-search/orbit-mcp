@@ -144,10 +144,11 @@ export class OrbitV3Client {
     return current;
   }
 
-  async searchAndWait(input: SearchInput): Promise<SearchResponse> {
+  /** Durable intake only; the API continues after the client disconnects. */
+  async startSearch(input: SearchInput): Promise<SearchResponse> {
     const query = input.query?.trim() || undefined;
     const signals = cleanSignals(input.signals);
-    if (!query && !signals) throw new Error("search_people requires a query or at least one identity signal");
+    if (!query && !signals && !Object.keys(input.intent ?? {}).length) throw new Error("search_people requires a query, intent or identity signal");
 
     const profileDepth = input.profile_depth ?? "partial";
     // Phone and address searches read known profiles only, except at quick depth: there discovery is
@@ -156,6 +157,7 @@ export class OrbitV3Client {
       (signals?.address || signals?.phone) && profileDepth !== "quick" ? false : (input.candidate_discovery ?? false);
     const request: JsonObject = {
       request_id: input.request_id?.trim() || randomUUID(),
+      ...(input.intent ? { intent: input.intent } : {}),
       ...(query ? { query } : {}),
       ...(signals ? { signals } : {}),
       candidate_discovery: candidateDiscovery,
@@ -167,19 +169,67 @@ export class OrbitV3Client {
       include_profile: true,
       limit: input.limit ?? 10,
     };
-    const serializedBody = JSON.stringify(request);
-    const initial = await this.requestWithRetry<SearchResponse>("/v3/search", { method: "POST", body: serializedBody });
-    if (TERMINAL_SEARCH_STATUSES.has(initial.status)) return initial;
-    return this.poll(
-      initial,
-      () => this.requestWithRetry<SearchResponse>(`/v3/search/${encodeURIComponent(initial.search_id)}`),
-      TERMINAL_SEARCH_STATUSES,
-    );
+    if (input.mode === "sync" && (candidateDiscovery || profileDepth !== "quick" || query || input.intent || !signals)) {
+      throw new Error("sync mode requires identity signals, discovery off and quick depth; use async otherwise");
+    }
+    try {
+      return await this.request<SearchResponse>("/v3/search", {
+        method: "POST", body: JSON.stringify(request),
+        headers: input.mode === "sync" ? {} : { Prefer: "respond-async" },
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (error) {
+      if (error instanceof OrbitApiError && error.status < 500 && error.status !== 408) throw error;
+      throw new Error(`Search acceptance is unknown. Orbit may still be running. Retry the identical search with request_id=${request.request_id}; do not start a new search. Prefer get_search_status if you already have search_id.`);
+    }
+  }
+
+  async searchAndWait(input: SearchInput): Promise<SearchResponse> {
+    const request = { request_id: input.request_id?.trim() || randomUUID(), ...OrbitV3Client.searchBody(input) };
+    const initial = await this.requestWithRetry<SearchResponse>("/v3/search", { method: "POST", body: JSON.stringify(request) });
+    return this.poll(initial, () => this.getSearch(initial.search_id), TERMINAL_SEARCH_STATUSES);
+  }
+
+  /** One durable bulk job; item failures do not discard successful people. */
+  async startBatch(requestId: string, items: Array<SearchInput & { person_key: string }>): Promise<JsonObject> {
+    const body = { request_id: requestId, items: items.map(({ person_key, ...input }) => ({
+      id: person_key, ...OrbitV3Client.searchBody(input),
+    })) };
+    try {
+      return await this.request("/v3/search/bulk", { method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) });
+    } catch (error) {
+      if (error instanceof OrbitApiError && error.status < 500 && error.status !== 408) throw error;
+      throw new Error(`Batch acceptance is unknown. Retry the identical batch with request_id=${requestId}; do not create another job. If job_id is known, use get_people_batch_status.`);
+    }
+  }
+
+  private static searchBody(input: SearchInput): JsonObject {
+    const query = input.query?.trim();
+    const signals = cleanSignals(input.signals);
+    if (!query && !signals && !Object.keys(input.intent ?? {}).length) throw new Error("Each person needs a query, intent or identity signals");
+    const depth = input.profile_depth ?? "partial";
+    const discovery = (signals?.address || signals?.phone) && depth !== "quick" ? false : input.candidate_discovery ?? false;
+    return { ...(input.intent ? { intent: input.intent } : {}), ...(query ? { query } : {}), ...(signals ? { signals } : {}), candidate_discovery: discovery,
+      ...(discovery && input.candidate_discovery_limit !== undefined ? { candidate_discovery_limit: input.candidate_discovery_limit } : {}),
+      profile_depth: depth, limit: input.limit ?? 10, include_profile: true };
+  }
+
+  getBatch(jobId: string, offset = 0): Promise<JsonObject> {
+    return this.request(`/v3/search/bulk/${encodeURIComponent(jobId)}/results?offset=${offset}`, { signal: AbortSignal.timeout(20_000) });
+  }
+
+  startEnrich(profileId: string, operation: EnrichOperation, requestId: string): Promise<EnrichResponse> {
+    return this.request(`/v3/enrich/${encodeURIComponent(profileId)}`, { method: "POST",
+      body: JSON.stringify({ request_id: requestId, operation, include_profile: true }), signal: AbortSignal.timeout(20_000) });
+  }
+
+  getEnrichment(requestId: string): Promise<EnrichResponse> {
+    return this.request(`/v3/enrich/requests/${encodeURIComponent(requestId)}`, { signal: AbortSignal.timeout(20_000) });
   }
 
   /** The latest snapshot of a search, without starting new work. */
   getSearch(searchId: string): Promise<SearchResponse> {
-    return this.requestWithRetry(`/v3/search/${encodeURIComponent(searchId)}`);
+    return this.request(`/v3/search/${encodeURIComponent(searchId)}`, { signal: AbortSignal.timeout(20_000) });
   }
 
   private static populationBody(input: PopulationInput, withRequestId: boolean): JsonObject {
