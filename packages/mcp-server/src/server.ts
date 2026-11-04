@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { OrbitApiError, OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
-import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema } from "./output-schemas.js";
+import { searchOutputSchema, searchSnapshotOutputSchema, populationSearchOutputSchema, populationQuoteOutputSchema, profileOutputSchema, enrichOutputSchema, creditUsageOutputSchema, networkPathOutputSchema } from "./output-schemas.js";
 
 function toolResult(value: object, isError = false) {
   return {
@@ -39,6 +39,18 @@ const identityIntentSchema = z.object({
   experiences: z.array(z.object({ organization: z.string().min(1).optional(), title: z.string().min(1).optional() }).strict()).max(20).optional(),
 }).strict().describe("Explicit identity criteria. Quick discovery with URLs requires exactly one names entry; quick company discovery also requires its organization in experiences.");
 
+/** The API's error code and message, so a caller can tell a bad request (e.g. the same person twice) from an outage. */
+function withApiErrorDetail(error: unknown): unknown {
+  if (!(error instanceof OrbitApiError) || !error.body || typeof error.body !== "object" || !("error" in error.body)) return error;
+  const detail = error.body.error;
+  if (!detail || typeof detail !== "object") return error;
+  const code = "code" in detail && typeof detail.code === "string" ? detail.code : undefined;
+  const message = "message" in detail && typeof detail.message === "string" ? detail.message : undefined;
+  return code || message ? new Error(`${error.message}: ${[code, message].filter(Boolean).join(": ")}`) : error;
+}
+
+const orbitProfileId = z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/, "Expected a canonical Orbit profile ID (UUID)");
+
 /** Terminal states that are MCP errors, as search_people reports them: some or all of the work failed. */
 const PARTIAL_OR_FAILED: ReadonlySet<string> = new Set(["completed_with_errors", "failed"]);
 
@@ -50,8 +62,8 @@ export function createOrbitServer(apiKey: string): McpServer {
   const server = new McpServer({
     name: "orbit-mcp",
     title: "Orbit",
-    version: "2.3.0",
-    description: "Search people and read source-backed Orbit profiles, enrich context, and manage directories.",
+    version: "2.4.0",
+    description: "Search people and read source-backed Orbit profiles, enrich context, find how two people are connected through the Network Graph, and manage directories.",
     websiteUrl: "https://developer.orbitsearch.com",
     icons: [
       { src: "https://developer.orbitsearch.com/orbit-icon-512.png", mimeType: "image/png", sizes: ["512x512"] },
@@ -239,6 +251,28 @@ export function createOrbitServer(apiKey: string): McpServer {
         return toolResult(result);
       } catch (error) {
         return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "find_network_path",
+    {
+      description: "Find how one Orbit person reaches another through Orbit's Network Graph: the chain of people between them, how strong each tie is (0 to 1), and what ties each pair (a relationship, or the same employer or school in the same years). Use it when the user asks how two people are connected or who could introduce one person to another. Both people must be Orbit profiles: pass canonical profile IDs from search_people, find_people or get_profile; never invent an ID. mode shortest (default) returns the fewest people, then the strongest of those paths; strongest returns the strongest ties, which can be one link longer. A path has at most six links. A found path uses credits at the Network Graph path rate in the pricing catalog; a search that finds no path is free and returns billing: null with a reason (no_path, search_limit or not_in_graph). Every call that finds a path is charged, so reuse a path already returned. The result names everyone on the path: read a profile only when the user asks about that person.",
+      outputSchema: networkPathOutputSchema,
+      // Reads Orbit's own graph; each found path is a new charge, so repeated calls are not free.
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      inputSchema: {
+        profile_id: orbitProfileId.describe("Canonical Orbit profile ID (UUID) of the person the path starts from."),
+        to: orbitProfileId.describe("Canonical Orbit profile ID (UUID) of the person to reach. It must be a different person."),
+        mode: z.enum(["shortest", "strongest"]).default("shortest").describe("shortest (default): the fewest people, then the strongest of those paths. strongest: the strongest ties, which can be one link longer."),
+      },
+    },
+    async ({ profile_id, to, mode }) => {
+      try {
+        return toolResult(await client.findNetworkPath(profile_id, to, mode));
+      } catch (error) {
+        return toolError(withApiErrorDetail(error));
       }
     },
   );

@@ -31,6 +31,18 @@ people; keep each person's successful results and follow `next_offset` pages.
 it does not wait for background enrichment. Profile reads, population quotes,
 population searches, credit usage and directory tools remain available.
 
+`find_network_path` shows how one Orbit person reaches another through Orbit's
+Network Graph: the people on the path, each link's strength (0 to 1), and what
+ties each pair (a relationship, or the same employer or school in the same
+years). Pass two canonical profile IDs as `profile_id` and `to`, and an optional
+`mode`: `shortest` (default) for the fewest people, or `strongest` for the
+strongest ties, which can be one link longer. A path has at most six links. A
+found path uses the Network Graph path rate from the pricing catalog; a search
+that finds no path is free and returns `billing: null` with a `reason`
+(`no_path`, `search_limit` or `not_in_graph`). Each call sends one
+`Idempotency-Key`, and transport retries reuse it, so a retried found path is
+charged once.
+
 See the [person research skill](../../skills/orbit-person-research/SKILL.md) and
 [implementation plan](../../docs/plans/async-people-search.md) for the retry and
 release contract.
@@ -40,7 +52,7 @@ release contract.
 For API-key connections, use an Orbit Developer API key with:
 
 - `search:read` for Search, polling, and Enrich operations;
-- `profile:read` for profile reads and embedded profiles.
+- `profile:read` for profile reads, embedded profiles and Network Graph paths.
 
 HTTP clients using API-key authentication must send the key on every MCP request:
 
@@ -204,6 +216,18 @@ Quick profiles for the owners of a phone number:
   "profile_depth": "quick"
 }
 ```
+
+Network Graph path:
+
+```json
+{
+  "profile_id": "11111111-1111-4111-8111-111111111111",
+  "to": "33333333-3333-4333-8333-333333333333",
+  "mode": "strongest"
+}
+```
+
+This calls `GET /v3/people/{profile_id}/network/path?to=...&mode=strongest`.
 
 Profile enrichment:
 

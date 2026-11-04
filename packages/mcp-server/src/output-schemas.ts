@@ -167,3 +167,34 @@ export const enrichOutputSchema = z.object({
     profile: z.string().describe("Relative profile-read URL."),
   }).passthrough().optional(),
 }).passthrough();
+
+const networkPathPlace = z.object({
+  name: z.string().nullable().describe("The employer or school name."),
+  overlap_years: z.number().describe("Years both people were there at the same time."),
+}).passthrough();
+
+/** A Network Graph path (contract network-path.v1): who links two people, and how. */
+export const networkPathOutputSchema = z.object({
+  from_profile_id: z.string().describe("The person the path starts from."),
+  to_profile_id: z.string().describe("The person the path reaches."),
+  mode: z.enum(["shortest", "strongest"]).describe("The mode used: shortest or strongest."),
+  found: z.boolean().describe("Whether a path was found."),
+  degrees: z.number().int().nullable().describe("Links between the two people (1 = directly tied), when found."),
+  strength: z.number().min(0).max(1).nullable().describe("The product of the link strengths, 0 to 1, when found."),
+  people: z.array(z.object({
+    profile_id: z.string().nullable().describe("Canonical Orbit profile ID of this person."),
+    name: z.string().nullable().describe("This person's name."),
+  }).passthrough()).describe("The people on the path, in order from the first person to the second."),
+  links: z.array(z.object({
+    from_profile_id: z.string().nullable(),
+    to_profile_id: z.string().nullable(),
+    strength: z.number().min(0).max(1).describe("How strong this tie is, 0 to 1."),
+    relationships: z.array(z.string()).describe("The ties between the two people, such as coworker, classmate or sibling."),
+    organizations: z.array(networkPathPlace).describe("Employers where both worked in overlapping years."),
+    schools: z.array(networkPathPlace).describe("Schools where both studied in overlapping years."),
+  }).passthrough()).describe("One link per pair of neighbors on the path."),
+  reason: z.string().nullable().describe("Why no path was returned: no_path, search_limit or not_in_graph. Null when found."),
+  billing: billingSchema.nullable().describe("Billing for a found path. Null when no path was found: nothing was charged."),
+  contract_version: z.string().describe("network-path.v1"),
+}).passthrough();
+export type NetworkPathResponse = z.infer<typeof networkPathOutputSchema>;

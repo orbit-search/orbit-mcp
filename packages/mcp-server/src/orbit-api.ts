@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { API_KEY_URL } from "./api-key-auth.js";
-import { creditUsageOutputSchema, profileOutputSchema } from "./output-schemas.js";
+import { creditUsageOutputSchema, networkPathOutputSchema, profileOutputSchema, type NetworkPathResponse } from "./output-schemas.js";
 import type {
   EnrichOperation,
   EnrichResponse,
@@ -112,10 +112,10 @@ export class OrbitV3Client {
     return body as T;
   }
 
-  private async requestWithRetry<T>(path: string, init: RequestInit = {}, maxAttempts = 5): Promise<T> {
+  private async requestWithRetry<T>(path: string, init: RequestInit = {}, maxAttempts = 5, attemptTimeoutMs?: number): Promise<T> {
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        return await this.request<T>(path, init);
+        return await this.request<T>(path, attemptTimeoutMs ? { ...init, signal: AbortSignal.timeout(attemptTimeoutMs) } : init);
       } catch (error) {
         if (!(error instanceof OrbitApiError)) throw error;
         const retryable = error.status === 429 || error.status >= 500;
@@ -266,6 +266,20 @@ export class OrbitV3Client {
       if (!parsed.success || parsed.data.format !== "markdown" || !parsed.data.markdown || parsed.data.profile !== undefined) throw new Error("Orbit returned an invalid Markdown profile package");
     }
     return result;
+  }
+
+  /**
+   * How one person reaches another through Orbit's Network Graph. A found path is billed; a search that
+   * finds none is free. Transport retries keep one Idempotency-Key, so a found path is charged once.
+   */
+  async findNetworkPath(profileId: string, to: string, mode: "shortest" | "strongest" = "shortest"): Promise<NetworkPathResponse> {
+    const query = new URLSearchParams({ to, mode });
+    const result = await this.requestWithRetry<unknown>(`/v3/people/${encodeURIComponent(profileId)}/network/path?${query}`, {
+      headers: { "Idempotency-Key": randomUUID() },
+    }, 3, 30_000);
+    const parsed = networkPathOutputSchema.safeParse(result);
+    if (!parsed.success) throw new Error("Orbit returned an invalid Network Graph path");
+    return parsed.data;
   }
 
   async getCreditUsage() {
