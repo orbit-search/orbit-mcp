@@ -39,14 +39,20 @@ const identityIntentSchema = z.object({
   experiences: z.array(z.object({ organization: z.string().min(1).optional(), title: z.string().min(1).optional() }).strict()).max(20).optional(),
 }).strict().describe("Explicit identity criteria. Quick discovery with URLs requires exactly one names entry; quick company discovery also requires its organization in experiences.");
 
-/** The API's error code and message, so a caller can tell a bad request (e.g. the same person twice) from an outage. */
-function withApiErrorDetail(error: unknown): unknown {
-  if (!(error instanceof OrbitApiError) || !error.body || typeof error.body !== "object" || !("error" in error.body)) return error;
+/** The public Network Graph request errors whose code and message help a caller fix the request. */
+const NETWORK_PATH_ERROR_CODES: ReadonlySet<string> = new Set(["network_path_same_person", "network_path_mode_invalid", "network_path_unavailable", "invalid_orbit_id"]);
+
+/**
+ * Adds the API's code and message for a known Network Graph error (e.g. the same person twice), so a caller can tell
+ * a bad request from an outage. Authentication, access and billing failures keep the client's filtered message.
+ */
+function withNetworkPathErrorDetail(error: unknown): unknown {
+  if (!(error instanceof OrbitApiError) || (error.status !== 400 && error.status !== 503)) return error;
+  if (!error.body || typeof error.body !== "object" || !("error" in error.body)) return error;
   const detail = error.body.error;
-  if (!detail || typeof detail !== "object") return error;
-  const code = "code" in detail && typeof detail.code === "string" ? detail.code : undefined;
+  if (!detail || typeof detail !== "object" || !("code" in detail) || typeof detail.code !== "string" || !NETWORK_PATH_ERROR_CODES.has(detail.code)) return error;
   const message = "message" in detail && typeof detail.message === "string" ? detail.message : undefined;
-  return code || message ? new Error(`${error.message}: ${[code, message].filter(Boolean).join(": ")}`) : error;
+  return new Error(`${error.message}: ${[detail.code, message].filter(Boolean).join(": ")}`);
 }
 
 const orbitProfileId = z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/, "Expected a canonical Orbit profile ID (UUID)");
@@ -272,7 +278,7 @@ export function createOrbitServer(apiKey: string): McpServer {
       try {
         return toolResult(await client.findNetworkPath(profile_id, to, mode));
       } catch (error) {
-        return toolError(withApiErrorDetail(error));
+        return toolError(withNetworkPathErrorDetail(error));
       }
     },
   );

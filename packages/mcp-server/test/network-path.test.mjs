@@ -101,6 +101,22 @@ test("API errors keep their code, malformed answers fail, and invalid input neve
     assert.equal(malformed.isError, true);
     assert.match(JSON.parse(malformed.content[0].text).error, /invalid Network Graph path/);
 
+    reply = () => json({ error: { code: "developer_api_credits_insufficient", message: "private billing detail", remainingCredits: 1 } }, 402);
+    const credits = await client.callTool({ name: "find_network_path", arguments: { profile_id: FROM, to: TO } });
+    assert.equal(credits.isError, true);
+    assert.match(credits.content[0].text, /requires additional credits/);
+    assert.doesNotMatch(credits.content[0].text, /private billing detail|developer_api_credits_insufficient/);
+
+    reply = () => json({ error: { code: "forbidden", message: "private access detail" } }, 403);
+    const denied = await client.callTool({ name: "find_network_path", arguments: { profile_id: FROM, to: TO } });
+    assert.equal(denied.isError, true);
+    assert.match(denied.content[0].text, /HTTP 403/);
+    assert.doesNotMatch(denied.content[0].text, /private access detail/);
+
+    reply = () => json({ error: { code: "unknown_bad_request", message: "private request detail" } }, 400);
+    const unknown = await client.callTool({ name: "find_network_path", arguments: { profile_id: FROM, to: TO } });
+    assert.doesNotMatch(unknown.content[0].text, /private request detail/, "only known Network Graph codes are forwarded");
+
     const before = requests.length;
     const slug = await client.callTool({ name: "find_network_path", arguments: { profile_id: "ana-ruiz", to: TO } });
     assert.equal(slug.isError, true);
