@@ -1,6 +1,6 @@
 ---
 name: orbit-person-research
-description: Find identity candidates, search source-backed people profiles, and poll durable Orbit searches and independent-person batches without duplicating work on timeout.
+description: Find identity candidates, search source-backed people profiles, poll durable Orbit searches and independent-person batches without duplicating work on timeout, and find how two people are connected through Orbit's Network Graph.
 ---
 
 # Orbit people research
@@ -58,8 +58,36 @@ set; `percent` and `eta_seconds` may be null. Never invent an ETA. Synchronous
 mode is an explicit option only for quick, discovery-off, identity-signal
 lookups; it never polls enrichment to completion inside the MCP call.
 
+## How two people are connected
+
+Use `find_network_path` when the user asks how two people are connected or who
+could introduce one person to another. It returns the chain of people between
+them, the strength of each tie (0 to 1), and what ties each pair: a relationship
+such as family, a stated connection or a mutual follow on social media, or the
+same employer or school in the same years. A path has at most six links.
+
+1. Resolve both people first and pass their canonical profile IDs as
+   `profile_id` and `to`. Never invent an ID; ask one short question when an
+   identity is ambiguous.
+2. `mode: "shortest"` (the default) gives the fewest people, then the strongest
+   of those paths. `mode: "strongest"` gives the strongest ties and can be one
+   link longer.
+3. Answer from the returned `people` and `links`: name each person in order and
+   the tie on each link. Read a person's profile only when the user asks about
+   that person.
+4. When `found` is `false`, explain `reason`: `no_path` (no path within six
+   links), `search_limit` (the search stopped at its limit), or `not_in_graph`
+   (one of the people is not on the graph yet).
+
+A found path uses the Network Graph path rate in the pricing catalog. A search
+that finds no path is free, and its `billing` is `null`. Every call that finds a
+path is a new charge: reuse a path already returned.
+
+## Profiles and credits
+
 Read existing profiles with `get_profile` for a user-selected person or explicit
 research question. Use only returned canonical profile IDs and source links.
-Discovery, profile generation and profile reads can consume Orbit credits; use
-the connected account and respect the user's scope and budget. Directory work
+Discovery, profile generation, profile reads and found Network Graph paths can
+consume Orbit credits; use the connected account and respect the user's scope
+and budget. Directory work
 uses the separate [directory skill](../orbit-directories/SKILL.md).
