@@ -18,9 +18,9 @@ Existing hosted connectors retain their native account-linking UI.
 
 Directory tools need the person's own sign-in, so use `orbit_login` below. A
 workspace created by `orbit_signup` (agent signup, for a person with no Orbit
-account) covers search and profiles only; once the person claims it from Orbit's
-email or `orbit_claim_link`, they can sign in and connect you with directory
-permissions.
+account) covers search and profiles only; once the person signs up with that
+email (the result's `sign_up_url`), they own it and can connect you with
+directory permissions.
 
 1. Call `orbit_login`, requesting only needed permissions. Use `search.read`
    for people research. Listing or reading directories also needs

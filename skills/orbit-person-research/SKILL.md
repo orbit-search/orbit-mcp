@@ -19,9 +19,10 @@ Never ask the person for an API key. If Orbit is not connected yet:
   person with no Orbit account, call `orbit_signup` with their `email`, your
   `agent_name`, and a random `request_id` you persist first (retry with the same
   one after a timeout): you are connected at once with free signup credits and nobody
-  signs in. Orbit emails them a link to claim the workspace; mention it in one
-  sentence. Ask for their email only if you do not know it, and never invent or
-  use a throwaway address. If the email already has an account
+  signs in. Orbit does not contact the person: give them the result's
+  `sign_up_url` and ask them to sign up with the same email, which adds them to
+  the workspace as its owner. Ask for their email only if you do not know it,
+  and never invent or use a throwaway address. If the email already has an account
   (`agent_signup_email_has_account`) or an earlier agent signup
   (`agent_signup_already_exists`), sign in instead: call `orbit_login` and keep
   its `login_request` private; call `orbit_wait_for_login` with `wait_seconds: 0`
@@ -35,10 +36,9 @@ Never ask the person for an API key. If Orbit is not connected yet:
   https://docs.orbitsearch.com/agent-signup.
 
 When credits run out (`developer_api_credits_insufficient`) on a workspace you
-created with agent signup, call `orbit_claim_link` (or `POST /v3/agents/claim-link`
-with your key) and send the person its `claim_url`. They sign in with the same
-email, own the workspace, and add credits you share; your connection keeps
-working. On any other account, tell the person an owner or admin can add credits
+created with agent signup, send the person `sign_up_url` and ask them to sign up
+with the email you used. They then own the workspace and add credits you share;
+your connection keeps working. On any other account, tell the person an owner or admin can add credits
 at https://developer.orbitsearch.com/dashboard/billing. Keep partial results.
 
 ## Asynchronous search and recovery
