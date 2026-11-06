@@ -23,17 +23,23 @@ Never ask the person for an API key. If Orbit is not connected yet:
   sentence. Ask for their email only if you do not know it, and never invent or
   use a throwaway address. If the email already has an account
   (`agent_signup_email_has_account`) or an earlier agent signup
-  (`agent_signup_already_exists`), use `orbit_login` and send them its link.
-  Keep `connection_token` private and pass it to `orbit_list_tools` and
+  (`agent_signup_already_exists`), sign in instead: call `orbit_login` and keep
+  its `login_request` private; call `orbit_wait_for_login` with `wait_seconds: 0`
+  to confirm it is pending **before** sending the person only the `login_url`;
+  then keep calling `orbit_wait_for_login` with the same handle, honoring
+  `retry_after`, until it returns `connected`. Either way, keep
+  `connection_token` private and pass it to `orbit_list_tools` and
   `orbit_call_tool`.
 - Agents with HTTP access can call `POST https://api.orbitsearch.com/v3/agents/signup`
   instead and keep the returned API key in private credential storage. See
   https://docs.orbitsearch.com/agent-signup.
 
-When credits run out (`developer_api_credits_insufficient`), call
-`orbit_claim_link` (or `POST /v3/agents/claim-link` with your key) and send the
-person its `claim_url`. They sign in with the same email, own the workspace, and
-add credits you share; your connection keeps working. Keep partial results.
+When credits run out (`developer_api_credits_insufficient`) on a workspace you
+created with agent signup, call `orbit_claim_link` (or `POST /v3/agents/claim-link`
+with your key) and send the person its `claim_url`. They sign in with the same
+email, own the workspace, and add credits you share; your connection keeps
+working. On any other account, tell the person an owner or admin can add credits
+at https://developer.orbitsearch.com/dashboard/billing. Keep partial results.
 
 ## Asynchronous search and recovery
 
