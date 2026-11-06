@@ -16,8 +16,9 @@ Never ask the person for an API key. If Orbit is not connected yet:
 - Clients with remote OAuth connect to `https://api.orbitsearch.com/mcp`; the
   person signs in once.
 - Otherwise, connect to `https://api.orbitsearch.com/mcp-auth/agent`. For a
-  person with no Orbit account, call `orbit_signup` with their `email` and your
-  `agent_name`: you are connected at once with free signup credits and nobody
+  person with no Orbit account, call `orbit_signup` with their `email`, your
+  `agent_name`, and a random `request_id` you persist first (retry with the same
+  one after a timeout): you are connected at once with free signup credits and nobody
   signs in. Orbit emails them a link to claim the workspace; mention it in one
   sentence. Ask for their email only if you do not know it, and never invent or
   use a throwaway address. If the email already has an account
