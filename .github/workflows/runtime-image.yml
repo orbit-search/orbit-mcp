@@ -1,0 +1,105 @@
+# Evidence only: ephemeral hosted candidates, no publication or release operations.
+name: Runtime Image Evidence
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  runtime-image:
+    name: Runtime Image (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [mcp-server, profile-server]
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      PACKAGE: ${{ matrix.package }}
+      TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+    steps:
+      - name: Prepare paths outside checkout and Docker context
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/image-evidence-$PACKAGE"
+          mkdir -p "$evidence"
+          echo "IMAGE_EVIDENCE_DIR=$evidence" >> "$GITHUB_ENV"
+          echo "IMAGE_CONTEXT=$RUNNER_TEMP/image-context-$PACKAGE" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Export allowlisted tracked source and test evidence guards
+        run: |
+          python3 -m unittest discover -s .github/image-evidence -p 'test_*.py'
+          python3 .github/image-evidence/receipts.py prepare
+      - name: Record pinned base and build final amd64 image
+        shell: bash
+        run: |
+          docker version > "$IMAGE_EVIDENCE_DIR/docker-version.txt"
+          docker buildx version > "$IMAGE_EVIDENCE_DIR/buildx-version.txt"
+          docker buildx imagetools inspect --raw "$BASE_REFERENCE" > "$IMAGE_EVIDENCE_DIR/base-index.json"
+          base_digest=$(python3 -c 'import json,os; from pathlib import Path; d=json.loads((Path(os.environ["IMAGE_EVIDENCE_DIR"])/"base-index.json").read_text()); print(next(m["digest"] for m in d["manifests"] if m.get("platform",{}).get("os")=="linux" and m.get("platform",{}).get("architecture")=="amd64"))')
+          docker buildx imagetools inspect --raw "${BASE_REFERENCE%@*}@$base_digest" > "$IMAGE_EVIDENCE_DIR/base-amd64.json"
+          docker buildx build --platform linux/amd64 --pull --load --provenance=false \
+            --metadata-file "$IMAGE_EVIDENCE_DIR/build-metadata.json" \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --tag "orbit-evidence:$PACKAGE" "$IMAGE_CONTEXT" 2>&1 | tee "$IMAGE_EVIDENCE_DIR/build.log"
+          docker image inspect "orbit-evidence:$PACKAGE" \
+            --format '{"id":{{json .Id}},"os":{{json .Os}},"architecture":{{json .Architecture}},"revision":{{json (index .Config.Labels "org.opencontainers.image.revision")}}}' \
+            > "$IMAGE_EVIDENCE_DIR/image.json"
+      - name: Collect every OS and library vulnerability including unfixed findings
+        shell: bash
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$IMAGE_EVIDENCE_DIR:/reports" -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" image --config /dev/null --image-src docker --scanners vuln \
+            --pkg-types os,library --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --ignorefile /dev/null --exit-code 0 --list-all-pkgs \
+            --format json --output /reports/scan.json "orbit-evidence:$PACKAGE" \
+            2>&1 | tee "$IMAGE_EVIDENCE_DIR/scan.log"
+          docker run --rm -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" version --format json > "$IMAGE_EVIDENCE_DIR/scanner-version.json"
+      - name: Probe constant health endpoint with all external networking denied
+        if: ${{ !cancelled() && success() }}
+        shell: bash
+        run: |
+          image_id=$(python3 -c 'import json,os; from pathlib import Path; print(json.loads((Path(os.environ["IMAGE_EVIDENCE_DIR"])/"image.json").read_text())["id"])')
+          docker run --detach --name orbit-evidence-smoke --network none --cap-drop ALL \
+            --security-opt no-new-privileges --memory 512m --cpus 1 --pids-limit 128 \
+            --env PORT=8080 --env ORBIT_API_URL=http://127.0.0.1:9 \
+            "$image_id"
+          timeout 65s docker exec orbit-evidence-smoke node --input-type=module -e '
+            for (let attempt = 0; attempt < 30; attempt++) {
+              try {
+                const response = await fetch("http://127.0.0.1:8080/health", {signal: AbortSignal.timeout(1000)});
+                const body = await response.json();
+                if (response.status === 200 && JSON.stringify(body) === JSON.stringify({status:"ok"})) {
+                  console.log(JSON.stringify({path:"/health",status:200,body})); process.exit(0);
+                }
+              } catch {}
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            throw new Error("Health endpoint did not return expected constant response");
+          ' | tee "$IMAGE_EVIDENCE_DIR/startup.json"
+          docker inspect orbit-evidence-smoke \
+            --format '{"image":{{json .Image}},"network":{{json .HostConfig.NetworkMode}},"running":{{json .State.Running}}}' \
+            > "$IMAGE_EVIDENCE_DIR/container.json"
+      - name: Verify source, build, scan and startup identities; summarize all severities
+        if: always()
+        run: python3 .github/image-evidence/receipts.py verify
+      - name: Retain isolated startup logs
+        if: always()
+        shell: bash
+        run: |
+          docker logs orbit-evidence-smoke > "$IMAGE_EVIDENCE_DIR/startup.log" 2>&1 || true
+          docker rm --force orbit-evidence-smoke || true
+      - name: Upload raw receipts even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-image-${{ matrix.package }}-${{ env.SOURCE_SHA }}
+          path: ${{ env.IMAGE_EVIDENCE_DIR }}/
+          retention-days: 14
+          if-no-files-found: error
