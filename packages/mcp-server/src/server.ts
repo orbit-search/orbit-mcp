@@ -1,6 +1,7 @@
 /** General Orbit MCP tools with truthful behavior hints and structured v3 results. */
+import { integer, uuid, email } from "./schema-compat.js";
 import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ContractMcpServer as McpServer } from "./mcp-compat.js";
 import { z } from "zod";
 import { OrbitApiError, OrbitV3Client } from "./orbit-api.js";
 import { registerDirectoryTools } from "./directory-tools.js";
@@ -25,7 +26,7 @@ function toolError(error: unknown) {
 
 const signalsSchema = z
   .object({
-    email: z.string().email().optional(),
+    email: email().optional(),
     linkedin_url: z.string().url().optional(),
     usernames: z.array(z.string().min(1)).max(20).optional(),
     urls: z.array(z.string().url()).max(20).optional(),
@@ -103,9 +104,9 @@ export function createOrbitServer(apiKey: string): McpServer {
         intent: identityIntentSchema.optional(),
         signals: signalsSchema.optional().describe("Exact identity signals such as email, LinkedIn URL, username, URL, address, or phone."),
         candidate_discovery: z.boolean().default(false).describe("Allow Orbit to find and build people beyond known matches. Address and phone disable discovery, except with profile_depth quick: a quick search needs discovery on to build the owners of a phone, email or address; with discovery off it returns only profiles Orbit already has."),
-        candidate_discovery_limit: z.number().int().min(1).max(50).optional().describe("Most people discovery adds (Orbit default 10, maximum 50). For a quick phone, email or address search, this caps the owners returned. Sent only when discovery is on."),
+        candidate_discovery_limit: integer().min(1).max(50).optional().describe("Most people discovery adds (Orbit default 10, maximum 50). For a quick phone, email or address search, this caps the owners returned. Sent only when discovery is on."),
         profile_depth: z.enum(["quick", "partial", "full"]).default("partial").describe("Minimum profile depth to build for selected results: quick (level 1), partial (level 2) or full (level 3). Quick never upgrades a known profile; it builds new level 1 profiles only through candidate_discovery."),
-        limit: z.number().int().min(1).max(20).default(10).describe("Maximum known-profile results; v3 supports up to 20. People that discovery adds are capped by candidate_discovery_limit."),
+        limit: integer().min(1).max(20).default(10).describe("Maximum known-profile results; v3 supports up to 20. People that discovery adds are capped by candidate_discovery_limit."),
         request_id: z.string().min(1).max(200).optional().describe("Persist this idempotency key before calling. On timeout, retry identical arguments with the same request_id; never start a new search. Prefer get_search_status if search_id is known."),
       },
     },
@@ -122,8 +123,8 @@ export function createOrbitServer(apiKey: string): McpServer {
   server.registerTool("find_people", {
     description: "Resolve identity to candidate/profile IDs at quick depth without upgrading known profiles. Explicitly choose this find step before enrich_profile for selected people. Discovery can build new level-1 profiles and uses credits. Quick discovery requires phone/email/address, URL signals with exactly one intent.names entry, or one name plus a company in intent.experiences. For open-ended discovery use search_people at partial/full depth. Returns quickly; poll get_search_status until terminal. On timeout retry the same request_id and identical arguments; if search_id is known, poll it instead.",
     inputSchema: { query: z.string().min(1).max(2000).optional(), intent: identityIntentSchema.optional(), signals: signalsSchema.optional(),
-      candidate_discovery: z.boolean().default(false), candidate_discovery_limit: z.number().int().min(1).max(50).optional(),
-      limit: z.number().int().min(1).max(20).default(10), request_id: z.string().min(1).max(128) },
+      candidate_discovery: z.boolean().default(false), candidate_discovery_limit: integer().min(1).max(50).optional(),
+      limit: integer().min(1).max(20).default(10), request_id: z.string().min(1).max(128) },
     outputSchema: searchSnapshotOutputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   }, async input => {
@@ -135,8 +136,8 @@ export function createOrbitServer(apiKey: string): McpServer {
     description: "Start one durable job for independent people queries. Returns job_id quickly; poll get_people_batch_status and paginate next_offset for per-person status/results. One failure never discards other people. Discovery and generation use credits; existing search defaults apply. On timeout retry the same request_id and identical people; if job_id is known poll it instead, never create a new batch.",
     inputSchema: { request_id: z.string().min(1).max(128).describe("Persist before calling; reuse for the identical batch after timeout."),
       people: z.array(z.object({ person_key: z.string().min(1).max(128), intent: identityIntentSchema.optional(), query: z.string().min(1).max(2000).optional(), signals: signalsSchema.optional(),
-        candidate_discovery: z.boolean().default(false), candidate_discovery_limit: z.number().int().min(1).max(50).optional(),
-        profile_depth: z.enum(["quick", "partial", "full"]).default("partial"), limit: z.number().int().min(1).max(20).default(10) })).min(1).max(100) },
+        candidate_discovery: z.boolean().default(false), candidate_discovery_limit: integer().min(1).max(50).optional(),
+        profile_depth: z.enum(["quick", "partial", "full"]).default("partial"), limit: integer().min(1).max(20).default(10) })).min(1).max(100) },
     outputSchema: z.object({ job_id: z.string(), status: z.string() }).passthrough(),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   }, async ({ request_id, people }) => {
@@ -148,7 +149,7 @@ export function createOrbitServer(apiKey: string): McpServer {
 
   server.registerTool("get_people_batch_status", {
     description: "Poll a batch job without starting work. Each item id is its original person_key; result contains available profile IDs, statuses and profiles after that person finishes. Read all pages with next_offset, even after overall terminal status. Keep successful people when another fails. Poll running/processing/queued jobs every 3 seconds; terminal states are completed, completed_with_errors, failed, canceled.",
-    inputSchema: { job_id: z.string().uuid(), offset: z.number().int().min(0).max(5000).default(0) },
+    inputSchema: { job_id: uuid(), offset: integer().min(0).max(5000).default(0) },
     outputSchema: z.object({ job_id: z.string(), status: z.string(), items: z.array(z.object({}).passthrough()), next_offset: z.number().nullable() }).passthrough(),
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ job_id, offset }) => {
@@ -170,7 +171,7 @@ export function createOrbitServer(apiKey: string): McpServer {
       id: z.string().regex(/^\d{1,20}$/).describe("The numeric id of the company or school."),
       name: z.string().min(1).max(200).describe("The company or school name."),
     }).strict(),
-    size: z.number().int().min(0).optional().describe("How many people the population has, when known."),
+    size: integer().min(0).optional().describe("How many people the population has, when known."),
     profile_depth: z.enum(["quick", "partial", "full"]).default("partial").describe("The depth every person in the population is built to. A deeper population costs more: quick costs least, full costs most."),
   };
 

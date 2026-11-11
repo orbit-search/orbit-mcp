@@ -22,9 +22,12 @@ test("security upgrade preserves tools/list, calls, errors and unknown keys", as
   const localOrigin = `http://127.0.0.1:${listener.address().port}`;
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const permitted = new Set(baseline.results.flatMap(item => item.backendCalls.map(call => JSON.stringify(call))));
   globalThis.fetch = async (url, options) => {
     if (String(url).startsWith(localOrigin + "/")) return originalFetch(url, options);
-    calls.push({ url: String(url), body: options?.body });
+    const call = { url: String(url), body: options?.body };
+    assert(permitted.has(JSON.stringify(call)), `Unexpected outbound request: ${call.url}`);
+    calls.push(call);
     return new Response(JSON.stringify({ profile_id: "p1", generation_level: 3, profile: { name: "Ada" }, status: "completed", results: [{ profile_id: "p1", status: "ready", generation_level: 3, profile: { name: "Ada" } }], payload: {
       account_type: "user", usage_scope: "current_api_key", balance_scope: "billing_account",
       period_start: "2026-01-01", period_end: "2026-02-01", credits_used: 0, request_count: 0,
