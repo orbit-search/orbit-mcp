@@ -29,9 +29,10 @@ class ReceiptTests(unittest.TestCase):
         self.docs = {
             "source.json": {"sha": SHA, "package": "mcp-server", "files_sha256": {}, "base_reference": "node@sha256:" + hashlib.sha256(index).hexdigest()},
             "image.json": {"id": CONFIG, "os": "linux", "architecture": "amd64", "revision": SHA},
+            "image-inspect.json": [{"Id": CONFIG, "Os": "linux", "Architecture": "amd64", "Config": {"Labels": {"org.opencontainers.image.revision": SHA}}}],
             "build-metadata.json": {"containerimage.config.digest": CONFIG, "containerimage.digest": "sha256:" + "c" * 64},
-            "scan.json": {"ArtifactType": "container_image", "Metadata": {"ImageID": CONFIG, "ImageConfig": {"config": {"Labels": {"org.opencontainers.image.revision": SHA}}}}, "Results": [{"Class": "os-pkgs", "Vulnerabilities": [{"Severity": "HIGH", "VulnerabilityID": "fixture-unfixed"}]}, {"Class": "lang-pkgs"}]},
-            "scanner-version.json": {"Version": "0.76.1"},
+            "scan.json": {"ArtifactType": "container_image", "Metadata": {"ImageID": CONFIG, "ImageConfig": {"config": {"Labels": {"org.opencontainers.image.revision": SHA}}}}, "Results": [{"Class": "os-pkgs", "Packages": [{"Name": "libc6"}], "Vulnerabilities": [{"Severity": "HIGH", "VulnerabilityID": "fixture-unfixed"}]}, {"Class": "lang-pkgs", "Packages": [{"Name": "zod"}]}]},
+            "scanner-version.json": {"Version": "0.76.1", "VulnerabilityDB": {"UpdatedAt": "2026-11-10T19:01:23Z"}},
             "startup.json": {"path": "/health", "status": 200, "body": {"status": "ok"}},
             "container.json": {"image": CONFIG, "network": "none", "running": True},
         }
@@ -44,8 +45,37 @@ class ReceiptTests(unittest.TestCase):
     def test_findings_preserved_and_config_is_not_manifest(self):
         receipt = verify(self.directory, SHA, "mcp-server")
         self.assertEqual(receipt["finding_counts"], {"HIGH": 1})
-        self.assertNotEqual(receipt["image"]["id"], receipt["build_manifest_digest"])
+        self.assertNotEqual(receipt["image"]["id"], receipt["build_export_digest"])
         self.assertIn("fixture-unfixed", (self.directory / "scan.json").read_text())
+
+    def test_manifest_backed_image_requires_matching_raw_descriptors(self):
+        """Cover actual Docker/OCI exports and reject missing or contradictory proof."""
+        for media_type in ("application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"):
+            docs = copy.deepcopy(self.docs)
+            descriptor = {"mediaType": media_type, "digest": CONFIG, "size": 2270,
+                          "platform": {"architecture": "amd64", "os": "linux"}}
+            docs["build-metadata.json"] = {"containerimage.digest": CONFIG, "containerimage.descriptor": descriptor}
+            docs["image-inspect.json"][0]["Descriptor"] = {k: v for k, v in descriptor.items() if k != "platform"}
+            self.write(docs)
+            self.assertEqual(verify(self.directory, SHA, "mcp-server")["image_identity_kind"], "manifest")
+            for name, keys, value in [
+                ("image-inspect.json", (0, "Descriptor", "digest"), "sha256:" + "e" * 64),
+                ("image-inspect.json", (0, "Descriptor", "size"), 1),
+                ("image-inspect.json", (0, "Descriptor"), {}),
+                ("build-metadata.json", ("containerimage.descriptor", "mediaType"), "unsupported"),
+                ("build-metadata.json", ("containerimage.descriptor", "platform", "architecture"), "arm64"),
+                ("build-metadata.json", ("containerimage.descriptor",), {}),
+            ]:
+                with self.subTest(media_type=media_type, name=name, keys=keys):
+                    damaged = copy.deepcopy(docs)
+                    target = damaged[name]
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = value
+                    self.write(damaged)
+                    with self.assertRaises(ValueError):
+                        verify(self.directory, SHA, "mcp-server")
+        self.write(self.docs)
 
     def test_every_required_receipt_missing_fails(self):
         for path in list(self.directory.glob("*.json")):
@@ -62,6 +92,10 @@ class ReceiptTests(unittest.TestCase):
             ("source.json", ("package",), "profile-server"),
             ("image.json", ("architecture",), "arm64"),
             ("image.json", ("revision",), "d" * 40),
+            ("image-inspect.json", (0, "Id"), "sha256:" + "e" * 64),
+            ("scan.json", ("Results", 0, "Packages"), []),
+            ("scan.json", ("Results", 1, "Packages"), []),
+            ("scanner-version.json", ("VulnerabilityDB", "UpdatedAt"), ""),
             ("build-metadata.json", ("containerimage.config.digest",), "sha256:" + "c" * 64),
             ("scan.json", ("Metadata", "ImageID"), "sha256:" + "c" * 64),
             ("scan.json", ("Metadata", "ImageConfig", "config", "Labels", "org.opencontainers.image.revision"), "d" * 40),

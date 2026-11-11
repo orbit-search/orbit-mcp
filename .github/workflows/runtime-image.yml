@@ -46,9 +46,16 @@ jobs:
             --metadata-file "$IMAGE_EVIDENCE_DIR/build-metadata.json" \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --tag "orbit-evidence:$PACKAGE" "$IMAGE_CONTEXT" 2>&1 | tee "$IMAGE_EVIDENCE_DIR/build.log"
-          docker image inspect "orbit-evidence:$PACKAGE" \
-            --format '{"id":{{json .Id}},"os":{{json .Os}},"architecture":{{json .Architecture}},"revision":{{json (index .Config.Labels "org.opencontainers.image.revision")}}}' \
-            > "$IMAGE_EVIDENCE_DIR/image.json"
+          docker image inspect "orbit-evidence:$PACKAGE" > "$IMAGE_EVIDENCE_DIR/image-inspect.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          directory = Path(os.environ["IMAGE_EVIDENCE_DIR"])
+          image = json.loads((directory / "image-inspect.json").read_text())[0]
+          summary = {"id": image["Id"], "os": image["Os"], "architecture": image["Architecture"],
+                     "revision": image["Config"]["Labels"]["org.opencontainers.image.revision"]}
+          (directory / "image.json").write_text(json.dumps(summary) + "\n")
+          PY
       - name: Collect every OS and library vulnerability including unfixed findings
         shell: bash
         run: |

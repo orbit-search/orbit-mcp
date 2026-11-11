@@ -26,6 +26,24 @@ def digest_matches(data, expected):
                for blob in (data, data.removesuffix(b"\n")))
 
 
+def build_identity(metadata, inspected):
+    """Require a config ID or both matching descriptors for manifest-backed IDs."""
+    image_id = inspected["Id"]
+    exported = metadata.get("containerimage.digest")
+    require(isinstance(exported, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", exported), "Invalid build export digest")
+    if "containerimage.config.digest" in metadata:
+        require(metadata["containerimage.config.digest"] == image_id, "Build config differs from inspected image")
+        return "config"
+    descriptor = metadata.get("containerimage.descriptor") or {}
+    actual = inspected.get("Descriptor") or {}
+    media_type = descriptor.get("mediaType")
+    require(media_type in ("application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json"), "Missing supported manifest descriptor")
+    require(exported == descriptor.get("digest") == actual.get("digest") == image_id, "Build manifest differs from inspected image")
+    require(actual.get("mediaType") == media_type and actual.get("size") == descriptor.get("size") and descriptor.get("size", 0) > 0, "Manifest descriptor mismatch")
+    require(descriptor.get("platform") == {"architecture": "amd64", "os": "linux"}, "Build manifest platform mismatch")
+    return "manifest"
+
+
 def prepare(directory, context, package, sha):
     """Export only tracked production inputs from the exact checked-out commit."""
     require(re.fullmatch(r"[0-9a-f]{40}", sha), "Invalid source SHA")
@@ -73,15 +91,20 @@ def verify(directory, sha, package):
     require(digest_matches(base_manifest, manifests[0]["digest"]), "Base platform digest mismatch")
     image = read(directory, "image.json")
     require((image["os"], image["architecture"], image["revision"]) == ("linux", "amd64", sha), "Image platform/revision mismatch")
-    require(re.fullmatch(r"sha256:[0-9a-f]{64}", image["id"]), "Invalid image config ID")
+    require(re.fullmatch(r"sha256:[0-9a-f]{64}", image["id"]), "Invalid Docker image ID")
+    inspected = read(directory, "image-inspect.json")[0]
+    require((inspected["Id"], inspected["Os"], inspected["Architecture"], inspected["Config"]["Labels"]["org.opencontainers.image.revision"]) == (image["id"], image["os"], image["architecture"], sha), "Raw/summary inspection mismatch")
     metadata = read(directory, "build-metadata.json")
-    require(metadata["containerimage.config.digest"] == image["id"], "Build config differs from inspected image")
+    identity_kind = build_identity(metadata, inspected)
     scan = read(directory, "scan.json")
     require(scan["ArtifactType"] == "container_image", "Wrong scan artifact type")
     require(scan["Metadata"]["ImageID"] == image["id"], "Scan image differs from built image")
     require(scan["Metadata"]["ImageConfig"]["config"]["Labels"]["org.opencontainers.image.revision"] == sha, "Scan revision mismatch")
     require({"os-pkgs", "lang-pkgs"} <= {r["Class"] for r in scan["Results"]}, "Missing OS/library coverage")
-    require(read(directory, "scanner-version.json")["Version"] == "0.76.1", "Scanner version mismatch")
+    for kind in ("os-pkgs", "lang-pkgs"):
+        require(any(r.get("Packages") for r in scan["Results"] if r["Class"] == kind), "Missing package inventory: " + kind)
+    scanner = read(directory, "scanner-version.json")
+    require(scanner["Version"] == "0.76.1" and scanner["VulnerabilityDB"]["UpdatedAt"], "Scanner/DB identity missing")
     startup = read(directory, "startup.json")
     container = read(directory, "container.json")
     require(startup == {"path": "/health", "status": 200, "body": {"status": "ok"}}, "Health probe failed")
@@ -89,8 +112,8 @@ def verify(directory, sha, package):
     findings = [v for result in scan["Results"] for v in result.get("Vulnerabilities", []) or []]
     counts = dict(collections.Counter(v["Severity"] for v in findings))
     receipt = {"source": source, "image": image, "base_amd64_manifest_digest": manifests[0]["digest"],
-               "build_manifest_digest": metadata.get("containerimage.digest"), "finding_counts": counts,
-               "note": "Image id is a config digest, not a registry manifest. Candidate never published. Scan completion is not CVE clearance; parent residual review required."}
+               "build_export_digest": metadata["containerimage.digest"], "image_identity_kind": identity_kind, "finding_counts": counts,
+               "note": "Local Docker image ID kind is checked explicitly; this is not a published registry receipt. Candidate never published. Scan completion is not CVE clearance; parent residual review required."}
     (directory / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     return receipt
 
