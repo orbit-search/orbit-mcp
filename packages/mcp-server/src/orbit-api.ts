@@ -1,3 +1,4 @@
+import { parseResponse } from "./validation-errors.js";
 import { randomUUID } from "node:crypto";
 import { API_KEY_URL } from "./api-key-auth.js";
 import { creditUsageOutputSchema, networkPathOutputSchema, profileOutputSchema, type NetworkPathResponse } from "./output-schemas.js";
@@ -284,7 +285,7 @@ export class OrbitV3Client {
 
   async getCreditUsage() {
     // Subject selection stays entirely upstream; strip any unexpected identity fields.
-    return creditUsageOutputSchema.parse(await this.requestWithRetry<unknown>("/v3/credits/usage"));
+    return parseResponse(creditUsageOutputSchema, await this.requestWithRetry<unknown>("/v3/credits/usage"));
   }
 
   async enrichAndWait(profileId: string, operation: EnrichOperation, requestId?: string): Promise<EnrichResponse> {

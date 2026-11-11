@@ -1,3 +1,4 @@
+import { parseResponse } from "./validation-errors.js";
 import { randomUUID } from "node:crypto";
 import { billingSchema, creditUsageOutputSchema, type OperationBilling } from "./billing.js";
 
@@ -185,12 +186,12 @@ export class ProfileOrbitClient {
   }
 
   async getCreditUsage() {
-    return creditUsageOutputSchema.parse(await this.requestWithRetry<unknown>("/v3/credits/usage"));
+    return parseResponse(creditUsageOutputSchema, await this.requestWithRetry<unknown>("/v3/credits/usage"));
   }
 
   async resolveProfile(query: string, profileDepth: ProfileDepth, requestId?: string): Promise<ProfileReadResponse | { message: string; search_billing?: OperationBilling }> {
     const search = await this.searchAndWait(query, profileDepth, requestId);
-    const searchBilling = search.billing ? { search_billing: billingSchema.parse(search.billing) } : {};
+    const searchBilling = search.billing ? { search_billing: parseResponse(billingSchema, search.billing) } : {};
     const result = search.results.find((item) => item.status === "ready");
     if (!result) {
       const failure = search.results.find((item) => item.failure)?.failure;

@@ -1,4 +1,5 @@
 /** API-owned billing receipts and key-scoped usage; no local tariff or ledger. */
+import { integer } from "./schema-compat.js";
 import { z } from "zod";
 
 export const billingSchema = z.object({
@@ -14,7 +15,7 @@ export const creditUsageOutputSchema = z.object({
     account_type: z.enum(["user", "organization"]),
     usage_scope: z.literal("current_api_key"), balance_scope: z.literal("billing_account"),
     period_start: z.string(), period_end: z.string(), credits_used: z.number().finite(),
-    request_count: z.number().int().nonnegative(), available_credits: z.number().finite(),
+    request_count: integer().nonnegative(), available_credits: z.number().finite(),
     reserved_credits: z.number().finite(),
   }),
 });

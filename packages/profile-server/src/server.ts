@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ContractMcpServer as McpServer } from "./mcp-compat.js";
 import { z } from "zod";
 import { ProfileOrbitClient, ProfileResolutionError } from "./orbit-api.js";
 import { creditUsageOutputSchema } from "./billing.js";
@@ -32,13 +32,12 @@ export function createProfileServer(apiKey: string): McpServer {
     } catch (error) { return toolError(error); }
   });
 
-  server.tool(
+  server.registerTool(
     "get_profile",
-    "Resolve a person from a name, email, phone number, or other plain-English identity query and return a full profile through Orbit v3 Search.",
-    {
+    { description: "Resolve a person from a name, email, phone number, or other plain-English identity query and return a full profile through Orbit v3 Search.", inputSchema: {
       query: z.string().min(1).max(2_000).describe("Name, email, phone number, URL, or plain-English identity query."),
       request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key for retrying the same profile resolution."),
-    },
+    } },
     async ({ query, request_id }) => {
       try {
         const profile = await client.resolveProfile(query, "full", request_id);

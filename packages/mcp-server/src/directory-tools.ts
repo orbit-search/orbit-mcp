@@ -1,4 +1,5 @@
 /** General MCP directory operations backed by Orbit organization permissions. */
+import { integer, uuid as uuidSchema } from "./schema-compat.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -6,15 +7,15 @@ import { requestDirectory, DirectoryApiError } from "./directory-api.js";
 import { directoryContext } from "./directory-auth.js";
 import { directoryOutputSchema, directoryResultHasFailure } from "./directory-output-schemas.js";
 
-const uuid = z.string().uuid();
+const uuid = uuidSchema();
 const text = z.string().trim().min(1).max(200);
 const org = { organizationId: uuid };
 const dir = { ...org, directoryId: uuid };
 const person = { ...dir, personId: text };
 const source = { ...dir, sourceId: uuid };
-const page = { limit: z.number().int().min(1).max(100).optional(), offset: z.number().int().min(0).optional() };
+const page = { limit: integer().min(1).max(100).optional(), offset: integer().min(0).optional() };
 const phases = z.array(z.enum(["existing_sources", "existing_socials", "new_sources"])).min(1).max(3);
-const interval = z.number().int().min(3600).max(2592000);
+const interval = integer().min(3600).max(2592000);
 const people = z.array(text).min(1).max(500);
 const fields = {
   name: z.string().trim().min(1).max(200).optional(),
@@ -39,7 +40,7 @@ export const directoryTools: Definition[] = [
   read("list_directory_organizations", "find the user's organizations before choosing a directory. Do not guess organization IDs.", "/v2/organizations", {}),
   read("list_directories", "list directories in a selected organization.", base, { ...org, limit: page.limit, after_directory_id: uuid.optional(), include_archived: z.boolean().optional() }),
   read("get_directory", "read a directory and its readiness before changing it.", directory, dir),
-  write("search_directory", "search within one directory using natural language. Never fall back to global search if access is denied or the directory is not ready.", "POST", "/v2/social/profiles/searches/smart", { ...dir, query: z.string().trim().min(1).max(2000), numUsers: z.number().int().min(1).max(100).default(20) }, true),
+  write("search_directory", "search within one directory using natural language. Never fall back to global search if access is denied or the directory is not ready.", "POST", "/v2/social/profiles/searches/smart", { ...dir, query: z.string().trim().min(1).max(2000), numUsers: integer().min(1).max(100).default(20) }, true),
   read("check_directory_slug", "check if a public directory slug is available.", `${base}/slug-availability`, { ...org, slug: text }),
   write("create_directory", "create a directory. Confirm the organization, name, and visibility; public makes it discoverable outside the organization.", "POST", base, { ...org, ...fields, name: z.string().trim().min(1).max(200), visibility: z.enum(["private", "public"]).default("private") }),
   write("update_directory", "change a directory's details. Read it first and confirm changes, especially public visibility.", "PATCH", directory, { ...dir, ...fields }),
@@ -60,7 +61,7 @@ export const directoryTools: Definition[] = [
   write("get_directory_source", "read a source and recover pending CSV processing where needed.", "GET", `${directory}/sources/:sourceId`, source, true),
   write("get_directory_source_status", "check import progress and recover pending CSV processing where needed. Queued or importing is not completion.", "GET", `${directory}/sources/:sourceId/status`, source, true),
   write("update_directory_source_status", "make an explicitly requested administrative source-status correction. Never mark an import completed merely to hide a failure; verify the actual processing state first.", "PATCH", `${directory}/sources/:sourceId/status`, { ...source, status: z.enum(["pending", "importing", "completed", "failed", "canceled"]), error: z.string().max(2000).nullable().optional(), import_metadata: z.record(z.string(), z.unknown()).optional() }),
-  write("upload_directory_csv", "import user-supplied CSV text into a directory. Confirm the target and field mapping. Never invent rows. Limited to 512 KiB; use the dashboard for larger files. Preserve idempotency_key on retries.", "POST", `${directory}/sources/csv-upload`, { ...dir, csv_text: z.string().min(1).max(524288), filename: z.string().regex(/^[A-Za-z0-9_.-]+\.csv$/).max(120).default("import.csv"), field_mapping: z.record(z.string(), z.union([text, z.array(text).min(1).max(20)])).optional(), idempotency_key: uuid, label: text.optional(), max_rows: z.number().int().min(1).max(10000).optional() }, true),
+  write("upload_directory_csv", "import user-supplied CSV text into a directory. Confirm the target and field mapping. Never invent rows. Limited to 512 KiB; use the dashboard for larger files. Preserve idempotency_key on retries.", "POST", `${directory}/sources/csv-upload`, { ...dir, csv_text: z.string().min(1).max(524288), filename: z.string().regex(/^[A-Za-z0-9_.-]+\.csv$/).max(120).default("import.csv"), field_mapping: z.record(z.string(), z.union([text, z.array(text).min(1).max(20)])).optional(), idempotency_key: uuid, label: text.optional(), max_rows: integer().min(1).max(10000).optional() }, true),
   write("infer_directory_csv_mapping", "suggest CSV column mapping from user-supplied headers. Review the mapping before upload; this may call an external model.", "POST", `${directory}/sources/csv-mapping`, { ...dir, headers: z.array(text).min(1).max(200) }, true),
   write("populate_directory_from_entities", "populate a directory from known companies or schools. Confirm IDs, AND/OR criteria and research costs. Never guess entity IDs. Poll source status after acceptance.", "POST", `${directory}/sources/entity-enrichment`, { ...dir, operator: z.enum(["and", "or"]), filters: z.array(z.object({ type: z.enum(["company", "school"]), id: text, name: text.optional() }).strict()).min(1).max(20), async: z.literal(true).default(true) }, true),
   write("remove_directory_source_people", "remove members contributed by a source after confirming the source and impact.", "DELETE", `${directory}/sources/:sourceId/people`, source),

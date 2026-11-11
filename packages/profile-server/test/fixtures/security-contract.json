@@ -1,0 +1,322 @@
+{
+  "tools": {
+    "tools": [
+      {
+        "name": "get_credit_usage",
+        "description": "Read net credit usage for the connected Orbit API key and available/reserved credits for its billing account. No purchase or billable work is started.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "success"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "account_type": {
+                  "type": "string",
+                  "enum": [
+                    "user",
+                    "organization"
+                  ]
+                },
+                "usage_scope": {
+                  "type": "string",
+                  "const": "current_api_key"
+                },
+                "balance_scope": {
+                  "type": "string",
+                  "const": "billing_account"
+                },
+                "period_start": {
+                  "type": "string"
+                },
+                "period_end": {
+                  "type": "string"
+                },
+                "credits_used": {
+                  "type": "number"
+                },
+                "request_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "available_credits": {
+                  "type": "number"
+                },
+                "reserved_credits": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "account_type",
+                "usage_scope",
+                "balance_scope",
+                "period_start",
+                "period_end",
+                "credits_used",
+                "request_count",
+                "available_credits",
+                "reserved_credits"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "status",
+            "payload"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "idempotentHint": true,
+          "openWorldHint": false
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "get_profile",
+        "description": "Resolve a person from a name, email, phone number, or other plain-English identity query and return a full profile through Orbit v3 Search.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000,
+              "description": "Name, email, phone number, URL, or plain-English identity query."
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "Stable idempotency key for retrying the same profile resolution."
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      }
+    ]
+  },
+  "results": [
+    {
+      "name": "get_credit_usage",
+      "args": {},
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"error\": \"[\\n  {\\n    \\\"received\\\": \\\"completed\\\",\\n    \\\"code\\\": \\\"invalid_literal\\\",\\n    \\\"expected\\\": \\\"success\\\",\\n    \\\"path\\\": [\\n      \\\"status\\\"\\n    ],\\n    \\\"message\\\": \\\"Invalid literal value, expected \\\\\\\"success\\\\\\\"\\\"\\n  }\\n]\"\n}"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": [
+        {
+          "url": "https://api.orbitsearch.com/v3/credits/usage"
+        }
+      ]
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": "Ada",
+        "request_id": "contract-1"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"profile_id\": \"p1\",\n  \"generation_level\": 3,\n  \"profile\": {\n    \"name\": \"Ada\"\n  }\n}"
+          }
+        ],
+        "structuredContent": {
+          "profile_id": "p1",
+          "generation_level": 3,
+          "profile": {
+            "name": "Ada"
+          }
+        }
+      },
+      "backendCalls": [
+        {
+          "url": "https://api.orbitsearch.com/v3/search",
+          "body": "{\"request_id\":\"contract-1\",\"query\":\"Ada\",\"candidate_discovery\":true,\"profile_depth\":\"full\",\"include_profile\":true,\"limit\":1}"
+        }
+      ]
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": "Ada",
+        "request_id": "contract-1",
+        "extra": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"profile_id\": \"p1\",\n  \"generation_level\": 3,\n  \"profile\": {\n    \"name\": \"Ada\"\n  }\n}"
+          }
+        ],
+        "structuredContent": {
+          "profile_id": "p1",
+          "generation_level": 3,
+          "profile": {
+            "name": "Ada"
+          }
+        }
+      },
+      "backendCalls": [
+        {
+          "url": "https://api.orbitsearch.com/v3/search",
+          "body": "{\"request_id\":\"contract-1\",\"query\":\"Ada\",\"candidate_discovery\":true,\"profile_depth\":\"full\",\"include_profile\":true,\"limit\":1}"
+        }
+      ]
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": ""
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: String must contain at least 1 character(s) at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: String must contain at most 2000 character(s) at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {},
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Required at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": null
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Expected string, received null at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": 1
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Expected string, received number at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": true
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Expected string, received boolean at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": []
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Expected string, received array at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    },
+    {
+      "name": "get_profile",
+      "args": {
+        "query": {}
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "MCP error -32602: Input validation error: Invalid arguments for tool get_profile: Expected string, received object at query"
+          }
+        ],
+        "isError": true
+      },
+      "backendCalls": []
+    }
+  ]
+}

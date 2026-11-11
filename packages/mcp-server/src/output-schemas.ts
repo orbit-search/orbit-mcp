@@ -1,4 +1,5 @@
 /** Public v3 response envelopes; preserve evolving profile fields and API additions. */
+import { integer } from "./schema-compat.js";
 import { z } from "zod";
 
 export const billingSchema = z.object({
@@ -20,7 +21,7 @@ export const creditUsageOutputSchema = z.object({
     period_start: z.string(),
     period_end: z.string(),
     credits_used: z.number().finite().describe("Net credits consumed by this API key, including refunds."),
-    request_count: z.number().int().nonnegative(),
+    request_count: integer().nonnegative(),
     available_credits: z.number().finite(),
     reserved_credits: z.number().finite(),
   }),
@@ -29,7 +30,7 @@ export const creditUsageOutputSchema = z.object({
 const profile = z.object({}).passthrough().describe(
   "Public Orbit person context, including available profile sections and source evidence. Fields vary by generation level; returned fields are preserved.",
 );
-const generationLevel = z.number().int().nullable().describe(
+const generationLevel = integer().nullable().describe(
   "Stored profile generation level: 1 quick, 2 partial, 3 full; null when no level is available.",
 );
 const failure = z.object({
@@ -49,7 +50,7 @@ export const searchOutputSchema = z.object({
   billing: billingSchema.optional(),
   progress: z.object({
     phase: z.enum(["matching", "discovering", "enriching", "completed", "failed"]),
-    completed_results: z.number().int().nonnegative(), observed_results: z.number().int().nonnegative(),
+    completed_results: integer().nonnegative(), observed_results: integer().nonnegative(),
     percent: z.number().min(0).max(100).nullable().describe("Unknown while discovery can add people."),
     eta_seconds: z.number().nonnegative().nullable().describe("Null when there is no measured estimate; never invent an ETA."),
     poll_after_seconds: z.number().nonnegative(),
@@ -87,10 +88,10 @@ const populationSubject = z.object({
 
 export const populationQuoteOutputSchema = z.object({
   population: populationSubject,
-  size: z.number().int().nullable().describe("The population's size as given, or null."),
+  size: integer().nullable().describe("The population's size as given, or null."),
   profile_depth: z.enum(["quick", "partial", "full"]).describe("The depth the quote priced."),
   credits: z.number().finite().describe("The whole cost of the search, as one number. Reserved when the search starts."),
-  max_people: z.number().int().describe("The most people one population search covers."),
+  max_people: integer().describe("The most people one population search covers."),
   pricing_version: z.string().describe("The pricing catalog version the quote used."),
 }).passthrough();
 
@@ -98,7 +99,7 @@ export const populationSchema = z.object({
   kind: z.enum(["company", "school"]),
   id: z.string(),
   name: z.string(),
-  size: z.number().int().nullable().describe("The population's size as given, or null."),
+  size: integer().nullable().describe("The population's size as given, or null."),
   profile_depth: z.enum(["quick", "partial", "full"]).describe("The depth every person is built to."),
   credits_quoted: z.number().finite().describe("The credits reserved when the search started."),
   status: z.enum(["running", "completed", "completed_with_errors", "failed", "cancelled"]).describe("Where the population search is."),
@@ -131,7 +132,7 @@ export const profileMarkdownSchema = z.object({
     title: z.string(),
     status: z.literal("available"),
   })).min(1).max(profileMarkdownPath.options.length),
-  files: z.record(z.string().min(1)),
+  files: z.record(z.string(), z.string().min(1)),
 }).superRefine((value, ctx) => {
   const paths = value.manifest.map(file => file.path);
   if ((value.files["USER.md"]?.length ?? 0) > 4000) {
@@ -179,7 +180,7 @@ export const networkPathOutputSchema = z.object({
   to_profile_id: z.string().describe("The person the path reaches."),
   mode: z.enum(["shortest", "strongest"]).describe("The mode used: shortest or strongest."),
   found: z.boolean().describe("Whether a path was found."),
-  degrees: z.number().int().nullable().describe("Links between the two people (1 = directly tied), when found."),
+  degrees: integer().nullable().describe("Links between the two people (1 = directly tied), when found."),
   strength: z.number().min(0).max(1).nullable().describe("The product of the link strengths, 0 to 1, when found."),
   people: z.array(z.object({
     profile_id: z.string().nullable().describe("Canonical Orbit profile ID of this person."),
