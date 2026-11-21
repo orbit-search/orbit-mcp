@@ -79,9 +79,16 @@ Your human does two things once, both in a browser. Your agent does the rest.
   they show as `orbit-harness[bot]`. Never commit, push or open a PR as the bot.
 - **Proof, not claims.** The PR body follows `.github/pull_request_template.md`
   and shows the commands you ran and their output.
-- **Review.** Greptile reviews every PR and reads `REVIEW.md`. Answer every
-  finding: fix it, or close the thread with a reason. Greptile is the only
-  outside reviewer; ask a new Codex or Claude thread for a second opinion.
+- **Review.** Greptile reviews every PR when it opens and reads `REVIEW.md`.
+  Answer every finding: fix it, or close the thread with a reason. Each review
+  costs credits: ask for a re-review (`@greptileai`) only after a fix that
+  changes behavior, at most 3 times per PR, and never after a base update (the
+  merge bot carries the review). After the first review and 3 re-reviews, a PR
+  merges on CI, resolved threads and `agent-policy` alone. A PR that changes
+  only the policy's `noBehaviorPaths` (docs, tests) needs no Greptile review:
+  put `[skip greptile]` in its title so Greptile does not start one. Greptile is
+  the only outside reviewer; ask a new Codex or Claude thread for a second
+  opinion.
 - **Gates.** `.github/agent-policy.json` lists the owners
   and the gated paths. The `agent-policy` commit status
   shows what needs a human for those paths. Gates without a path rule (an
@@ -118,7 +125,9 @@ Your human does two things once, both in a browser. Your agent does the rest.
   for repos with `"agentMerge": true` in `.github/agent-policy.json`)
   squash-merges, as `orbit-harness[bot]`, exactly the head commit it checked,
   when the PR is open and not a draft, `agent-policy` passes, every check
-  passes, Greptile reviewed that commit and no review thread is open. It never
+  passes, Greptile reviewed that commit (or needs no review: only
+  `noBehaviorPaths` changed, Greptile already reviewed 4 rounds, or every commit
+  since its last review is a base update) and no review thread is open. It never
   updates a branch that is behind. To keep a ready PR open, mark it as a draft
   or add the `hold` label.
 - **Ask for approval in Slack.** When `agent-policy` needs approval from

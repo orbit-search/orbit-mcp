@@ -1,0 +1,7 @@
+{
+  "effort": "base",
+  "autoReview": ["open"],
+  "triggerOnDrafts": false,
+  "ignoreKeywords": "[skip greptile]",
+  "ignorePatterns": "**/package-lock.json\n**/yarn.lock\n**/pnpm-lock.yaml\n**/poetry.lock\n**/uv.lock\n**/Cargo.lock\n**/go.sum\n**/Podfile.lock\n**/pubspec.lock\n**/*.min.js\n**/*.snap\n**/__snapshots__/**"
+}
