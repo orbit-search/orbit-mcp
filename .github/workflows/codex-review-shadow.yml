@@ -106,6 +106,17 @@ jobs:
           for f in REVIEW.md AGENTS.md; do
             git show "origin/$BASE:$f" > "/tmp/rules/$f" 2>/dev/null || rm -f "/tmp/rules/$f"
           done
+          # Codex loads AGENTS.md from its working directory by itself: put the
+          # base branch's copies there too (the PR's edits stay in the diff).
+          # Stage outside the checkout and remove whatever the PR put at the
+          # path (file, symlink or directory) first, so no PR path is written
+          # through.
+          for f in AGENTS.md AGENTS.override.md; do
+            rm -rf -- "$f"
+            if git show "origin/$BASE:$f" > "/tmp/base-$f" 2>/dev/null; then
+              cp -- "/tmp/base-$f" "$f"
+            fi
+          done
           {
             echo "You are reviewing pull request #$PR_NUMBER in $GITHUB_REPOSITORY. Do not modify any file."
             echo
