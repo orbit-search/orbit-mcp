@@ -108,11 +108,13 @@ jobs:
           done
           # Codex loads AGENTS.md from its working directory by itself: put the
           # base branch's copies there too (the PR's edits stay in the diff).
+          # Stage outside the checkout and remove whatever the PR put at the
+          # path (file, symlink or directory) first, so no PR path is written
+          # through.
           for f in AGENTS.md AGENTS.override.md; do
-            if git show "origin/$BASE:$f" > "$f.base" 2>/dev/null; then
-              mv "$f.base" "$f"
-            else
-              rm -f "$f" "$f.base"
+            rm -rf -- "$f"
+            if git show "origin/$BASE:$f" > "/tmp/base-$f" 2>/dev/null; then
+              cp -- "/tmp/base-$f" "$f"
             fi
           done
           {
