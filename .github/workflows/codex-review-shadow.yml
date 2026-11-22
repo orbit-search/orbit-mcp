@@ -106,6 +106,15 @@ jobs:
           for f in REVIEW.md AGENTS.md; do
             git show "origin/$BASE:$f" > "/tmp/rules/$f" 2>/dev/null || rm -f "/tmp/rules/$f"
           done
+          # Codex loads AGENTS.md from its working directory by itself: put the
+          # base branch's copies there too (the PR's edits stay in the diff).
+          for f in AGENTS.md AGENTS.override.md; do
+            if git show "origin/$BASE:$f" > "$f.base" 2>/dev/null; then
+              mv "$f.base" "$f"
+            else
+              rm -f "$f" "$f.base"
+            fi
+          done
           {
             echo "You are reviewing pull request #$PR_NUMBER in $GITHUB_REPOSITORY. Do not modify any file."
             echo
