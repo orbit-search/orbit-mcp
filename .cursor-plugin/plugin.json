@@ -1,0 +1,42 @@
+{
+  "name": "orbit",
+  "displayName": "Orbit",
+  "version": "1.0.0",
+  "description": "Search people, read source-backed profiles, enrich context, and manage Orbit directories via the hosted Orbit MCP.",
+  "author": {
+    "name": "Orbit",
+    "email": "support@orbitsearch.com"
+  },
+  "homepage": "https://developer.orbitsearch.com/",
+  "repository": "https://github.com/orbit-search/orbit-mcp",
+  "license": "MIT",
+  "logo": "assets/logo.png",
+  "keywords": [
+    "orbit",
+    "people-search",
+    "profiles",
+    "enrichment",
+    "directories",
+    "mcp",
+    "osint"
+  ],
+  "category": "integrations",
+  "tags": [
+    "orbit",
+    "people-search",
+    "mcp",
+    "profiles"
+  ],
+  "variables": {
+    "type": "object",
+    "properties": {
+      "ORBIT_API_KEY": {
+        "type": "string",
+        "title": "Orbit API key",
+        "description": "Developer API key from https://developer.orbitsearch.com/dashboard/keys. Required scopes: search:read and profile:read. Prefer OAuth in clients that support it."
+      }
+    },
+    "required": ["ORBIT_API_KEY"]
+  },
+  "mcpServers": "./mcp.json"
+}
