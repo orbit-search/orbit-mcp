@@ -10,11 +10,8 @@ try {
   await Promise.all([server.connect(st), client.connect(ct)]);
   const { tools } = await client.listTools();
   const card = {
-    serverInfo: {
-      ...client.getServerVersion(), title: "Orbit",
-      description: "The most in-depth, source-backed context about a person for deep personalization and research.",
-      websiteUrl: "https://developer.orbitsearch.com/",
-    },
+    // Title and description come from the server's own initialize response, so the card matches what clients show.
+    serverInfo: { ...client.getServerVersion() },
     authentication: { required: true, schemes: ["bearer"] },
     tools, resources: [], prompts: [],
   };

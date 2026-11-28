@@ -1,14 +1,22 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.orbit-search/orbit",
-  "title": "Orbit",
-  "description": "The most in-depth, source-backed context about a person for deep personalization and research.",
-  "version": "2.0.0",
+  "title": "Orbit Search",
+  "description": "People data API for AI agents and apps: find anyone by name, email, phone, username or description.",
+  "version": "2.4.1",
   "websiteUrl": "https://developer.orbitsearch.com/",
   "repository": {
     "url": "https://github.com/orbit-search/orbit-mcp",
-    "source": "github"
+    "source": "github",
+    "subfolder": "packages/mcp-server"
   },
+  "icons": [
+    {
+      "src": "https://developer.orbitsearch.com/orbit-icon-512.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
   "remotes": [
     {
       "type": "streamable-http",

@@ -51,7 +51,7 @@ test("all tools advertise output schemas and accurate annotations", async () => 
     const catalog = await client.listTools();
     assert.equal(catalog.tools.length, 50);
     const tools = catalog.tools.filter(tool => ["search_people", "get_profile", "enrich_profile"].includes(tool.name));
-    assert.equal(client.getServerVersion().version, "2.4.0");
+    assert.equal(client.getServerVersion().version, "2.4.1");
     assert.deepEqual(tools.map(t => t.name), ["search_people", "get_profile", "enrich_profile"]);
     for (const tool of tools) {
       assert.equal(tool.outputSchema.type, "object");

@@ -34,7 +34,7 @@ export function createProfileServer(apiKey: string): McpServer {
 
   server.registerTool(
     "get_profile",
-    { description: "Resolve a person from a name, email, phone number, or other plain-English identity query and return a full profile through Orbit v3 Search.", inputSchema: {
+    { description: "Resolve one person from a single query (a name, email address, phone number, LinkedIn or other profile URL, or a plain-English identity description) and return their full (level 3) Orbit profile with source evidence, or a message when no matching person is found. Waits for the Orbit v3 Search to finish. A phone number matches only people Orbit already has. Uses credits for the search and profile; search_billing is Orbit's receipt.", inputSchema: {
       query: z.string().min(1).max(2_000).describe("Name, email, phone number, URL, or plain-English identity query."),
       request_id: z.string().min(1).max(200).optional().describe("Stable idempotency key for retrying the same profile resolution."),
     } },

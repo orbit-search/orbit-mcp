@@ -1,6 +1,6 @@
-# Orbit MCP
+# Orbit Search MCP server
 
-General MCP server for Orbit people search, profiles, enrichment, and directory management. The hosted endpoint is `https://api.orbitsearch.com/mcp`. Search and enrichment support OAuth sign-in or an Orbit Developer API key; directory management requires a signed-in Orbit user and the appropriate organization permissions.
+General MCP server for Orbit Search (orbitsearch.com): people search, source-backed profiles, enrichment, and directory management. The hosted endpoint is `https://api.orbitsearch.com/mcp`. Search and enrichment support OAuth sign-in or an Orbit Developer API key; directory management requires a signed-in Orbit user and the appropriate organization permissions.
 
 Remote agents can use `https://api.orbitsearch.com/mcp-auth/agent` for ordinary
 MCP login tools, without a CLI, remote browser, or host-specific OAuth integration.
