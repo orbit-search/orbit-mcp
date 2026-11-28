@@ -1,7 +1,7 @@
 {
   "name": "@openea/orbit-mcp",
-  "version": "2.4.0",
-  "description": "MCP server for Orbit v3 Search and Enrich APIs",
+  "version": "2.4.1",
+  "description": "Orbit Search (orbitsearch.com) MCP server: people search, source-backed profiles, enrichment and directories for AI agents",
   "type": "module",
   "bin": {
     "orbit-mcp": "./build/index.js",
